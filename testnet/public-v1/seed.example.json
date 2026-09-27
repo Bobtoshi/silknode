@@ -1,0 +1,17 @@
+{
+  "schema": "silknode-public-testnet-config-v1",
+  "accept_public_zero_value": true,
+  "domain": "3e156fe886be5b82188b5af94f48e4dac0017a8c061298ae7d136438c3bc987e",
+  "store": "/ABS/testnet-state/store",
+  "retained_head": "/ABS/testnet-state/pins/head",
+  "host_margin": "/ABS/host-filesystem-margin",
+  "spend_parameters": "/ABS/checkout/parameters/sapling-spend.params",
+  "output_parameters": "/ABS/checkout/parameters/sapling-output.params",
+  "seed": "152.53.113.247:28444",
+  "ca_der_hex": "/ABS/checkout/testnet/public-v1/ca.der.hex",
+  "seed_certificate_sha256": "20f2e023298a8d59678ec63b22a4a6e11929de52300461a995d032a8c2dd480c",
+  "reward_owner": "REPLACE_WITH_YOUR_64_LOWERCASE_HEX_PUBLIC_ATTRIBUTION_TAG",
+  "listen": "0.0.0.0:28444",
+  "server_certificate_der": "/ABS/your-new-seed-certificate.der",
+  "server_key_pkcs8_der": "/ABS/your-new-seed-private-key.pkcs8.der"
+}

@@ -30,6 +30,7 @@ store creation—not the complete path shown above.
 | `silk-f04-client` | Versioned local preparation/submission ownership; explicit offer and relay handoff |
 | `silk-f04-relay` | Framing, cryptography, pinned TLS, schedules, journals and producer interfaces |
 | `silk-f04-node` | Genesis admission, full-data DAG ingress/sync, state reduction, cuts, durable store and local scanner |
+| `silk-f04-testnet` | Opt-in version1 zero-allocation public seed/miner adapter; TLS-bound full work-carrier sync, not wallet ingress |
 | `silk-order`, `silk-pow`, `silk-randomx` | Graph order, work rules and pinned native work implementation |
 | `silk-types`, `silk-profile`, `silk-bootstrap`, `silk-genesis` | Typed identities, versioned descriptors and supporting genesis/bootstrap definitions |
 | `silk-kernel`, `silk-gate2` | Supporting execution/checkpoint descriptor and transition interfaces |
@@ -51,6 +52,11 @@ Keep wire formats, domain separation, commitments and profile selection intact.
 A different cryptographic suite or consensus rule needs a deliberately versioned
 protocol change, not a drop-in adapter that silently changes validation.
 Modularity does not mean arbitrary code can execute inside consensus.
+
+The public-zero-v1 genesis is a closed, separately pinned empty-allocation
+profile. It preserves the private genesis admission path, F0.4 rule bytes and
+parameter commitments; it cannot authorize arbitrary zero-allocation profiles.
+See [Public testnet V1](PUBLIC_TESTNET_V1.md) for its launch and transfer limits.
 
 The `functional-lab` relay feature enables unqualified fixture scheduling and
 is off by default. It is not production time/custody qualification. Local store

@@ -2,14 +2,22 @@
 
 An experimental, modular private-transaction DAG core written in Rust.
 **Nonproduction software: no real funds, production deployment or anonymity
-guarantees.** This is a source-only candidate, not a public network or a turnkey
-node distribution. It has not received an independent security audit and does
+guarantees.** This successor adds an explicit zero-value testnet adapter, not a
+turnkey production node distribution. It has not received an independent security audit and does
 not claim Monero-equivalent privacy or historical novelty.
 
 The F0.4 modules implement Sapling-based shielded transfers, wallet recovery,
 relay transport, DAG admission, sealed-cut state reduction and durable local
 state. Supporting crates keep ordering, work, profiles and kernel interfaces
 separate. Start with [Architecture](ARCHITECTURE.md) to find each boundary.
+
+## Optional zero-value public testnet
+
+See [Public testnet V1](PUBLIC_TESTNET_V1.md) for the pinned genesis, bootstrap
+seed, resource requirements and node/mining commands. Its empty genesis has no
+premine; mining produces nontransferable attribution credits, not spendable coins.
+This successor remains separate from the published `v0.1.0-alpha.1` source tag.
+Do not assume that tag contains the new CLI.
 
 ## Try a small local example
 
@@ -55,7 +63,8 @@ The Rust libraries are the extension surface; no privileged service or operator
 account is needed to inspect them. Versioned adapters live in `offer::v1`,
 `handoff::v1` and the client `v1` module. They do not let extensions bypass node
 validation or change consensus bytes. There is no general-purpose plugin loader
-or permissionless public-network launch in this package.
+in this package. The separately opted-in testnet adapter never replaces the
+node's full work/history validation.
 
 The `silk-f04-local` binary is a low-level explicit local tool, not a daemon.
 Payment/proof experiments require the external Sapling ceremony files. Their
