@@ -1,0 +1,17 @@
+[package]
+name = "silk-pow"
+description = "Replaceable synthetic proof-of-work boundary for the private SilkNode prototype"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+sha2.workspace = true
+silk-gate2 = { path = "../silk-gate2" }
+silk-randomx = { path = "../silk-randomx" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

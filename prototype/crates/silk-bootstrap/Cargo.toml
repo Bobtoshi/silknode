@@ -1,0 +1,22 @@
+[package]
+name = "silk-bootstrap"
+description = "Authenticated first-child anchor reference for the SilkNode no-value prototype"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+silk-genesis = { path = "../silk-genesis" }
+silk-types = { path = "../silk-types" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+silk-kernel = { path = "../silk-kernel" }
+silk-profile = { path = "../silk-profile" }
+
+[lints]
+workspace = true

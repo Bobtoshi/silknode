@@ -1,0 +1,37 @@
+[package]
+name = "silk-f04-relay"
+description = "Explicit private F04 relay codecs and transport components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Enables explicitly unqualified scheduling only for private functional fixtures.
+functional-lab = []
+
+[dependencies]
+silk-f04-node = { path = "../silk-f04-node" }
+silk-sapling-f04 = { path = "../silk-sapling-f04" }
+ed25519-dalek = "=2.2.0"
+sha2.workspace = true
+thiserror.workspace = true
+hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "chacha", "x25519"] }
+rand_core_06 = { package = "rand_core", version = "=0.6.4", features = ["getrandom"] }
+rand_chacha_10 = { package = "rand_chacha", version = "=0.10.0" }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+rustix = { version = "=1.1.4", features = ["fs", "process", "net", "time", "event"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["signal", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+silk-local-platform = { path = "../silk-local-platform" }
+
+[lints]
+workspace = true

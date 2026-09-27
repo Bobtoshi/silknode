@@ -1,0 +1,180 @@
+{
+  "schema": "silknode.transparent-native-kernel.interface.v2",
+  "abi_version": 2,
+  "role": "NativeKernel",
+  "status": {
+    "kind": "semantic_interface_projection",
+    "independent_rust_entrypoint_exposed": false,
+    "current_facade": "TransparentExecutionHost combines NativeKernel evaluation with Checkpoint sealing",
+    "typed_state_effect_boundary": "the evaluator receives a read-only native view and stages typed effects; only the checkpoint sealer materializes state",
+    "wire_authority": "decoded artifacts are evidence candidates and never caller-injected effects"
+  },
+  "canonical_wire": {
+    "integer_byte_order": "little_endian",
+    "hash32_size_bytes": 32,
+    "object_type_tag": "u8",
+    "object_version": "u8",
+    "list_length_type": "u32",
+    "decode": "exact_with_trailing_byte_rejection",
+    "map_and_set_order": "strict_lexicographic_unique",
+    "allocation_guard": "a decoder bounds each count by the remaining bytes divided by the minimum encoded element size before allocation; transport byte budgets are local policy, not canonical meaning",
+    "trust_rule": "canonical decoding produces only Unverified types"
+  },
+  "existing_input_types": {
+    "NativeNoteV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "value", "type": "u64" },
+        { "name": "owner_tag", "type": "Hash32" },
+        { "name": "rho", "type": "Hash32" },
+        { "name": "randomness", "type": "Hash32" },
+        { "name": "nullifier_key", "type": "Hash32" }
+      ]
+    },
+    "TransparentWitnessV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "note", "type": "NativeNoteV1" },
+        { "name": "authorization_valid", "type": "canonical_bool_00_or_01" }
+      ]
+    },
+    "TransparentInputV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "commitment", "type": "NoteCommitment:Hash32" },
+        { "name": "nullifier", "type": "Nullifier:Hash32" },
+        { "name": "witness", "type": "TransparentWitnessV1" }
+      ]
+    },
+    "TransparentOutputV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "commitment", "type": "NoteCommitment:Hash32" },
+        { "name": "note", "type": "NativeNoteV1" }
+      ]
+    },
+    "RecoveryRecordV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "output_commitment", "type": "NoteCommitment:Hash32" },
+        { "name": "payload", "type": "bytes[128]" }
+      ]
+    },
+    "NativeTransactionV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "chain_domain", "type": "ChainDomain:Hash32" },
+        { "name": "profile_domain", "type": "ProfileDomain:Hash32" },
+        { "name": "anchor", "type": "CheckpointId:Hash32" },
+        { "name": "public_fee", "type": "u64" },
+        { "name": "inputs", "type": "list[TransparentInputV1]", "max_items": 16 },
+        { "name": "outputs", "type": "list[TransparentOutputV1]", "max_items": 16 },
+        { "name": "recovery_hashes", "type": "list[Hash32]", "max_items": 16 },
+        { "name": "recovery_records", "type": "list[RecoveryRecordV1]", "max_items": 16 }
+      ]
+    },
+    "OrderedBodyV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "body_id", "type": "VertexId:Hash32" },
+        { "name": "transactions", "type": "list[NativeTransactionV1]", "max_items": 4096 }
+      ],
+      "precondition": "transactions strictly increase by intent_id, instance_hash, canonical_transaction_bytes"
+    },
+    "GenesisAllocationTemplateEntryV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "note", "type": "NativeNoteV1" },
+        { "name": "recovery_payload", "type": "bytes[128]" }
+      ]
+    },
+    "GenesisAllocationTemplateV1": {
+      "tag": 1,
+      "fields": [
+        { "name": "entries", "type": "ordered_list[GenesisAllocationTemplateEntryV1]", "max_items": 4096 }
+      ]
+    }
+  },
+  "evidence_types": {
+    "NativeStateProjectionV1": {
+      "type_tag": 192,
+      "version": 1,
+      "fields": [
+        { "name": "live_notes", "type": "sorted_unique_map[NoteCommitment,NativeNoteV1]" },
+        { "name": "nullifiers", "type": "sorted_unique_set[Nullifier]" },
+        { "name": "commitment_history", "type": "sorted_unique_set[NoteCommitment]" },
+        { "name": "recovery_history", "type": "ordered_list[RecoveryRecordV1]" },
+        { "name": "accepted_intents", "type": "sorted_unique_set[IntentId]" },
+        { "name": "native_issued", "type": "u128" },
+        { "name": "fee_pool", "type": "u128" }
+      ],
+      "authority": "standalone verification checks native invariants only and does not create checkpoint or sealing authority"
+    },
+    "OutcomeV1": {
+      "type_tag": 193,
+      "version": 1,
+      "variants": [
+        { "tag": 0, "name": "accepted", "fields": [] },
+        { "tag": 1, "name": "rejected", "fields": [{ "name": "reject_code", "type": "u16" }] }
+      ]
+    },
+    "DecisionV1": {
+      "type_tag": 194,
+      "version": 1,
+      "fields": [
+        { "name": "position", "type": "u32" },
+        { "name": "body_id", "type": "VertexId:Hash32" },
+        { "name": "body_position", "type": "u32" },
+        { "name": "transaction_position", "type": "u32" },
+        { "name": "intent_id", "type": "IntentId:Hash32" },
+        { "name": "instance_hash", "type": "Hash32" },
+        { "name": "outcome", "type": "OutcomeV1" }
+      ],
+      "authority": "promoted only by exact comparison with deterministic replay"
+    },
+    "AcceptedEffectV1": {
+      "type_tag": 195,
+      "version": 1,
+      "fields": [
+        { "name": "body_id", "type": "VertexId:Hash32" },
+        { "name": "intent_id", "type": "IntentId:Hash32" }
+      ],
+      "authority": "promoted only by exact comparison with deterministic replay"
+    },
+    "NativeIntervalResultV1": {
+      "type_tag": 196,
+      "version": 1,
+      "fields": [
+        { "name": "decisions", "type": "ordered_list[DecisionV1]", "max_items": 4096 },
+        { "name": "accepted_effects", "type": "ordered_list[AcceptedEffectV1]", "max_items": 4096 },
+        { "name": "resulting_native_state", "type": "NativeStateProjectionV1" }
+      ],
+      "promotion": "re-execute from the trusted base and ordered bodies, exact-compare every field, and return the recomputed result"
+    }
+  },
+  "operations": [
+    {
+      "name": "materialize_genesis",
+      "inputs": ["ExecutionContext", "GenesisAllocationTemplateV1"],
+      "output": "NativeStateProjectionV1",
+      "failure_model": "structural_error_invalidates_call"
+    },
+    {
+      "name": "evaluate_interval",
+      "inputs": ["ExecutionContext", "trusted BaseCheckpointNativeView", "ordered_list[OrderedBodyV1]"],
+      "output": "NativeIntervalResultV1",
+      "failure_model": "structural errors invalidate the call; transaction failures are decisions with no effect"
+    },
+    {
+      "name": "verify_native_interval_result",
+      "inputs": ["UnverifiedNativeIntervalResultV1", "trusted CheckpointState", "ordered_list[OrderedBodyV1]"],
+      "output": "freshly_recomputed NativeIntervalResultV1",
+      "failure_model": "unknown reject code or any replay mismatch rejects"
+    }
+  ],
+  "dependency_contract": {
+    "exact_module_dependencies": [],
+    "ordered_verified_bodies": "caller supplied ABI input, not a call to a specific GraphOrder implementation"
+  },
+  "security_status": "transparent no-value differential ABI only; no privacy, ownership security, proof of work, production, valuable operation, or decoded-state authority"
+}

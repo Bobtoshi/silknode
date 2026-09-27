@@ -1,0 +1,74 @@
+{
+  "schema": "silknode.genesis-object.v1",
+  "case_id": "transparent-two-entry-genesis-object-v1",
+  "claims": {
+    "no_value": true,
+    "non_pow_state_anchor": true,
+    "detached_from_descriptor_root": true,
+    "no_reward": true,
+    "no_work": true,
+    "first_child_pow_not_implemented": true
+  },
+  "canonical_template_hex": "a00101000000a7322eb1482cf44b0db1d1c84479289135c5b155a4a571498fd4a297b2b25ce1000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000000006",
+  "canonical_object_hex": "a10101000000a7322eb1482cf44b0db1d1c84479289135c5b155a4a571498fd4a297b2b25ce1dda5cd9e3801f331218a51eeb0ec4e15058eb60af2ebf478ee7b1300d37101e09f40906b7b24017a75978dd6903dfb72ab20453b581097464c9793cf1ea96cc6fa58f03cd4b21f477e7072c6c0411f6a93eae290299d6f81adcfb7208bb09b7c6a745df0a1370b5a89019d00c0e8166b9bf704bdd5ea6bb9343e7a57040ea6c7ce70b565c37f26b69e16d48455505cac78ed0a9039cb47e5f336e8cc124712469d2327d2675bfbd23341f5c347dc534a6654466d1259dd1009df199b81229d89",
+  "expected": {
+    "template": {
+      "canonical_length_bytes": 236,
+      "template_hash_hex": "bc43d38526a444bf24dcf71e627f61d5c1be440bb2b4e9e06e84d138798654e9",
+      "projection": {
+        "template_tag_u8": 160,
+        "version_u8": 1,
+        "protocol_major_u32": 1,
+        "allocation_template_hash_hex": "a7322eb1482cf44b0db1d1c84479289135c5b155a4a571498fd4a297b2b25ce1",
+        "derived_slots": [
+          {
+            "field": "genesis_commitment",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 1
+          },
+          {
+            "field": "chain_domain",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 2
+          },
+          {
+            "field": "protocol_manifest_hash",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 3
+          },
+          {
+            "field": "profile_domain",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 4
+          },
+          {
+            "field": "checkpoint_zero_state_digest",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 5
+          },
+          {
+            "field": "checkpoint_zero_id",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 6
+          }
+        ]
+      }
+    },
+    "object": {
+      "canonical_length_bytes": 230,
+      "genesis_id_pin_hex": "5240a325ad31a175049ab7d7959c2d9d5a5207957d4bb637894d95c9a5609d93",
+      "projection": {
+        "object_tag_u8": 161,
+        "version_u8": 1,
+        "protocol_major_u32": 1,
+        "allocation_template_hash_hex": "a7322eb1482cf44b0db1d1c84479289135c5b155a4a571498fd4a297b2b25ce1",
+        "genesis_commitment_hex": "dda5cd9e3801f331218a51eeb0ec4e15058eb60af2ebf478ee7b1300d37101e0",
+        "chain_domain_hex": "9f40906b7b24017a75978dd6903dfb72ab20453b581097464c9793cf1ea96cc6",
+        "protocol_manifest_hash_hex": "fa58f03cd4b21f477e7072c6c0411f6a93eae290299d6f81adcfb7208bb09b7c",
+        "profile_domain_hex": "6a745df0a1370b5a89019d00c0e8166b9bf704bdd5ea6bb9343e7a57040ea6c7",
+        "checkpoint_zero_state_digest_hex": "ce70b565c37f26b69e16d48455505cac78ed0a9039cb47e5f336e8cc12471246",
+        "checkpoint_zero_id_hex": "9d2327d2675bfbd23341f5c347dc534a6654466d1259dd1009df199b81229d89"
+      }
+    }
+  }
+}

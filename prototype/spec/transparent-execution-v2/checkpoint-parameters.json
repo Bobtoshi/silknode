@@ -1,0 +1,140 @@
+{
+  "schema": "silknode.transparent-checkpoint.parameters.v3",
+  "abi_version": 3,
+  "role": "Checkpoint",
+  "canonical_versions": {
+    "state_digest_projection": 1,
+    "ordered_body_execution_binding_projection": 1,
+    "gate_a_genesis_receipt_template": 1,
+    "gate_a_genesis_receipt": 1,
+    "checkpoint_state_wire": { "type_tag": 197, "version": 1 },
+    "transition_wire": { "type_tag": 198, "version": 1 }
+  },
+  "resource_limits": {
+    "max_ordered_bodies_per_interval": 1024,
+    "max_transactions_per_interval": 4096
+  },
+  "semantic_hash_domains": {
+    "ordered_body_execution_binding": "Silk-Transparent-Ordered-Body-v1",
+    "state_digest": "Silk-Transparent-State-v1",
+    "checkpoint_id": "Silk-Transparent-Checkpoint-v1"
+  },
+  "checkpoint_zero": {
+    "checkpoint_index": 0,
+    "previous_checkpoint_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "nullifiers_empty": true,
+    "current_body_lists_empty": true,
+    "accepted_effects_empty": true,
+    "accepted_intents_empty": true,
+    "fee_pool_zero": true,
+    "genesis_receipt_required_from_public_host": true,
+    "genesis_receipt_becomes_vertex_or_genesis_id": false,
+    "stored_checkpoint_id_must_equal_recomputed_id": true
+  },
+  "gate_a_genesis_receipt": {
+    "template_canonical_length_bytes": 203,
+    "receipt_canonical_length_bytes": 197,
+    "derived_placeholder_bytes": 32,
+    "derived_placeholder_must_be_zero": true,
+    "recipe_tags_in_field_order": [1, 2, 3, 4, 5, 6],
+    "comparison_precedence": [
+      "protocol_major",
+      "genesis_commitment",
+      "chain_domain",
+      "protocol_manifest_hash",
+      "profile_domain",
+      "checkpoint_zero_state_digest",
+      "checkpoint_zero_id"
+    ],
+    "scope": "detached A2a-5 no-value derivation diagnostic; not the A2a-6 GenesisObjectTemplate, GenesisObject, or GenesisId"
+  },
+  "structural_error_codes": [
+    "kernel.checkpoint_binding_mismatch",
+    "kernel.execution_chain_mismatch",
+    "kernel.execution_profile_mismatch",
+    "kernel.genesis_receipt_requires_checkpoint_zero",
+    "kernel.genesis_receipt_mismatch",
+    "kernel.empty_checkpoint",
+    "kernel.too_many_ordered_bodies",
+    "kernel.duplicate_ordered_body",
+    "kernel.too_many_transactions",
+    "kernel.checkpoint_index_overflow",
+    "kernel.invalid_state",
+    "codec.checkpoint_identity_mismatch",
+    "codec.checkpoint_pin_mismatch",
+    "codec.native_interval_result_mismatch",
+    "codec.transition_mismatch",
+    "codec.unknown_reject_code",
+    "canonical.length_overflow",
+    "canonical.unexpected_eof",
+    "canonical.unknown_tag",
+    "canonical.nonzero_placeholder",
+    "canonical.trailing_bytes",
+    "hash.empty_domain",
+    "hash.length_overflow",
+    "kernel.internal_invariant"
+  ],
+  "state_invariant_categories": [
+    "LiveCommitmentMismatch",
+    "LiveCommitmentMissingFromHistory",
+    "LiveNoteAlreadySpent",
+    "DuplicateRecoveryCommitment",
+    "RecoveryHistoryMismatch",
+    "DuplicateCheckpointIntent",
+    "AcceptedIntentMissingFromHistory",
+    "DuplicateOrderedBody",
+    "CheckpointBodyHistoryMismatch",
+    "CheckpointBodyBindingMismatch",
+    "SupplyOverflow",
+    "SupplyMismatch"
+  ],
+  "state_invariant_code_status": {
+    "outer_stable_code": "kernel.invalid_state",
+    "per_category_language_neutral_numeric_codes": false,
+    "statement": "category names mirror the current Rust enum and are diagnostic labels, not separately frozen wire codes"
+  },
+  "state_validation_order": [
+    "live-note key matches its chain-bound opening commitment",
+    "live commitment is present in commitment history",
+    "live note's derived nullifier is not spent",
+    "recovery-history output commitments are unique",
+    "recovery-history commitment set exactly equals commitment history",
+    "checkpoint-local accepted intents are unique",
+    "checkpoint-local accepted intents exist in accepted-intent history",
+    "checkpoint-local accepted effects name a current body",
+    "ordered body history is unique",
+    "current bodies are the exact suffix of ordered body history",
+    "current body IDs and body bindings have equal lengths",
+    "checked live-note value plus fee pool equals native issuance"
+  ],
+  "descriptor_dependency_roles": ["NativeKernel"],
+  "capability_review_metadata": {
+    "declared_state_reads": [
+      { "tag": 3, "name": "CanonicalOrder" },
+      { "tag": 4, "name": "NoteCommitments" },
+      { "tag": 5, "name": "Nullifiers" },
+      { "tag": 6, "name": "RecoveryHistory" },
+      { "tag": 7, "name": "AcceptedEffects" },
+      { "tag": 8, "name": "NativeSupply" },
+      { "tag": 10, "name": "Checkpoints" }
+    ],
+    "declared_state_writes": [
+      { "tag": 10, "name": "Checkpoints" }
+    ],
+    "base_checkpoint_status": "the complete immutable base is a direct semantic ABI input and Checkpoints remains declared as a read capability",
+    "mechanically_restricted_typed_views_enforced": true,
+    "statement": "the Rust checkpoint sealer is the only materializer of evaluator-created typed effects; decoded evidence can only be compared with recomputation and cannot enter the sealing path"
+  },
+  "excluded_semantics": [
+    "graph ordering and fork choice",
+    "body identifier authenticity and availability",
+    "transaction validity and native effect evaluation",
+    "persistence and snapshot availability",
+    "proof-of-work finality",
+    "A2a-6 GenesisObjectTemplate in silk-profile and GenesisObject, GenesisId, and release-pin enforcement in the separate silk-genesis leaf",
+    "first-mined-child anchor-reference validation, RandomX/bootstrap key, target and DAA policy, timestamp, nonce, body roots, reward, and proof-of-work validation",
+    "profile successor activation",
+    "privacy and valuable operation",
+    "source, build, executable, and runtime attestation"
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "schema": "silknode.first-child-anchor-reference.v1",
+  "case_id": "transparent-two-entry-first-child-anchor-reference-v1",
+  "scope": {
+    "no_value": true,
+    "reference_only": true,
+    "genesis_is_not_a_vertex": true,
+    "mining_policy_not_selected": true
+  },
+  "canonical_reference_hex": "b0015240a325ad31a175049ab7d7959c2d9d5a5207957d4bb637894d95c9a5609d93",
+  "genesis_context": {
+    "fixture": "genesis-object-v1.json",
+    "genesis_id_hex": "5240a325ad31a175049ab7d7959c2d9d5a5207957d4bb637894d95c9a5609d93",
+    "chain_domain_hex": "9f40906b7b24017a75978dd6903dfb72ab20453b581097464c9793cf1ea96cc6",
+    "protocol_manifest_hash_hex": "fa58f03cd4b21f477e7072c6c0411f6a93eae290299d6f81adcfb7208bb09b7c",
+    "profile_domain_hex": "6a745df0a1370b5a89019d00c0e8166b9bf704bdd5ea6bb9343e7a57040ea6c7"
+  },
+  "expected": {
+    "canonical_length_bytes": 34,
+    "projection": {
+      "reference_tag_u8": 176,
+      "version_u8": 1,
+      "genesis_id_hex": "5240a325ad31a175049ab7d7959c2d9d5a5207957d4bb637894d95c9a5609d93"
+    }
+  }
+}

@@ -1,0 +1,743 @@
+//! One checkpoint reducer shared by canonical execution and parent-prefix replay.
+//! A cut is a reversible prefix reference, never a finality certificate.
+use crate::{Digest, Error, Result, genesis::Genesis, graph::VerifiedVertex, wire::raw_hash};
+use sapling_crypto::{CommitmentTree, Node};
+use sha2::{Digest as _, Sha256};
+use silk_pow::randomx_v2_work_key_id;
+use silk_sapling_f04::{
+    codec::{RECOVERY_BYTES, domain_hash},
+    crypto::VerifiedEnvelope,
+    wallet::CutReference,
+};
+use silk_types::VertexId;
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::Arc,
+};
+
+/// Canonical cut with its exact prefix and leaf-count lineage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cut {
+    /// Cut ordinal, at checkpoint 128*c (zero is genesis).
+    pub index: u64,
+    /// Checkpoint-prefix commitment Q, not merely a note root.
+    pub prefix: Digest,
+    /// Standard Sapling tree root at that prefix.
+    pub root: Digest,
+    /// Number of positioned leaves present at the cut.
+    pub leaves: u64,
+    /// Exact Kc.
+    pub id: Digest,
+}
+impl Cut {
+    fn new(n: &Digest, index: u64, prefix: Digest, root: Digest, leaves: u64) -> Self {
+        let id = domain_hash(
+            "SilkNode-F0-cut",
+            &[
+                n,
+                &index.to_le_bytes(),
+                &prefix,
+                &root,
+                &leaves.to_le_bytes(),
+            ],
+        );
+        Self {
+            index,
+            prefix,
+            root,
+            leaves,
+            id,
+        }
+    }
+    /// Wallet construction binding; availability/maturity is checked by the caller.
+    #[must_use]
+    pub fn reference(&self, domain: Digest) -> CutReference {
+        CutReference {
+            domain,
+            index: self.index,
+            id: self.id,
+            root: self.root,
+        }
+    }
+}
+
+/// Deterministic effect result. All variants retain the carrier's work/public position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectOutcome {
+    /// Both inputs/outputs and the one-unit burn applied together.
+    Accepted,
+    /// The exact signed cut is immature or absent on this canonical prefix.
+    IneligibleCut,
+    /// A previously accepted effect is a fee-free no-op.
+    Duplicate,
+    /// At least one input is already spent; neither new input is consumed.
+    Conflict,
+    /// Pool, integer or tree-capacity checks refused the whole effect.
+    Bounds,
+}
+
+/// Derived linkage created ONLY when an effect applies atomically. Public bytes,
+/// not a serialized consensus object, peer snapshot or outgoing-viewing capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedOutputs {
+    /// Exact accepted economic effect, independent of authorization encoding.
+    pub effect: Digest,
+    /// Canonical position of output slot zero; slot one follows immediately.
+    pub first_position: u64,
+    /// Value commitments from those exact slots in the accepted envelope.
+    pub commitments: [Digest; 2],
+}
+
+/// Derived immutable completed branch state. Mutation occurs only in the reducer.
+#[derive(Clone)]
+pub struct BranchState {
+    domain: Digest,
+    parameters: Digest,
+    initial_leaves: u64,
+    initial_pool: u64,
+    tree: CommitmentTree,
+    nullifiers: BTreeSet<Digest>,
+    effects: BTreeSet<Digest>,
+    // Share immutable entries across reversible states; do not copy ciphertext history.
+    recovery: Vec<Arc<[u8; RECOVERY_BYTES]>>,
+    // Derived only; NEVER added to current hashes, manifests, deltas or wire bytes.
+    accepted_outputs: Vec<Arc<AcceptedOutputs>>,
+    rewards: Vec<[u8; 112]>,
+    pool: u64,
+    burned: u64,
+    issued: u128,
+    executed: Vec<VertexId>,
+    j: Digest,
+    tail: VecDeque<[u8; 56]>,
+    dc: Digest,
+    kc: Digest,
+    checkpoint_index: u64,
+    checkpoint: Vec<u8>,
+    checkpoint_id: Digest,
+    state_digest: Digest,
+    prefix: Digest,
+    cuts: Vec<Cut>,
+}
+
+/// Reversible checkpoint result. Publication, not construction, makes it current.
+pub(crate) struct CheckpointTransition {
+    pub state: BranchState,
+    pub outcomes: Vec<EffectOutcome>,
+}
+
+impl BranchState {
+    /// Complete checkpoint-zero state from admitted immutable genesis material.
+    pub fn genesis(g: &Genesis) -> Result<Self> {
+        let domain = g.domain();
+        let parameters = g.parameters_id();
+        let j = domain_hash("SilkNode-F0-eligible-genesis", &[&domain]);
+        let kc = domain_hash("SilkNode-F01-key-carry-genesis", &[&domain, &parameters]);
+        let mut s = Self {
+            domain,
+            parameters,
+            initial_leaves: g.recoveries().len() as u64,
+            initial_pool: g.total(),
+            tree: g.tree().clone(),
+            nullifiers: BTreeSet::new(),
+            effects: BTreeSet::new(),
+            recovery: g.recoveries().iter().map(|e| Arc::new(*e)).collect(),
+            accepted_outputs: Vec::new(),
+            rewards: Vec::new(),
+            pool: g.total(),
+            burned: 0,
+            issued: 0,
+            executed: Vec::new(),
+            j,
+            tail: VecDeque::new(),
+            dc: [0; 32],
+            kc,
+            checkpoint_index: 0,
+            checkpoint: Vec::new(),
+            checkpoint_id: [0; 32],
+            state_digest: [0; 32],
+            prefix: [0; 32],
+            cuts: Vec::new(),
+        };
+        s.dc = s.daa_carry();
+        s.state_digest = s.hash_state();
+        s.checkpoint.extend_from_slice(b"SNCGEN01");
+        for field in [&domain, &s.state_digest, &s.dc, &kc] {
+            s.checkpoint.extend_from_slice(field);
+        }
+        s.checkpoint_id = domain_hash("SilkNode-F0-checkpoint-genesis", &[&s.checkpoint]);
+        s.prefix = domain_hash("SilkNode-F0-prefix-genesis", &[&domain, &s.checkpoint_id]);
+        s.cuts
+            .push(Cut::new(&domain, 0, s.prefix, s.root(), s.leaves()));
+        s.check_invariants()?;
+        Ok(s)
+    }
+
+    /// Exactly eight fully admitted vertices at the next eligible checkpoint.
+    /// The graph owner checks this batch against its SG-0 sequence; scratch callers
+    /// use the candidate's parent sequence, not the unrelated current ledger.
+    pub(crate) fn execute(
+        &self,
+        batch: [&VerifiedVertex; 8],
+        budget: &crate::budget::JobBudget,
+    ) -> Result<CheckpointTransition> {
+        budget.check()?;
+        let mut next = self.clone();
+        let j = self
+            .checkpoint_index
+            .checked_add(1)
+            .ok_or(Error::Invalid("checkpoint overflow"))?;
+        if self.executed.len() as u64 != self.checkpoint_index * 8 {
+            return Err(Error::Unavailable("checkpoint cursor invariant"));
+        }
+        let mut outcomes = Vec::new();
+        for v in batch {
+            budget.check()?;
+            if v.candidate().header.bytes[560..] != self.domain {
+                return Err(Error::Unavailable("reducer foreign vertex"));
+            }
+            for e in v.envelopes() {
+                budget.check()?;
+                outcomes.push(next.execute_envelope(e, j)?);
+            }
+            next.append_position(v)?;
+        }
+        next.checkpoint_index = j;
+        next.dc = next.daa_carry();
+        next.state_digest = next.hash_state_checked(Some(budget))?;
+        let mut c = Vec::with_capacity(484);
+        c.extend_from_slice(b"SNCPTF01\x01\0\0\0");
+        c.extend_from_slice(&self.domain);
+        c.extend_from_slice(&j.to_le_bytes());
+        c.extend_from_slice(&self.checkpoint_id);
+        c.extend_from_slice(&next.j);
+        for v in batch {
+            c.extend_from_slice(&v.candidate().id);
+        }
+        for h in [&next.state_digest, &next.dc, &next.kc] {
+            c.extend_from_slice(h);
+        }
+        c.extend_from_slice(&(next.executed.len() as u64).to_le_bytes());
+        c.extend_from_slice(&0_u64.to_le_bytes());
+        debug_assert_eq!(c.len(), 484);
+        next.checkpoint_id = domain_hash("SilkNode-F0-checkpoint", &[&c]);
+        next.prefix = domain_hash(
+            "SilkNode-F0-prefix",
+            &[&self.domain, &self.prefix, &j.to_le_bytes(), &raw_hash(&c)],
+        );
+        next.checkpoint = c;
+        if j % 128 == 0 {
+            next.cuts.push(Cut::new(
+                &self.domain,
+                j / 128,
+                next.prefix,
+                next.root(),
+                next.leaves(),
+            ));
+        }
+        next.check_invariants()?;
+        Ok(CheckpointTransition {
+            state: next,
+            outcomes,
+        })
+    }
+
+    fn execute_envelope(&mut self, verified: &VerifiedEnvelope, j: u64) -> Result<EffectOutcome> {
+        let e = verified.envelope();
+        if e.domain() != self.domain {
+            return Err(Error::Unavailable("reducer foreign envelope"));
+        }
+        let c = e.cut_index();
+        let eligible = c <= eligible_cut_index(j)
+            && self.cuts.get(c as usize).is_some_and(|cut| {
+                cut.index == c && cut.id == e.cut_id() && cut.root == e.anchor()
+            });
+        if !eligible {
+            return Ok(EffectOutcome::IneligibleCut);
+        }
+        let effect = e.effect_id();
+        if self.effects.contains(&effect) {
+            return Ok(EffectOutcome::Duplicate);
+        }
+        let nfs = e.nullifiers();
+        if nfs.iter().any(|nf| self.nullifiers.contains(nf)) {
+            return Ok(EffectOutcome::Conflict);
+        }
+        if self.effects.len() >= 50_000 {
+            return Err(Error::Paused("accepted-effect reference horizon"));
+        }
+        if self.pool == 0 || self.burned == u64::MAX || self.leaves() > (1_u64 << 32) - 2 {
+            return Ok(EffectOutcome::Bounds);
+        }
+        let entries = e.recovery();
+        let linkage = AcceptedOutputs {
+            effect,
+            first_position: self.leaves(),
+            commitments: e.output_value_commitments(),
+        };
+        // Stage the entire two-output tree update before any economic write.
+        let mut tree = self.tree.clone();
+        for entry in &entries {
+            let node = Option::<Node>::from(Node::from_bytes(
+                entry[..32].try_into().expect("fixed recovery"),
+            ))
+            .ok_or(Error::Unavailable("verified output commitment invariant"))?;
+            tree.append(node)
+                .map_err(|()| Error::Unavailable("tree capacity invariant"))?;
+        }
+        self.tree = tree;
+        for nf in nfs {
+            self.nullifiers.insert(nf);
+        }
+        self.effects.insert(effect);
+        self.recovery.extend(entries.into_iter().map(Arc::new));
+        self.accepted_outputs.push(Arc::new(linkage));
+        self.pool -= 1;
+        self.burned += 1;
+        Ok(EffectOutcome::Accepted)
+    }
+
+    fn append_position(&mut self, v: &VerifiedVertex) -> Result<()> {
+        let candidate = v.candidate();
+        let h = &candidate.header;
+        let i = (self.executed.len() as u64)
+            .checked_add(1)
+            .ok_or(Error::Invalid("eligible cursor overflow"))?;
+        if self.executed.len() >= 4096 {
+            return Err(Error::Paused("eligible reference horizon"));
+        }
+        self.j = fold_j(&self.domain, self.j, i, candidate.id);
+        self.executed.push(VertexId::from_bytes(candidate.id));
+        let mut row = [0; 56];
+        row[..8].copy_from_slice(&(i - 1).to_le_bytes());
+        row[8..40].copy_from_slice(&candidate.id);
+        row[40..48].copy_from_slice(&h.timestamp.to_le_bytes());
+        row[48..56].copy_from_slice(&h.work.to_le_bytes());
+        self.tail.push_back(row);
+        if self.tail.len() > 43 {
+            self.tail.pop_front();
+        }
+        let mut kr = Vec::with_capacity(176);
+        kr.extend_from_slice(&i.to_le_bytes());
+        kr.extend_from_slice(&candidate.id);
+        kr.extend_from_slice(&h.source_index.to_le_bytes());
+        for x in [
+            &h.source_checkpoint,
+            &h.source_j,
+            &h.seed,
+            &randomx_v2_work_key_id(v.facts().key_material),
+        ] {
+            kr.extend_from_slice(x);
+        }
+        debug_assert_eq!(kr.len(), 176);
+        self.kc = domain_hash(
+            "SilkNode-F01-key-carry-step",
+            &[&self.domain, &self.kc, &kr],
+        );
+        let mut r = [0; 112];
+        r[..8].copy_from_slice(&i.to_le_bytes());
+        r[8..40].copy_from_slice(&candidate.id);
+        r[40..72].copy_from_slice(&h.owner);
+        r[72..104].copy_from_slice(&h.reward_nonce);
+        r[104..].copy_from_slice(&10_u64.to_le_bytes());
+        self.rewards.push(r);
+        self.issued = u128::from(i) * 10;
+        Ok(())
+    }
+
+    fn daa_carry(&self) -> Digest {
+        let mut b = Vec::with_capacity(124 + 56 * self.tail.len());
+        b.extend_from_slice(b"SNDCF001\x01\0\0\0");
+        b.extend_from_slice(&self.domain);
+        b.extend_from_slice(&self.parameters);
+        b.extend_from_slice(&(self.executed.len() as u64).to_le_bytes());
+        b.extend_from_slice(&self.j);
+        b.push(self.tail.len() as u8);
+        b.extend_from_slice(&[0; 7]);
+        for row in &self.tail {
+            b.extend_from_slice(row);
+        }
+        domain_hash("SilkNode-F01-DAA-carry", &[&b])
+    }
+
+    fn hash_state(&self) -> Digest {
+        self.hash_state_checked(None)
+            .expect("unbudgeted state hashing")
+    }
+    fn hash_state_checked(&self, budget: Option<&crate::budget::JobBudget>) -> Result<Digest> {
+        let check = || budget.map_or(Ok(()), crate::budget::JobBudget::check);
+        check()?;
+        let nf = hash_stream_checked(
+            "SilkNode-F0-NF",
+            &self.domain,
+            self.nullifiers.len(),
+            self.nullifiers.iter().map(|x| x.as_slice()),
+            budget,
+        )?;
+        check()?;
+        let ef = hash_stream_checked(
+            "SilkNode-F0-EF",
+            &self.domain,
+            self.effects.len(),
+            self.effects.iter().map(|x| x.as_slice()),
+            budget,
+        )?;
+        check()?;
+        let rh = hash_stream_checked(
+            "SilkNode-F0-recovery-history",
+            &self.domain,
+            self.recovery.len(),
+            self.recovery.iter().map(|x| x.as_slice()),
+            budget,
+        )?;
+        check()?;
+        let pr = hash_stream_checked(
+            "SilkNode-F0-public-rewards",
+            &self.domain,
+            self.rewards.len(),
+            self.rewards.iter().map(|x| x.as_slice()),
+            budget,
+        )?;
+        check()?;
+        Ok(domain_hash(
+            "SilkNode-F0-state",
+            &[
+                &self.domain,
+                &self.root(),
+                &self.leaves().to_le_bytes(),
+                &nf,
+                &ef,
+                &self.pool.to_le_bytes(),
+                &self.burned.to_le_bytes(),
+                &rh,
+                &pr,
+                &self.issued.to_le_bytes(),
+            ],
+        ))
+    }
+
+    fn check_invariants(&self) -> Result<()> {
+        if self.nullifiers.len() != self.effects.len() * 2
+            || self.accepted_outputs.len() != self.effects.len()
+            || self
+                .accepted_outputs
+                .last()
+                .is_some_and(|row| row.first_position.checked_add(2) != Some(self.leaves()))
+            || self.burned != self.effects.len() as u64
+            || self.leaves() != self.initial_leaves + 2 * self.burned
+            || self.pool.checked_add(self.burned) != Some(self.initial_pool)
+            || self.tree.size() as u64 != self.leaves()
+            || self.rewards.len() != self.executed.len()
+            || self.issued != self.executed.len() as u128 * 10
+        {
+            return Err(Error::Unavailable("complete state invariants"));
+        }
+        Ok(())
+    }
+
+    // Conservative cache charge counts shared ciphertexts afresh, so sharing can
+    // only reduce actual use; includes collection node/allocator slack.
+    pub(crate) fn cache_charge(&self) -> usize {
+        8192 + self.recovery.len() * 1024
+            + self.nullifiers.len() * 128
+            + self.effects.len() * 128
+            + self.accepted_outputs.len() * 192
+            + self.rewards.len() * 160
+            + self.executed.len() * 64
+            + self.cuts.len() * 256
+    }
+
+    /// Local-only materialized state manifest. Sets/history are the immutable
+    /// genesis plus linked reversible deltas; their exact hashes are in the
+    /// checkpoint state digest. Reopen recomputes and byte-compares this manifest.
+    pub(crate) fn manifest(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"SNF04ST1");
+        b.extend_from_slice(&(self.checkpoint.len() as u32).to_le_bytes());
+        b.extend_from_slice(&self.checkpoint);
+        for v in [
+            self.initial_leaves,
+            self.initial_pool,
+            self.leaves(),
+            self.pool,
+            self.burned,
+            self.nullifiers.len() as u64,
+            self.effects.len() as u64,
+        ] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for h in [
+            &self.domain,
+            &self.parameters,
+            &self.state_digest,
+            &self.checkpoint_id,
+            &self.prefix,
+            &self.j,
+            &self.dc,
+            &self.kc,
+        ] {
+            b.extend_from_slice(h);
+        }
+        b.extend_from_slice(&self.issued.to_le_bytes());
+        let frontier = self.tree.to_frontier();
+        if let Some(f) = frontier.value() {
+            b.push(1);
+            b.extend_from_slice(&u64::from(f.position()).to_le_bytes());
+            b.extend_from_slice(&f.leaf().to_bytes());
+            b.push(f.ommers().len() as u8);
+            for n in f.ommers() {
+                b.extend_from_slice(&n.to_bytes());
+            }
+        } else {
+            b.push(0);
+        }
+        b.push(self.tail.len() as u8);
+        for row in &self.tail {
+            b.extend_from_slice(row);
+        }
+        b.extend_from_slice(&(self.cuts.len() as u64).to_le_bytes());
+        for c in &self.cuts {
+            b.extend_from_slice(&c.index.to_le_bytes());
+            for h in [&c.prefix, &c.root, &c.id] {
+                b.extend_from_slice(h);
+            }
+            b.extend_from_slice(&c.leaves.to_le_bytes());
+        }
+        b
+    }
+
+    pub(crate) fn delta(
+        &self,
+        prior: &Self,
+        outcomes: &[EffectOutcome],
+        rollback: bool,
+    ) -> Result<Vec<u8>> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"SNF04DL1");
+        b.push(u8::from(rollback));
+        b.extend_from_slice(&[0; 7]);
+        b.extend_from_slice(&prior.checkpoint_id);
+        b.extend_from_slice(&self.checkpoint_id);
+        b.extend_from_slice(&(outcomes.len() as u32).to_le_bytes());
+        for o in outcomes {
+            b.push(match o {
+                EffectOutcome::Accepted => 0,
+                EffectOutcome::IneligibleCut => 1,
+                EffectOutcome::Duplicate => 2,
+                EffectOutcome::Conflict => 3,
+                EffectOutcome::Bounds => 4,
+            });
+        }
+        if rollback {
+            // Both complete state manifests and the immutable head lineage name
+            // every reversed delta. No set union or partial balance restoration.
+            for state in [prior, self] {
+                let m = state.manifest();
+                b.extend_from_slice(&(m.len() as u32).to_le_bytes());
+                b.extend_from_slice(&m);
+            }
+        } else {
+            if self.executed.len() != prior.executed.len() + 8
+                || !self.executed.starts_with(&prior.executed)
+            {
+                return Err(Error::Unavailable("delta prefix"));
+            }
+            for set in [&self.nullifiers, &self.effects]
+                .into_iter()
+                .zip([&prior.nullifiers, &prior.effects])
+            {
+                let added: Vec<_> = set.0.difference(set.1).collect();
+                b.extend_from_slice(&(added.len() as u32).to_le_bytes());
+                for x in added {
+                    b.extend_from_slice(x);
+                }
+            }
+            let added = &self.recovery[prior.recovery.len()..];
+            b.extend_from_slice(&(added.len() as u32).to_le_bytes());
+            for x in added {
+                b.extend_from_slice(x.as_slice());
+            }
+            for r in &self.rewards[prior.rewards.len()..] {
+                b.extend_from_slice(r);
+            }
+        }
+        Ok(b)
+    }
+
+    /// Canonical next-checkpoint maturity (not finality).
+    #[must_use]
+    pub fn eligible_cut(&self) -> &Cut {
+        &self.cuts[eligible_cut_index(self.checkpoint_index + 1) as usize]
+    }
+    /// Complete canonical cut catalog, including immature cuts.
+    #[must_use]
+    pub fn cuts(&self) -> &[Cut] {
+        &self.cuts
+    }
+    /// Public state digest.
+    #[must_use]
+    pub const fn digest(&self) -> Digest {
+        self.state_digest
+    }
+    /// Current complete checkpoint-prefix Q, not eligible-position J or cut Q.
+    #[must_use]
+    pub const fn prefix_commitment(&self) -> Digest {
+        self.prefix
+    }
+    /// Complete current checkpoint bytes (136 at genesis, then 484).
+    #[must_use]
+    pub fn checkpoint_bytes(&self) -> &[u8] {
+        &self.checkpoint
+    }
+    /// Exact current checkpoint ID.
+    #[must_use]
+    pub const fn checkpoint_id(&self) -> Digest {
+        self.checkpoint_id
+    }
+    /// Number of completed checkpoints.
+    #[must_use]
+    pub const fn checkpoint_index(&self) -> u64 {
+        self.checkpoint_index
+    }
+    /// F0 eligible-prefix fold J.
+    #[must_use]
+    pub const fn eligible_commitment(&self) -> Digest {
+        self.j
+    }
+    /// Completed eligible IDs only; an incomplete interval is graph evidence.
+    #[must_use]
+    pub fn executed(&self) -> &[VertexId] {
+        &self.executed
+    }
+    /// Public pool and cumulative private burn counters.
+    #[must_use]
+    pub const fn private_counters(&self) -> (u64, u64) {
+        (self.pool, self.burned)
+    }
+    /// Position-bound ordered recovery history, including genesis.
+    #[must_use]
+    pub fn recovery(&self) -> &[Arc<[u8; RECOVERY_BYTES]>] {
+        &self.recovery
+    }
+    /// Derived accepted-order output linkage. Restored by whole-state rollback and
+    /// rebuilt through the reducer on replay, never adopted from received metadata.
+    #[must_use]
+    pub fn accepted_outputs(&self) -> &[Arc<AcceptedOutputs>] {
+        &self.accepted_outputs
+    }
+    /// Genesis outputs have no retained value commitment for ordinary OVK recovery.
+    #[must_use]
+    pub const fn genesis_leaves(&self) -> u64 {
+        self.initial_leaves
+    }
+    /// Spentness at this complete canonical state.
+    #[must_use]
+    pub fn contains_nullifier(&self, nf: &Digest) -> bool {
+        self.nullifiers.contains(nf)
+    }
+    /// Exact economic-effect acceptance at this reversible canonical snapshot.
+    /// This does not establish delivery of a particular authorization encoding.
+    #[must_use]
+    pub fn contains_effect(&self, effect: &Digest) -> bool {
+        self.effects.contains(effect)
+    }
+    /// Current leaf count.
+    #[must_use]
+    pub fn leaves(&self) -> u64 {
+        self.recovery.len() as u64
+    }
+    /// Standard Sapling note root.
+    #[must_use]
+    pub fn root(&self) -> Digest {
+        self.tree.root().to_bytes()
+    }
+    /// Issued/mature public nontransferable attribution credits.
+    #[must_use]
+    pub fn public_balance(&self, owner: &Digest) -> (u128, u128) {
+        let mut issued = 0;
+        let mut mature = 0;
+        for r in &self.rewards {
+            if r[40..72] == *owner {
+                issued += 10;
+                let i = u64::from_le_bytes(r[..8].try_into().expect("fixed reward"));
+                if u128::from(i) + 16 <= self.executed.len() as u128 {
+                    mature += 10;
+                }
+            }
+        }
+        (issued, mature)
+    }
+}
+
+/// Largest eligible cut at execution checkpoint j. Genesis cut is the explicit exception.
+#[must_use]
+pub const fn eligible_cut_index(j: u64) -> u64 {
+    j.saturating_sub(1).saturating_div(128).saturating_sub(2)
+}
+
+pub(crate) fn fold_j(n: &Digest, prior: Digest, position: u64, id: Digest) -> Digest {
+    domain_hash(
+        "SilkNode-F0-eligible",
+        &[n, &prior, &position.to_le_bytes(), &id],
+    )
+}
+#[cfg(test)]
+fn hash_stream<'a>(
+    label: &'static str,
+    n: &Digest,
+    count: usize,
+    entries: impl Iterator<Item = &'a [u8]>,
+) -> Digest {
+    hash_stream_checked(label, n, count, entries, None).unwrap()
+}
+fn hash_stream_checked<'a>(
+    label: &'static str,
+    n: &Digest,
+    count: usize,
+    entries: impl Iterator<Item = &'a [u8]>,
+    budget: Option<&crate::budget::JobBudget>,
+) -> Result<Digest> {
+    let mut h = Sha256::new();
+    h.update([label.len() as u8]);
+    h.update(label.as_bytes());
+    h.update(n);
+    h.update((count as u64).to_le_bytes());
+    for (i, entry) in entries.enumerate() {
+        if i % 64 == 0 {
+            if let Some(budget) = budget {
+                budget.check()?;
+            }
+        }
+        h.update(entry);
+    }
+    Ok(h.finalize().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exact_cut_eligibility_boundaries() {
+        for j in [1, 127, 128, 129, 256, 384] {
+            assert_eq!(eligible_cut_index(j), 0);
+        }
+        for j in [385, 386, 512] {
+            assert_eq!(eligible_cut_index(j), 1);
+        }
+        assert_eq!(eligible_cut_index(513), 2);
+    }
+    #[test]
+    fn streamed_hash_matches_literal_full_count_prefixed_bytes() {
+        let n = [3; 32];
+        let a = [4; 32];
+        let b = [5; 32];
+        assert_eq!(
+            hash_stream(
+                "SilkNode-F0-NF",
+                &n,
+                2,
+                [a.as_slice(), b.as_slice()].into_iter()
+            ),
+            domain_hash("SilkNode-F0-NF", &[&n, &2_u64.to_le_bytes(), &a, &b])
+        );
+    }
+}

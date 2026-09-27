@@ -1,0 +1,19 @@
+{
+  "schema": "silknode.gate-a.linear-order.v1",
+  "anchor_reference_hex": "b0015240a325ad31a175049ab7d7959c2d9d5a5207957d4bb637894d95c9a5609d93",
+  "vertices": [
+    {
+      "id": "0101010101010101010101010101010101010101010101010101010101010101",
+      "parent": {
+        "kind": "anchor",
+        "reference_hex": "b0015240a325ad31a175049ab7d7959c2d9d5a5207957d4bb637894d95c9a5609d93"
+      },
+      "declared_test_work": "1",
+      "body_available": false
+    }
+  ],
+  "expected": {
+    "order": [],
+    "cumulative_test_work": "0"
+  }
+}

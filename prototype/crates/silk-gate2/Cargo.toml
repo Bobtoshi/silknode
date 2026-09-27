@@ -1,0 +1,23 @@
+[package]
+name = "silk-gate2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Enables only the local, valueless corpus adapter.  Production builds have no
+# public constructor for opaque checkpoint, interval, or eligibility pins.
+private-test-harness = []
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

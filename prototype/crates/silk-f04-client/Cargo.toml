@@ -1,0 +1,28 @@
+[package]
+name = "silk-f04-client"
+description = "Explicit private F04 wallet-to-relay submission owner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+silk-f04-wallet = { path = "../silk-f04-wallet", features = ["local-node"] }
+silk-f04-relay = { path = "../silk-f04-relay" }
+silk-f04-node = { path = "../silk-f04-node" }
+silk-sapling-f04 = { path = "../silk-sapling-f04" }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+sha2.workspace = true
+silk-local-platform = { path = "../silk-local-platform" }
+ed25519-dalek = "=2.2.0"
+tempfile = "3"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+sapling-crypto = { version = "=0.7.0", default-features = false, features = ["circuit"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+zcash_note_encryption = { version = "=0.4.2", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

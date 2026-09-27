@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/silk-types",
+  "crates/silk-profile",
+  "crates/silk-bootstrap",
+  "crates/silk-order",
+  "crates/silk-kernel",
+  "crates/silk-genesis",
+  "crates/silk-gate2",
+  "crates/silk-randomx",
+  "crates/silk-local-platform",
+  "crates/silk-pow",
+  "crates/silk-sapling-f04",
+  "crates/silk-f04-node",
+  "crates/silk-f04-wallet",
+  "crates/silk-f04-relay",
+  "crates/silk-f04-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+thiserror = "2.0.16"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"

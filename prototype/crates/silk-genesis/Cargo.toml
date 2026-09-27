@@ -1,0 +1,21 @@
+[package]
+name = "silk-genesis"
+description = "Deterministic non-PoW genesis state anchor for the SilkNode prototype"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+silk-kernel = { path = "../silk-kernel" }
+silk-profile = { path = "../silk-profile" }
+silk-types = { path = "../silk-types" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

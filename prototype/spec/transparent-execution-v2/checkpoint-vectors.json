@@ -1,0 +1,224 @@
+{
+  "schema": "silknode.transparent-checkpoint.vectors.v3",
+  "abi_version": 3,
+  "role": "Checkpoint",
+  "corpus_status": {
+    "kind": "initial_finite_descriptor_independent_corpus",
+    "json_consumed_by_current_rust_test_runner": false,
+    "independent_standard_library_oracle": true,
+    "complete_second_client": false,
+    "detached_full_transition_corpus_executed_by_both_languages": true,
+    "limitations": [
+      "one checkpoint-zero projection and one one-body interval projection",
+      "the descriptor-independent state projections remain intentionally small",
+      "the larger shared transition corpus is detached to avoid a descriptor/profile identity cycle",
+      "finite multi-body, replay, rollback, rejection, precedence, and field-tamper coverage is not proof of exhaustive mutation or production safety",
+      "the separate genesis-receipt consumer still checks only the detached A2a-5 receipt grammar; the transparent-kernel oracle derives checkpoint state but does not validate a full profile manifest"
+    ]
+  },
+  "literal_context": {
+    "origin": "literal_test_constants_not_derived_from_any_descriptor_manifest_module_or_genesis_identity",
+    "chain_domain_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "profile_domain_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "zero_checkpoint_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "native_kernel_fixture_link": {
+    "subject": "native-kernel-vectors.json",
+    "genesis_case": "literal_single_entry_genesis",
+    "interval_case": "spend_42_to_40_with_fee_2",
+    "link_status": "semantic package reference; exact dependency identity and every artifact digest remain detached"
+  },
+  "gate_a_genesis_receipt_fixture": {
+    "subject": "../../fixtures/genesis-receipt-v1.json",
+    "case_id": "transparent-two-entry-genesis-v1",
+    "template_canonical_length_bytes": 203,
+    "receipt_canonical_length_bytes": 197,
+    "rust_recomputes_receipt_from_profile_and_checkpoint_zero": true,
+    "python_recomputes_checkpoint_zero": false,
+    "binding_status": "detached end-to-end fixture; its final profile depends on the Checkpoint ModuleId, so its bytes and digest are not inputs to this descriptor-independent conformance root",
+    "status": "detached A2a-5 no-value derivation diagnostic; never a VertexId, GenesisObject, or GenesisId; the separate A2a-6 leaf owns the final non-PoW anchor"
+  },
+  "checkpoint_zero": {
+    "id": "seal_literal_single_entry_genesis",
+    "native_projection": {
+      "live_notes": [
+        {
+          "commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+          "note_fixture": "native-kernel-vectors.json#fixtures.source_note"
+        }
+      ],
+      "nullifiers_hex": [],
+      "commitment_history_hex": [
+        "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970"
+      ],
+      "recovery_history": [
+        {
+          "output_commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+          "payload_fixture": "native-kernel-vectors.json#fixtures.source_recovery_payload"
+        }
+      ],
+      "accepted_intents_hex": [],
+      "native_issued_u128": "42",
+      "fee_pool_u128": "0"
+    },
+    "checkpoint_fields": {
+      "previous_checkpoint_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "checkpoint_index_u64": "0",
+      "ordered_body_history_hex": [],
+      "bodies_in_checkpoint_hex": [],
+      "body_bindings_in_checkpoint_hex": [],
+      "accepted_effects_in_checkpoint": []
+    },
+    "state_digest_projection_canonical_length_bytes": 535,
+    "expected_state_digest_hex": "adb78718d68ad5383830f28ce0f89ad232f41ed6df475945c11b3a255e90d799",
+    "expected_checkpoint_id_hex": "f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd"
+  },
+  "one_body_interval": {
+    "id": "seal_one_accepted_spend",
+    "base_checkpoint_id_hex": "f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd",
+    "ordered_body": {
+      "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "transaction_count": 1,
+      "transaction_canonical_length_bytes": 688,
+      "transaction_canonical_hex": "0111111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd0200000000000000010000000169ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f09705549006c20d5ee33c82f4b6890867c5f3f064d3ca43420c0fcc53e9b3a50a86a01012a0000000000000031313131313131313131313131313131313131313131313131313131313131313232323232323232323232323232323232323232323232323232323232323232333333333333333333333333333333333333333333333333333333333333333334343434343434343434343434343434343434343434343434343434343434340101000000018a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d570128000000000000005151515151515151515151515151515151515151515151515151515151515151525252525252525252525252525252525252525252525252525252525252525253535353535353535353535353535353535353535353535353535353535353535454545454545454545454545454545454545454545454545454545454545454010000005f981701c1fc4054f4ad518ce50308fcd2a0f05b7d61af90187146bee5739e5c01000000018a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+      "expected_execution_binding_hex": "1f517801d27dad8c31163caacc2c81ddae7744088d8fe151112b9ae402c63ffb"
+    },
+    "native_result": {
+      "decisions": [
+        {
+          "position": 0,
+          "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "body_position": 0,
+          "transaction_position": 0,
+          "intent_id_hex": "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32",
+          "instance_hash_hex": "8ee8ba8a6faa5d8656bc792c883d7810808a2470c211bb297d60d8fbfe55d93a",
+          "outcome": "accepted"
+        }
+      ],
+      "accepted_effects": [
+        {
+          "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "intent_id_hex": "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32"
+        }
+      ],
+      "resulting_native_state": {
+        "live_notes": [
+          {
+            "commitment_hex": "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57",
+            "note_fixture": "native-kernel-vectors.json#fixtures.output_note"
+          }
+        ],
+        "nullifiers_hex": [
+          "5549006c20d5ee33c82f4b6890867c5f3f064d3ca43420c0fcc53e9b3a50a86a"
+        ],
+        "commitment_history_hex": [
+          "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+          "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57"
+        ],
+        "recovery_history": [
+          {
+            "output_commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+            "payload_fixture": "native-kernel-vectors.json#fixtures.source_recovery_payload"
+          },
+          {
+            "output_commitment_hex": "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57",
+            "payload_fixture": "native-kernel-vectors.json#fixtures.output_recovery_payload"
+          }
+        ],
+        "accepted_intents_hex": [
+          "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32"
+        ],
+        "native_issued_u128": "42",
+        "fee_pool_u128": "2"
+      }
+    },
+    "next_checkpoint_fields": {
+      "previous_checkpoint_hex": "f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd",
+      "checkpoint_index_u64": "1",
+      "ordered_body_history_hex": [
+        "4444444444444444444444444444444444444444444444444444444444444444"
+      ],
+      "bodies_in_checkpoint_hex": [
+        "4444444444444444444444444444444444444444444444444444444444444444"
+      ],
+      "body_bindings_in_checkpoint_hex": [
+        "1f517801d27dad8c31163caacc2c81ddae7744088d8fe151112b9ae402c63ffb"
+      ],
+      "accepted_effects_in_checkpoint": [
+        {
+          "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "intent_id_hex": "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32"
+        }
+      ]
+    },
+    "state_digest_projection_canonical_length_bytes": 952,
+    "expected_state_digest_hex": "e7994b4798bbf3d2e2c619ac399f62e2506d6e17520c831e8e170fdcadfd9068",
+    "expected_checkpoint_id_hex": "caefd97a62349485f4b9dcdc2d7b83986b4c8d0c0885ed338a16bfdb28b20fd2",
+    "expected_transition": {
+      "previous_checkpoint_id_hex": "f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd",
+      "next_checkpoint_id_hex": "caefd97a62349485f4b9dcdc2d7b83986b4c8d0c0885ed338a16bfdb28b20fd2",
+      "rollback_checkpoint_id_hex": "f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd",
+      "replay_from_same_inputs": "value-identical decision trace and next state"
+    }
+  },
+  "context_binding_projection": {
+    "id": "same_transaction_bytes_different_body_id",
+    "mutation": "replace the sole body_id and accepted-effect body_id with 45 repeated 32 bytes; retain transaction bytes and literal chain/profile",
+    "expected_body_binding_hex": "1f517801d27dad8c31163caacc2c81ddae7744088d8fe151112b9ae402c63ffb",
+    "expected_state_digest_hex": "0f387336a28edf1ef8ad28c66395111a07c7308cb15ad002d9fff988ca577a67",
+    "expected_checkpoint_id_hex": "9cdcbaf201a7d43125db0d89b1072f1e77ff5cdd9901bd40f189f6889c8e9ef5",
+    "reason": "body binding excludes body_id, while ordered-body and accepted-effect context in state commits the authoritative body position and identifier"
+  },
+  "structural_mutation_cases": [
+    {
+      "id": "wrong_execution_chain_precedes_profile",
+      "mutation": "replace execution context chain_domain with 55 repeated 32 bytes and profile_domain with 66 repeated 32 bytes while retaining the base",
+      "expected_error_code": "kernel.execution_chain_mismatch",
+      "expected_transition": "none"
+    },
+    {
+      "id": "wrong_execution_profile",
+      "mutation": "retain literal execution chain and replace execution profile_domain with 66 repeated 32 bytes while retaining the base",
+      "expected_error_code": "kernel.execution_profile_mismatch",
+      "expected_transition": "none"
+    },
+    {
+      "id": "empty_checkpoint",
+      "mutation": "replace ordered_bodies with the empty list",
+      "expected_error_code": "kernel.empty_checkpoint",
+      "expected_transition": "none"
+    },
+    {
+      "id": "duplicate_body_id",
+      "mutation": "supply two bodies whose body_id is 44 repeated 32 bytes",
+      "expected_error_code": "kernel.duplicate_ordered_body",
+      "expected_transition": "none"
+    },
+    {
+      "id": "supply_mismatch_projection",
+      "mutation": "in a diagnostic state projection change fee_pool from 2 to 3 without changing live value or native issuance",
+      "expected_outer_error_code": "kernel.invalid_state",
+      "expected_invariant_category": "SupplyMismatch",
+      "current_public_state_mutator_exists": false
+    },
+    {
+      "id": "body_history_suffix_mismatch_projection",
+      "mutation": "in a diagnostic state projection replace bodies_in_checkpoint with body 45 repeated 32 bytes while ordered_body_history ends in body 44 repeated 32 bytes",
+      "expected_outer_error_code": "kernel.invalid_state",
+      "expected_invariant_category": "CheckpointBodyHistoryMismatch",
+      "current_public_state_mutator_exists": false
+    }
+  ],
+  "known_validation_boundary": {
+    "stored_checkpoint_id_recomputed_by_validate_state": false,
+    "stored_checkpoint_zero_id_recomputed_by_genesis_receipt_verification": true,
+    "statement": "the standalone state validator does not compare a stored checkpoint_id with recomputation; the genesis-receipt path separately recomputes checkpoint zero's ID and requires equality"
+  },
+  "identity_cycle_guard": {
+    "contains_resulting_descriptor_hash": false,
+    "contains_resulting_module_identity": false,
+    "contains_manifest_or_derived_profile_identity": false,
+    "contains_source_build_executable_or_attestation_hash": false
+  },
+  "security_status": "transparent no-value Checkpoint control only; the receipt is detached A2a-5 diagnostic evidence, the A2a-6 non-PoW GenesisObject belongs to the separate silk-genesis leaf, and first-child proof-of-work is not covered; no body authenticity, persistence, proof-of-work, privacy, completeness, or production claim"
+}

@@ -1,0 +1,8 @@
+SilkNode brand assets licence notice
+
+SilkNode names, word marks, logos, icons, and visual brand artwork are not
+licensed under BSD-3-Clause or CC-BY-4.0. All copyright and trademark rights in
+those materials are reserved by their respective owner or owners.
+
+Accurate referential use is governed by TRADEMARKS.md. No other permission is
+granted by this repository.

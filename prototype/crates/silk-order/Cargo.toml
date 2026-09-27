@@ -1,0 +1,29 @@
+[package]
+name = "silk-order"
+description = "Deterministic cumulative-work control ordering for the SilkNode no-value prototype"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+silk-bootstrap = { path = "../silk-bootstrap" }
+silk-gate2 = { path = "../silk-gate2" }
+silk-pow = { path = "../silk-pow" }
+silk-types = { path = "../silk-types" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+silk-genesis = { path = "../silk-genesis" }
+silk-gate2 = { path = "../silk-gate2", features = ["private-test-harness"] }
+silk-kernel = { path = "../silk-kernel" }
+silk-profile = { path = "../silk-profile" }
+
+[lints]
+workspace = true

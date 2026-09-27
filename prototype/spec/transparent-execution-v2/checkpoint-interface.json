@@ -1,0 +1,151 @@
+{
+  "schema": "silknode.transparent-checkpoint.interface.v3",
+  "abi_version": 3,
+  "role": "Checkpoint",
+  "status": {
+    "kind": "semantic_interface_projection",
+    "independent_rust_entrypoint_exposed": false,
+    "current_facade": "TransparentExecutionHost combines NativeKernel evaluation with Checkpoint sealing",
+    "decoded_state_authority": false
+  },
+  "canonical_wire": {
+    "integer_byte_order": "little_endian",
+    "hash32_size_bytes": 32,
+    "object_type_tag": "u8",
+    "object_version": "u8",
+    "list_length_type": "u32",
+    "state_digest_projection_version": 1,
+    "state_digest_projection_is_not_checkpoint_state_wire": true,
+    "checkpoint_state_top_level_codec": "CheckpointStateWireV1",
+    "transition_top_level_codec": "TransitionV1",
+    "decode": "exact_to_unverified_type_with_trailing_byte_rejection"
+  },
+  "imported_types": {
+    "NativeNoteV1": "native-kernel-interface.json",
+    "RecoveryRecordV1": "native-kernel-interface.json",
+    "OrderedBodyV1": "native-kernel-interface.json",
+    "NativeStateProjectionV1": "native-kernel-interface.json",
+    "DecisionV1": "native-kernel-interface.json",
+    "AcceptedEffectV1": "native-kernel-interface.json",
+    "NativeIntervalResultV1": "native-kernel-interface.json"
+  },
+  "types": {
+    "CheckpointContext": {
+      "fields": [
+        { "name": "chain_domain", "type": "ChainDomain:Hash32" },
+        { "name": "profile_domain", "type": "ProfileDomain:Hash32" }
+      ]
+    },
+    "CheckpointStateWireV1": {
+      "type_tag": 197,
+      "version": 1,
+      "fields": [
+        { "name": "chain_domain", "type": "ChainDomain:Hash32" },
+        { "name": "profile_domain", "type": "ProfileDomain:Hash32" },
+        { "name": "checkpoint_id", "type": "CheckpointId:Hash32", "trust": "unverified_until_recomputed_and_externally_pinned" },
+        { "name": "previous_checkpoint", "type": "CheckpointId:Hash32" },
+        { "name": "checkpoint_index", "type": "u64" },
+        { "name": "live_notes", "type": "strictly_sorted_unique_map[NoteCommitment => NativeNoteV1]" },
+        { "name": "nullifiers", "type": "strictly_sorted_unique_set[Nullifier]" },
+        { "name": "commitment_history", "type": "strictly_sorted_unique_set[NoteCommitment]" },
+        { "name": "recovery_history", "type": "ordered_list[RecoveryRecordV1]" },
+        { "name": "ordered_body_history", "type": "ordered_list[VertexId]" },
+        { "name": "bodies_in_checkpoint", "type": "ordered_list[VertexId]", "max_items": 1024 },
+        { "name": "body_bindings_in_checkpoint", "type": "ordered_list[BodyCommitment]", "max_items": 1024 },
+        { "name": "accepted_intents", "type": "strictly_sorted_unique_set[IntentId]" },
+        { "name": "accepted_effects_in_checkpoint", "type": "ordered_list[AcceptedEffectV1]", "max_items": 4096 },
+        { "name": "native_issued", "type": "u128" },
+        { "name": "fee_pool", "type": "u128" }
+      ],
+      "native_field_layout": "the logical fields match NativeStateProjectionV1 but are inlined around checkpoint-only history in the stated order; there is no nested c0 type/version prefix",
+      "promotion": [
+        "match the bound host chain and profile",
+        "validate every native and checkpoint invariant",
+        "recompute the state digest and checkpoint identifier",
+        "match the stored identifier",
+        "match a separately supplied trusted checkpoint identifier pin",
+        "return a freshly constructed immutable checkpoint state"
+      ]
+    },
+    "CheckpointStateDigestProjectionV1": {
+      "tag": 1,
+      "fields_in_order": [
+        "chain_domain",
+        "profile_domain",
+        "previous_checkpoint",
+        "checkpoint_index",
+        "live_notes",
+        "nullifiers",
+        "commitment_history",
+        "recovery_history",
+        "ordered_body_history",
+        "bodies_in_checkpoint",
+        "body_bindings_in_checkpoint",
+        "accepted_intents",
+        "accepted_effects_in_checkpoint",
+        "native_issued",
+        "fee_pool"
+      ],
+      "identity_cycle_rule": "checkpoint_id is excluded",
+      "compatibility": "byte-identical to Checkpoint ABI 2"
+    },
+    "TransitionV1": {
+      "type_tag": 198,
+      "version": 1,
+      "fields": [
+        { "name": "previous", "type": "CheckpointStateWireV1" },
+        { "name": "next", "type": "CheckpointStateWireV1" },
+        { "name": "decisions", "type": "ordered_list[DecisionV1]", "max_items": 4096 }
+      ],
+      "promotion": "from a separately trusted base and ordered bodies, recompute execution and sealing, exact-compare every candidate field, and return the recomputed Transition"
+    },
+    "GateAGenesisReceiptV1": {
+      "tag": 1,
+      "canonical_length_bytes": 197,
+      "authority": "decoded receipt values remain untrusted until every field is recomputed against the sealed profile and verified checkpoint zero",
+      "compatibility": "byte-identical to Checkpoint ABI 2"
+    },
+    "MaterializedGenesis": {
+      "fields": [
+        { "name": "state", "type": "trusted CheckpointState" },
+        { "name": "receipt", "type": "verified GateAGenesisReceiptV1" }
+      ]
+    }
+  },
+  "operations": [
+    {
+      "name": "seal_genesis",
+      "inputs": ["CheckpointContext", "dependent NativeStateProjectionV1"],
+      "output": "MaterializedGenesis",
+      "precondition": "native projection is created inside the same sealed host invocation"
+    },
+    {
+      "name": "seal_interval",
+      "inputs": ["CheckpointContext", "trusted CheckpointState", "ordered_list[OrderedBodyV1]", "dependent NativeIntervalResultV1"],
+      "output": "TransitionV1",
+      "precondition": "native result is created inside the same sealed host invocation and cannot be injected from its codec"
+    },
+    {
+      "name": "verify_checkpoint_state",
+      "inputs": ["UnverifiedCheckpointStateWireV1", "bound host context", "external trusted CheckpointId pin"],
+      "output": "freshly constructed trusted CheckpointState",
+      "failure_model": "context, invariant, derived identity, or external pin mismatch rejects"
+    },
+    {
+      "name": "verify_transition",
+      "inputs": ["UnverifiedTransitionV1", "trusted base CheckpointState", "ordered_list[OrderedBodyV1]"],
+      "output": "freshly recomputed TransitionV1",
+      "failure_model": "unknown code or any exact deterministic replay mismatch rejects"
+    },
+    {
+      "name": "rollback",
+      "input": "trusted TransitionV1",
+      "output": "unchanged previous CheckpointState"
+    }
+  ],
+  "dependency_contract": {
+    "semantic_dependency_roles": ["NativeKernel"],
+    "exact_dependency_identity": "constructed outside this subject after the NativeKernel descriptor is frozen"
+  },
+  "security_status": "Checkpoint ABI 3 adds unverified evidence codecs and verified promotion; it provides no body authenticity, persistence, proof of work, privacy, production, valuable operation, or caller-created state authority"
+}

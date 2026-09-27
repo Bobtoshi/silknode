@@ -1,0 +1,220 @@
+{
+  "schema": "silknode.transparent-native-kernel.vectors.v2",
+  "abi_version": 2,
+  "role": "NativeKernel",
+  "corpus_status": {
+    "kind": "initial_finite_descriptor_independent_corpus",
+    "json_consumed_by_current_rust_test_runner": false,
+    "independent_standard_library_oracle": true,
+    "complete_second_client": false,
+    "detached_full_transition_corpus_executed_by_both_languages": true,
+    "limitations": [
+      "one positive genesis and one positive spend",
+      "these descriptor-independent projections remain intentionally small",
+      "the larger shared transition corpus is detached to avoid a descriptor/profile identity cycle",
+      "finite differential and mutation coverage is not proof of completeness, fuzzing, or production safety"
+    ]
+  },
+  "literal_context": {
+    "origin": "literal_test_constants_not_derived_from_any_descriptor_manifest_module_or_genesis_identity",
+    "chain_domain_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "profile_domain_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "fixtures": {
+    "source_note": {
+      "value_u64": "42",
+      "owner_tag_hex": "3131313131313131313131313131313131313131313131313131313131313131",
+      "rho_hex": "3232323232323232323232323232323232323232323232323232323232323232",
+      "randomness_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "nullifier_key_hex": "3434343434343434343434343434343434343434343434343434343434343434"
+    },
+    "source_recovery_payload": {
+      "encoding": "repeat_byte",
+      "byte_hex": "a1",
+      "count": 128
+    },
+    "output_note": {
+      "value_u64": "40",
+      "owner_tag_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+      "rho_hex": "5252525252525252525252525252525252525252525252525252525252525252",
+      "randomness_hex": "5353535353535353535353535353535353535353535353535353535353535353",
+      "nullifier_key_hex": "5454545454545454545454545454545454545454545454545454545454545454"
+    },
+    "output_recovery_payload": {
+      "encoding": "repeat_byte",
+      "byte_hex": "b1",
+      "count": 128
+    }
+  },
+  "genesis_materialization": {
+    "id": "literal_single_entry_genesis",
+    "allocation_template_canonical_length_bytes": 271,
+    "allocation_template_canonical_hex": "010100000001012a000000000000003131313131313131313131313131313131313131313131313131313131313131323232323232323232323232323232323232323232323232323232323232323233333333333333333333333333333333333333333333333333333333333333333434343434343434343434343434343434343434343434343434343434343434a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "expected_allocation_template_hash_hex": "f6135759006a6c0e5d16cba9c143a7957da0bf21b1f452caa216aea77d3f9a67",
+    "expected_source_note_commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+    "expected_source_note_nullifier_hex": "5549006c20d5ee33c82f4b6890867c5f3f064d3ca43420c0fcc53e9b3a50a86a",
+    "expected_source_recovery_record_hash_hex": "1c8ec6a9b03a73b8e3bfbac4fa76780c96ea7f8e34c07a60400c482b6b10af9d",
+    "expected_native_state": {
+      "live_notes": [
+        {
+          "commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+          "note_fixture": "source_note"
+        }
+      ],
+      "nullifiers_hex": [],
+      "commitment_history_hex": [
+        "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970"
+      ],
+      "recovery_history": [
+        {
+          "output_commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+          "payload_fixture": "source_recovery_payload"
+        }
+      ],
+      "accepted_intents_hex": [],
+      "native_issued_u128": "42",
+      "fee_pool_u128": "0"
+    }
+  },
+  "accepted_spend": {
+    "id": "spend_42_to_40_with_fee_2",
+    "anchor_checkpoint_hex": "f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd",
+    "public_fee_u64": "2",
+    "input_note_fixture": "source_note",
+    "authorization_valid": true,
+    "output_note_fixture": "output_note",
+    "output_recovery_payload_fixture": "output_recovery_payload",
+    "transaction_canonical_length_bytes": 688,
+    "transaction_canonical_hex": "0111111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222f3ec319d0fb4c3c1d996e8b5e613fec6aa01e0dbd025c531a6975a404894d0dd0200000000000000010000000169ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f09705549006c20d5ee33c82f4b6890867c5f3f064d3ca43420c0fcc53e9b3a50a86a01012a0000000000000031313131313131313131313131313131313131313131313131313131313131313232323232323232323232323232323232323232323232323232323232323232333333333333333333333333333333333333333333333333333333333333333334343434343434343434343434343434343434343434343434343434343434340101000000018a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d570128000000000000005151515151515151515151515151515151515151515151515151515151515151525252525252525252525252525252525252525252525252525252525252525253535353535353535353535353535353535353535353535353535353535353535454545454545454545454545454545454545454545454545454545454545454010000005f981701c1fc4054f4ad518ce50308fcd2a0f05b7d61af90187146bee5739e5c01000000018a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "expected_output_commitment_hex": "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57",
+    "expected_output_recovery_record_hash_hex": "5f981701c1fc4054f4ad518ce50308fcd2a0f05b7d61af90187146bee5739e5c",
+    "expected_effect_digest_hex": "8181f80a148405357a2439dda84cd51b92b0ee9fed66a84d4c1af7b2afb2dccb",
+    "expected_intent_id_hex": "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32",
+    "expected_instance_hash_hex": "8ee8ba8a6faa5d8656bc792c883d7810808a2470c211bb297d60d8fbfe55d93a",
+    "expected_native_result": {
+      "decisions": [
+        {
+          "position": 0,
+          "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "body_position": 0,
+          "transaction_position": 0,
+          "intent_id_hex": "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32",
+          "instance_hash_hex": "8ee8ba8a6faa5d8656bc792c883d7810808a2470c211bb297d60d8fbfe55d93a",
+          "outcome": "accepted"
+        }
+      ],
+      "accepted_effects": [
+        {
+          "body_id_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "intent_id_hex": "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32"
+        }
+      ],
+      "resulting_native_state": {
+        "live_notes": [
+          {
+            "commitment_hex": "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57",
+            "note_fixture": "output_note"
+          }
+        ],
+        "nullifiers_hex": [
+          "5549006c20d5ee33c82f4b6890867c5f3f064d3ca43420c0fcc53e9b3a50a86a"
+        ],
+        "commitment_history_hex": [
+          "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+          "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57"
+        ],
+        "recovery_history": [
+          {
+            "output_commitment_hex": "69ff403999e924b9b0ee5eedd9531c0df3155705e2d1c7eac1e00092665f0970",
+            "payload_fixture": "source_recovery_payload"
+          },
+          {
+            "output_commitment_hex": "8a01344592cf078dcf3e72f4406cdefdfcf5e4deb5789f9f0245b50359e36d57",
+            "payload_fixture": "output_recovery_payload"
+          }
+        ],
+        "accepted_intents_hex": [
+          "647726e35a73604301541d02630818af70ebf5b285f4bf30cf58b6ac64fe2c32"
+        ],
+        "native_issued_u128": "42",
+        "fee_pool_u128": "2"
+      }
+    }
+  },
+  "mutation_cases": [
+    {
+      "id": "empty_inputs_precedes_later_failures",
+      "base": "accepted_spend",
+      "mutation": "replace inputs with the empty list",
+      "expected_reject": { "numeric": 5, "code": "kernel.empty_inputs" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "literal_wrong_chain_fails_closed",
+      "base": "accepted_spend",
+      "mutation": "replace transaction chain_domain with 5555555555555555555555555555555555555555555555555555555555555555",
+      "expected_reject": { "numeric": 2, "code": "kernel.wrong_chain" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "literal_wrong_profile_fails_closed",
+      "base": "accepted_spend",
+      "mutation": "replace transaction profile_domain with 6666666666666666666666666666666666666666666666666666666666666666",
+      "expected_reject": { "numeric": 3, "code": "kernel.wrong_profile" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "literal_wrong_anchor_fails_closed",
+      "base": "accepted_spend",
+      "mutation": "replace anchor with 7777777777777777777777777777777777777777777777777777777777777777",
+      "expected_reject": { "numeric": 4, "code": "kernel.wrong_checkpoint" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "false_boolean_authorization",
+      "base": "accepted_spend",
+      "mutation": "replace the input authorization_valid byte 01 with canonical false 00",
+      "expected_reject": { "numeric": 14, "code": "kernel.invalid_transparent_witness" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "conservation_precedes_recovery_validation",
+      "base": "accepted_spend",
+      "mutation": "replace public_fee 2 with 3 while retaining input value 42 and output value 40",
+      "expected_reject": { "numeric": 24, "code": "kernel.conservation_failure" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "recovery_vector_length_mismatch",
+      "base": "accepted_spend",
+      "mutation": "replace recovery_records with the empty list while retaining one output and one recovery hash",
+      "expected_reject": { "numeric": 8, "code": "kernel.recovery_vector_mismatch" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "recovery_hash_mismatch",
+      "base": "accepted_spend",
+      "mutation": "replace the declared recovery hash with 0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_reject": { "numeric": 22, "code": "kernel.recovery_hash_mismatch" },
+      "expected_rejected_transaction_native_effect": "none"
+    },
+    {
+      "id": "same_interval_duplicate_intent",
+      "base": "accepted_spend",
+      "mutation": "execute the exact base transaction first in body 44 repeated 32 bytes and then in body 45 repeated 32 bytes in the same interval",
+      "expected_decisions": [
+        { "position": 0, "outcome": "accepted" },
+        { "position": 1, "outcome": "rejected", "numeric": 1, "code": "kernel.duplicate_intent" }
+      ],
+      "expected_second_transaction_native_effect": "none"
+    }
+  ],
+  "identity_cycle_guard": {
+    "contains_resulting_descriptor_hash": false,
+    "contains_resulting_module_identity": false,
+    "contains_manifest_or_derived_profile_identity": false,
+    "contains_source_build_executable_or_attestation_hash": false
+  },
+  "security_status": "transparent no-value control only; no privacy, secure ownership, completeness, or production claim"
+}

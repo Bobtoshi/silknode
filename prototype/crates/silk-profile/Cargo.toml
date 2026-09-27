@@ -1,0 +1,19 @@
+[package]
+name = "silk-profile"
+description = "Fail-closed protocol manifests and module capability validation for SilkNode Gate A"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+silk-types = { path = "../silk-types" }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

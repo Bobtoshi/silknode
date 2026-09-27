@@ -1,0 +1,61 @@
+{
+  "schema": "silknode.gate-a.genesis-receipt.v1",
+  "case_id": "transparent-two-entry-genesis-v1",
+  "canonical_template_hex": "0101000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000000006",
+  "canonical_receipt_hex": "0101000000dda5cd9e3801f331218a51eeb0ec4e15058eb60af2ebf478ee7b1300d37101e09f40906b7b24017a75978dd6903dfb72ab20453b581097464c9793cf1ea96cc6fa58f03cd4b21f477e7072c6c0411f6a93eae290299d6f81adcfb7208bb09b7c6a745df0a1370b5a89019d00c0e8166b9bf704bdd5ea6bb9343e7a57040ea6c7ce70b565c37f26b69e16d48455505cac78ed0a9039cb47e5f336e8cc124712469d2327d2675bfbd23341f5c347dc534a6654466d1259dd1009df199b81229d89",
+  "expected": {
+    "template": {
+      "canonical_length_bytes": 203,
+      "template_hash_hex": "b3959108b6a54272ac1cff33c49ac1abf8550e44e2d51354a0b5f280d1d07f7d",
+      "projection": {
+        "template_version_u8": 1,
+        "protocol_major_u32": 1,
+        "derived_slots": [
+          {
+            "field": "genesis_commitment",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 1
+          },
+          {
+            "field": "chain_domain",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 2
+          },
+          {
+            "field": "protocol_manifest_hash",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 3
+          },
+          {
+            "field": "profile_domain",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 4
+          },
+          {
+            "field": "checkpoint_zero_state_digest",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 5
+          },
+          {
+            "field": "checkpoint_zero_id",
+            "zero_placeholder_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recipe_tag_u8": 6
+          }
+        ]
+      }
+    },
+    "receipt": {
+      "canonical_length_bytes": 197,
+      "projection": {
+        "receipt_version_u8": 1,
+        "protocol_major_u32": 1,
+        "genesis_commitment_hex": "dda5cd9e3801f331218a51eeb0ec4e15058eb60af2ebf478ee7b1300d37101e0",
+        "chain_domain_hex": "9f40906b7b24017a75978dd6903dfb72ab20453b581097464c9793cf1ea96cc6",
+        "protocol_manifest_hash_hex": "fa58f03cd4b21f477e7072c6c0411f6a93eae290299d6f81adcfb7208bb09b7c",
+        "profile_domain_hex": "6a745df0a1370b5a89019d00c0e8166b9bf704bdd5ea6bb9343e7a57040ea6c7",
+        "checkpoint_zero_state_digest_hex": "ce70b565c37f26b69e16d48455505cac78ed0a9039cb47e5f336e8cc12471246",
+        "checkpoint_zero_id_hex": "9d2327d2675bfbd23341f5c347dc534a6654466d1259dd1009df199b81229d89"
+      }
+    }
+  }
+}

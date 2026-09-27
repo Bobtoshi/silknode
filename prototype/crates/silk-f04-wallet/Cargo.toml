@@ -1,0 +1,34 @@
+[package]
+name = "silk-f04-wallet"
+description = "Local-only F04 Sapling wallet and encrypted recovery components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Explicit local trusted-domain adapter, not a node endpoint or process boundary.
+local-node = ["dep:silk-f04-node"]
+
+[dependencies]
+silk-sapling-f04 = { path = "../silk-sapling-f04" }
+silk-f04-node = { path = "../silk-f04-node", optional = true }
+sapling-crypto = { version = "=0.7.0", default-features = false, features = ["circuit"] }
+zip32 = "=0.2.1"
+argon2 = { version = "=0.5.3", default-features = false, features = ["zeroize"] }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
+thiserror.workspace = true
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = "=2.2.0"
+zcash_note_encryption = { version = "=0.4.2", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

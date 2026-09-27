@@ -1,0 +1,24 @@
+[package]
+name = "silk-randomx"
+description = "Narrow safe wrapper for the pinned RandomX v2 SilkNode candidate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+thiserror.workspace = true
+
+# This crate deliberately does not inherit the workspace's `unsafe_code =
+# "forbid"` lint. All FFI unsafety is confined to `src/ffi.rs`; the public
+# API and every consensus-facing crate remain safe Rust.
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
