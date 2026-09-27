@@ -15,6 +15,8 @@ use silk_sapling_f04::{
 };
 use std::collections::BTreeSet;
 
+pub mod public_testnet_v1;
+
 /// Immutable profile parameters, in exact ascending ID order.
 #[must_use]
 pub fn parameter_bytes() -> [u8; 656] {

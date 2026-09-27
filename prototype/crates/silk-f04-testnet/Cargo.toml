@@ -1,0 +1,21 @@
+[package]
+name = "silk-f04-testnet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+silk-f04-node = { path = "../silk-f04-node" }
+silk-sapling-f04 = { path = "../silk-sapling-f04" }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex = "0.4"
+libc = "0.2"
+
+[lints]
+workspace = true

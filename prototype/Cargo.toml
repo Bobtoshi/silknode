@@ -16,6 +16,7 @@ members = [
   "crates/silk-f04-wallet",
   "crates/silk-f04-relay",
   "crates/silk-f04-client",
+  "crates/silk-f04-testnet",
 ]
 
 [workspace.package]
