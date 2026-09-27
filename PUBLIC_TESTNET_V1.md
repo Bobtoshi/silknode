@@ -12,14 +12,14 @@ a reachable seed means its new source has already been released.
 
 ## Build and configure a connecting miner
 
-Supported path: x86-64 Linux, Rust 1.93.0, Git, CMake, Make, a C/C++ compiler,
+Supported path: x86-64 Linux, Rustup with Rust 1.93.0, Git, CMake, Make, a C/C++ compiler,
 Python 3.11+ for optional parameter acquisition, and systemd/cgroup-v2 resource
 control. Use a Git checkout, not an archive: RandomX verifies its vendored index.
 
 From the checkout root:
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo build --manifest-path prototype/Cargo.toml \
+CARGO_BUILD_JOBS=1 cargo +1.93.0 build --manifest-path prototype/Cargo.toml \
   --locked --release -p silk-f04-testnet
 python3 tools/fetch-sapling-parameters.py parameters
 ./prototype/target/release/silk-f04-testnet identity
