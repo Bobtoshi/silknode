@@ -13,7 +13,7 @@ a reachable seed means its new source has already been released.
 ## Build and configure a connecting miner
 
 Supported path: x86-64 Linux, Rustup with Rust 1.93.0, Git, CMake, Make, a C/C++ compiler,
-Python 3.11+ for optional parameter acquisition, and systemd/cgroup-v2 resource
+Python 3.11+ for parameter acquisition/preparation, and systemd/cgroup-v2 resource
 control. Use a Git checkout, not an archive: RandomX verifies its vendored index.
 
 From the checkout root:
@@ -29,41 +29,53 @@ The acquisition tool verifies both complete ceremony files; the node checks them
 again before replay. They are required by the existing API even for empty
 carriers. No proving-parameter bodies or secret keys are bundled.
 
-Use a **new private state directory on a dedicated, capped filesystem**
-(maximum 16 GiB). Leave at least 4 GiB free on the separate host filesystem
-named by `host_margin`; do not defeat the checks or point it at the capped
-volume. The store pauses at its existing 14 GiB accounting threshold and
-4,096-vertex reference horizon. This is not indefinite operation.
+### Prepare a first join on Linux
 
-Copy [miner.example.json](testnet/public-v1/miner.example.json), replacing every
-`/ABS/...` path with a real absolute path. Create the state parent and sibling
-`pins` directory mode0700, owned by your unprivileged user. Do **not** pre-create
-`store`, `pins/head` or import another operator's store/pin. Generate a fresh
-public attribution tag with `openssl rand -hex 32`; this is not a spending key.
-Keep the JSON config local. Leave the pinned domain, seed and certificate fields
-unchanged when connecting to the bootstrap seed.
-
-Run these one at a time, with the same config and state directory:
+The explicit [preparation helper](tools/prepare-public-testnet-v1.py) replaces
+manual filesystem/config placeholders. Inspect it before running with sudo.
+It needs an existing non-root account, cgroup v2/systemd, util-linux and
+e2fsprogs. It installs no packages, accounts, persistent services, firewall rules
+or boot-time mounts, opens no listener and makes no network requests.
 
 ```sh
-# Set these to your checkout binary and edited configuration:
-testnet_binary=/ABS/checkout/prototype/target/release/silk-f04-testnet
-testnet_config=/ABS/miner.json
-run_testnet() {
-  systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
-    -p TasksMax=4 -p CPUQuota=100% \
-    "$testnet_binary" "$@" --config "$testnet_config"
-}
-run_testnet init
-run_testnet probe
-# --count follows --config for the mining command:
-systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 \
-  -p TasksMax=4 -p CPUQuota=100% \
-  "$testnet_binary" mine --config "$testnet_config" --count 8
-run_testnet sync
+# From the checkout root, as your ordinary Linux login user:
+sudo python3 tools/prepare-public-testnet-v1.py \
+  --destination /var/tmp/silknode-first-join-v1 \
+  --owner "$(id -un)" \
+  --binary "$PWD/prototype/target/release/silk-f04-testnet" \
+  --parameters "$PWD/parameters" \
+  --store-gib 4 --accept-public-zero-value
 ```
 
-A resource-control failure is not permission to run an unbounded fallback.
+The destination must not exist. The helper physically reserves and formats
+**only its newly created regular image file**, mounts it with nodev/nosuid/noexec,
+creates private sibling store/pin locations and a concrete pinned config, and
+generates a public attribution tag. It verifies both entire parameter files and
+the bootstrap CA before creating anything. The copied ELF is your selected
+locally built binary; its printed SHA256 identifies bytes, not release approval.
+The account owns node data, not the backing image or copied executable/parameters.
+
+Run the two exact commands it prints, in order: **init, then sync**. They use
+transient systemd jobs with your non-root UID, 4 GiB RAM, no swap, four tasks,
+one CPU, a 900-second lifetime and no listening sockets. `sync` discovers the
+pinned seed and independently revalidates its full genuine-work history; it
+does not import a peer's store or accept a peer's checkpoint as proof.
+An optional, separately printed `mine --count 1` command submits genuine work
+only when you explicitly run it. No mining occurs during preparation or sync.
+Commands/config are retained in `preparation.json` and `volume/node/config.json`.
+
+Preparation refuses existing directories/state, malformed inputs, insufficient
+backing reservation or host margin. A partial failure retains its new files for
+inspection; it does not delete, overwrite or silently retry. Once all node jobs
+have ended, the printed unmount command retains every file and note of state.
+For later remount, use the same `store.ext4` with `loop,nodev,nosuid,noexec` at
+the same `volume` path; never format it again. No automatic boot mount is added.
+
+Advanced operators can still use [miner.example.json](testnet/public-v1/miner.example.json)
+with an already capped filesystem and absolute paths. Keep at least 4 GiB free
+on the separate host filesystem; the image may be 1–16 GiB. Existing 14 GiB
+accounting and 4,096-vertex horizons remain, not indefinite-operation promises.
+A resource-control failure is a STOP, not permission for an unbounded fallback.
 Ordinary mining uses current wall time, genuine interpreted-light RandomX,
 initial work1 and the unchanged parent-local DAA. The CLI paces successive
 attempts 40 real seconds apart, not simulated time. It downloads full history,
@@ -124,3 +136,27 @@ miner with a different OS identity/store on the same host; it cannot establish
 operator independence or decentralization. TLS does not hide peer IP addresses.
 No network-privacy, adversarial-load, performance, long-history/maturity or
 production-readiness claims follow from this bounded launch check.
+
+## First-join evidence and limits (2026-09-29)
+
+The five focused, non-privileged checks pass with
+`PYTHONDONTWRITEBYTECODE=1 python3 tools/test_prepare_public_testnet_v1.py`.
+A fresh 4 GiB setup on x86-64 Linux completed the printed `init` then `sync`
+commands over pinned TLS: eight genuine-work vertices were locally verified,
+eight executed and checkpoint 1 was derived, with zero initial allocation.
+The existing seed process and retained head were unchanged; no work was mined.
+This reused the existing Linux binary (SHA256
+`a210eff0c5cad3144ec14b49ec744b5dbb8c32389177edbf8d2d5171a150df6e`),
+not a new build or a new release qualification.
+
+That check exposed lazy ext4 initialization releasing backing reservation.
+The helper now completes initialization before reserving and checks again at
+completion. A separate fresh preparation with the corrected format options
+retained at least 4 GiB of allocated backing through mount and unmount. The
+network sync was not repeated after this formatting-only correction.
+
+This was fresh state on the same operator's host as the seed, not an independent
+participant or separate-host onboarding acceptance. Other distributions,
+interrupted preparation and long-running operation remain **UNPROVEN** by this
+check. No privacy, decentralization, transferable assets or release readiness
+is established. Source publication remains a separate decision.
