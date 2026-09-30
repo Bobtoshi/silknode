@@ -27,6 +27,9 @@ pub const MAX_RESPONSE: usize = 32 * (90_000 + 4) + 4096;
 pub const MAX_REQUEST: usize = 90_001;
 const WINDOW: Duration = Duration::from_secs(45);
 pub const HANDSHAKE_WINDOW: Duration = Duration::from_secs(3);
+// Linux can coalesce a long SO_RCVTIMEO/SO_SNDTIMEO past its nominal end.
+// Short waits recheck the original Instant; progress never renews the window.
+const IO_SLICE: Duration = Duration::from_millis(100);
 pub fn hello(g: &Genesis) -> Result<[u8; 140]> {
     let protocol = carriage_hash(
         "SilkNode/PublicZeroWire/v1",
@@ -75,17 +78,51 @@ impl DeadlineSocket {
 }
 impl Read for DeadlineSocket {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        self.socket.set_read_timeout(Some(self.remaining()?))?;
-        self.socket.read(b)
+        loop {
+            self.socket
+                .set_read_timeout(Some(self.remaining()?.min(IO_SLICE)))?;
+            match self.socket.read(b) {
+                Ok(n) => {
+                    self.remaining()?;
+                    return Ok(n);
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 impl Write for DeadlineSocket {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.socket.set_write_timeout(Some(self.remaining()?))?;
-        if let Some(budget) = &mut self.budget {
-            budget.charge(b.len(), Instant::now())?;
+        loop {
+            self.socket
+                .set_write_timeout(Some(self.remaining()?.min(IO_SLICE)))?;
+            if let Some(budget) = &mut self.budget {
+                // Each actual TCP attempt, including retries, remains charged.
+                budget.charge(b.len(), Instant::now())?;
+            }
+            self.remaining()?;
+            match self.socket.write(b) {
+                Ok(n) => {
+                    self.remaining()?;
+                    return Ok(n);
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e),
+            }
         }
-        self.socket.write(b)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.socket.flush()
@@ -223,4 +260,35 @@ pub fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     stream.write_all(bytes)?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn short_io_slices_keep_original_deadline_and_refuse_late_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut stream = DeadlineSocket::new(socket).unwrap();
+        let began = Instant::now();
+        stream.until = began + Duration::from_millis(250);
+        assert_eq!(
+            stream.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(began.elapsed() >= Duration::from_millis(250));
+        assert!(began.elapsed() < Duration::from_millis(500));
+        peer.write_all(&[7]).unwrap();
+        assert_eq!(
+            stream.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            stream.write(&[8]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 }

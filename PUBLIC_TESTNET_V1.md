@@ -251,3 +251,36 @@ mining, proof generation or replay is involved.
 This is a local candidate awaiting narrow independent review, not accepted or
 deployed source. Exact-binary Linux service validation remains required after
 acceptance; GitHub main and the live seed were not changed by this correction.
+
+## Exact-source Linux canary blocked on timeout cleanup (2026-09-30)
+
+Published `a66e956f2c296438303378302a9b3636b1ad233b` built on x86-64 Linux
+with Rust 1.93.0. Its release ELF SHA256 is
+`3fc695988d7388d3065e28ed00a39fab4d9cc4e817326dc2d9d68e4810d4ca28`.
+An isolated loopback canary used the seed UID/rootfs, a new reserved 4 GiB store
+and the real four-task/4 GiB/no-swap/one-CPU limits. It refused A's second socket,
+served B discovery in 0.054 seconds, and admitted one previously mined public
+carrier in 0.944 seconds while A remained stalled after its valid hello. Peak
+seed tasks were four (owner, two sockets and the admission worker), with zero
+pids-limit violations. No new work or proofs were generated.
+
+Both existing focused native tests passed in 45.96 seconds. Their separate
+five-task allowance included test-harness threads; the actual seed stayed at four.
+The runtime handshake stalls closed after 3.264 and 3.074 seconds. However, the
+nominal 45-second payload slot lasted 46.884 seconds, outside the existing
+transport regression's 46-second cleanup allowance. The new external driver
+initially returned PASS using a looser 47-second check; that is not acceptance.
+The measured result is retained and rollout is **BLOCKED**, not qualified by
+changing the accepted bound. The canary ended, all its workers/processes and
+namespace listener disappeared, and its filesystem was unmounted. The real
+seed binary/configuration/store/head and other services were not changed.
+
+This local, unpublished correction replaces long individual socket waits with
+at most 100 ms waits that recheck the original absolute deadline. Transient
+timeout/interruption retries never renew the window; late completed I/O is
+refused. Every TCP write attempt remains conservatively charged, including
+retries. The configured 3/45-second windows, connection/rate/byte caps,
+thread counts and serialized consensus/history/TLS framing remain unchanged.
+One short original-deadline/late-I/O test passes locally. This candidate still
+needs narrow independent review and a new exact-binary Linux timing check;
+neither source publication nor live rollout follows from this short test.
