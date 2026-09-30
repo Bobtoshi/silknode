@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MAX_CONNECTIONS: usize = 3;
+// TasksMax=4 also covers the node owner's one derivation/verification worker.
+// Two socket workers + owner + core worker fit; three sockets would exhaust it.
+pub const MAX_CONNECTIONS: usize = 2;
 const PEER_CONNECTIONS: usize = 2;
 const PEER_STARTS: usize = 16;
 const GLOBAL_STARTS: usize = 64;
@@ -151,6 +153,8 @@ mod tests {
                 .admit("::ffff:127.0.0.1".parse().unwrap(), now)
                 .is_none()
         );
+        assert!(limits.admit(b, now).is_none());
+        drop(second);
         let third = limits.admit(b, now).unwrap();
         assert!(limits.admit(c, now).is_none());
         first.charge(CONNECTION_BYTES, now).unwrap();
@@ -158,7 +162,7 @@ mod tests {
         drop(first);
         let mut replacement = limits.admit(a, now).unwrap();
         assert!(replacement.charge(1, now).is_err());
-        drop((replacement, second, third));
+        drop((replacement, third));
         for i in 2..=4 {
             let ip = format!("127.0.0.{i}").parse().unwrap();
             limits

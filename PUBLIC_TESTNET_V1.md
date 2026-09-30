@@ -126,7 +126,7 @@ pins to connecting miners. Serve only one necessary TCP port.
 
 The versioned adapter offers status/bootstrap advertisement, bounded full-range
 export and full work-carrier submission. Each TLS connection has one request and
-bounded frames. The seed runs at most three socket workers; only the main thread
+bounded frames. The seed runs at most two socket workers; only the main thread
 reads or mutates the node. TLS plus the exact application hello have a single
 3-second deadline from admission. After the hello succeeds, one 45-second payload
 window covers request reads, waiting for the node owner and response writes.
@@ -134,7 +134,7 @@ Progress never renews either window. Expired queued requests are discarded.
 An admission already executing still follows the existing durable-operation
 rules; losing its reply never permits a reset or automatic retry.
 
-Admission limits are three active connections globally and two per source IP,
+Admission limits are two active connections globally and two per source IP,
 with 64 and 16 new admitted connections respectively per fixed 60-second window.
 The bounded IP table keeps spent allowances when a connection closes; IPv4-mapped
 IPv6 addresses share the same IP allowance. Before every actual TCP write, the
@@ -143,8 +143,8 @@ per 60-second window and 16 MiB globally per 60-second window. TLS and framing
 count too; partial/failed writes are charged conservatively. Excess connections
 or output are refused by closing the connection. These process-local allowances
 reset on an operator restart. Large history downloads or clients sharing an IP
-can reach the caps and must stop on refusal. Three workers plus the node owner
-fit the existing four-task runtime cap.
+can reach the caps and must stop on refusal. Two socket workers plus the node
+owner leave one task for its derivation or verification worker under TasksMax=4.
 
 Node admission still performs all consensus/work checks. This adapter is **not**
 raw wallet-envelope ingress, a relay bypass, an automatic peer mesh or a
@@ -183,7 +183,9 @@ is established. Source publication remains a separate decision.
 
 ## Seed availability correction evidence (2026-09-30)
 
-Run the two focused checks with
+The previous published source `31f3af3c14d1cf476ed8e7fe7f0a787ca954cd45`
+passed the two focused checks described below. Their historical evidence does
+not qualify this task-budget correction for Linux rollout. Reproduce with
 `CARGO_BUILD_JOBS=1 cargo +1.93.0 test --manifest-path prototype/Cargo.toml --locked --offline -p silk-f04-testnet --bin silk-f04-testnet`.
 The loopback check generates temporary TLS certificates with local OpenSSL and
 uses a mock status application. It shows a second peer completing discovery in
@@ -198,3 +200,26 @@ store, mining, proofs or history replay. Linux deployment and service-level
 availability under sustained load remain untested by this correction. The live
 bootstrap seed remains on its previous binary; no service or GitHub state was
 changed. Publication and deployment still require the separate review decision.
+
+## Linux task-budget blocker and local correction (2026-09-30)
+
+Rollout of published source `31f3af3c14d1cf476ed8e7fe7f0a787ca954cd45`
+was stopped during Linux capacity preflight. The seed's real configuration has
+TasksMax=4. Three socket workers plus the owner exhaust those slots, while
+ordinary node admission starts an additional `f04-derive` worker (and bounded
+batch verification can also require one extra thread). The published three-worker
+ceiling therefore cannot safely share that task budget with node admission.
+
+An isolated Linux systemd capacity canary used the seed UID/rootfs and resource
+settings, with private networking and no sockets or node data. It read kernel
+controls directly: pids.max=4, memory.max=4294967296, memory.swap.max=0 and
+cpu.max=100000/100000. With three parked workers, a fifth task was refused;
+with two, the required fourth task started. Every test worker joined.
+This is task-capacity evidence, not a full seed/transport acceptance run.
+
+The local correction limits socket workers to two and keeps all byte/rate
+allowances and consensus/TLS framing unchanged. The affected limiter check passes.
+No Linux source binary was built or switched, no history was opened/mutated, and
+no GitHub update or live-service restart occurred. The corrected source requires
+a new narrow review before publication; the complete Linux transport canary and
+controlled service rollout remain pending that review.
