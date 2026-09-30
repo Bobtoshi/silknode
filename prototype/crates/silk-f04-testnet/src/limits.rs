@@ -10,7 +10,8 @@ use std::{
 // TasksMax=4 also covers the node owner's one derivation/verification worker.
 // Two socket workers + owner + core worker fit; three sockets would exhaust it.
 pub const MAX_CONNECTIONS: usize = 2;
-const PEER_CONNECTIONS: usize = 2;
+// A single source must not occupy both socket workers during the payload window.
+const PEER_CONNECTIONS: usize = 1;
 const PEER_STARTS: usize = 16;
 const GLOBAL_STARTS: usize = 64;
 const MAX_PEERS: usize = 128;
@@ -50,6 +51,13 @@ struct State {
 }
 #[derive(Clone)]
 pub struct Limits(Arc<Mutex<State>>);
+#[cfg(test)]
+pub struct Snapshot {
+    pub active: usize,
+    pub starts: usize,
+    pub bytes: usize,
+    pub peers: HashMap<IpAddr, (usize, usize, usize)>,
+}
 impl Limits {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(State {
@@ -93,6 +101,20 @@ impl Limits {
             began: now,
             bytes: 0,
         })
+    }
+    #[cfg(test)]
+    pub fn snapshot(&self) -> Snapshot {
+        let state = self.0.lock().unwrap();
+        Snapshot {
+            active: state.active,
+            starts: state.global.starts,
+            bytes: state.global.bytes,
+            peers: state
+                .peers
+                .iter()
+                .map(|(ip, peer)| (*ip, (peer.active, peer.window.starts, peer.window.bytes)))
+                .collect(),
+        }
     }
 }
 pub struct Permit {
@@ -146,23 +168,20 @@ mod tests {
         let b: IpAddr = "127.0.0.2".parse().unwrap();
         let c: IpAddr = "127.0.0.3".parse().unwrap();
         let mut first = limits.admit(a, now).unwrap();
-        let second = limits.admit(a, now).unwrap();
         assert!(limits.admit(a, now).is_none());
         assert!(
             limits
                 .admit("::ffff:127.0.0.1".parse().unwrap(), now)
                 .is_none()
         );
-        assert!(limits.admit(b, now).is_none());
-        drop(second);
-        let third = limits.admit(b, now).unwrap();
+        let second = limits.admit(b, now).unwrap();
         assert!(limits.admit(c, now).is_none());
         first.charge(CONNECTION_BYTES, now).unwrap();
         assert!(first.charge(1, now).is_err());
         drop(first);
         let mut replacement = limits.admit(a, now).unwrap();
         assert!(replacement.charge(1, now).is_err());
-        drop((replacement, third));
+        drop((replacement, second));
         for i in 2..=4 {
             let ip = format!("127.0.0.{i}").parse().unwrap();
             limits
@@ -171,8 +190,14 @@ mod tests {
                 .charge(PEER_BYTES, now)
                 .unwrap();
         }
-        assert!(limits.admit(c, now).unwrap().charge(1, now).is_err());
-        for _ in 3..PEER_STARTS {
+        assert!(
+            limits
+                .admit("127.0.0.8".parse().unwrap(), now)
+                .unwrap()
+                .charge(1, now)
+                .is_err()
+        );
+        for _ in 2..PEER_STARTS {
             drop(limits.admit(a, now).unwrap());
         }
         assert!(limits.admit(a, now).is_none());

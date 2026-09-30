@@ -134,7 +134,7 @@ Progress never renews either window. Expired queued requests are discarded.
 An admission already executing still follows the existing durable-operation
 rules; losing its reply never permits a reset or automatic retry.
 
-Admission limits are two active connections globally and two per source IP,
+Admission limits are two active connections globally and one per source IP,
 with 64 and 16 new admitted connections respectively per fixed 60-second window.
 The bounded IP table keeps spent allowances when a connection closes; IPv4-mapped
 IPv6 addresses share the same IP allowance. Before every actual TCP write, the
@@ -143,7 +143,9 @@ per 60-second window and 16 MiB globally per 60-second window. TLS and framing
 count too; partial/failed writes are charged conservatively. Excess connections
 or output are refused by closing the connection. These process-local allowances
 reset on an operator restart. Large history downloads or clients sharing an IP
-can reach the caps and must stop on refusal. Two socket workers plus the node
+can reach the caps and must stop on refusal; clients sharing one source IP cannot
+connect concurrently. One source cannot occupy both socket workers, but two
+different sources can still exhaust the global cap. Two socket workers plus the node
 owner leave one task for its derivation or verification worker under TasksMax=4.
 
 Node admission still performs all consensus/work checks. This adapter is **not**
@@ -223,3 +225,29 @@ No Linux source binary was built or switched, no history was opened/mutated, and
 no GitHub update or live-service restart occurred. The corrected source requires
 a new narrow review before publication; the complete Linux transport canary and
 controlled service rollout remain pending that review.
+
+## Per-source reservation correction (2026-09-30)
+
+Narrow review of local candidate `0288014925ac0f3d755ccc7b5780959cedbfdd40`
+found that its two-per-IP cap equaled the two global workers. A source completing
+the valid static hello could hold both workers for their 45-second payload
+windows without reaching the connection-start rate cap. This successor changes
+only the production per-source active cap to one; the global task reserve,
+deadlines, byte/rate allowances, consensus/history and TLS framing are unchanged.
+
+The focused transport regression holds source A after a valid hello without a
+payload, refuses A's second connection without spending admission/egress budget,
+and verifies that source B completes mock discovery in under one second while A
+remains active beyond the handshake deadline. It waits for the real production
+45-second payload expiry, checks retained starts/egress and released active slots,
+then re-admits both sources and checks shutdown/join accounting. The fixture uses
+IPv4 and IPv6 loopback-only listeners in the same Server state, switching the
+test listener to obtain distinct source IPs without host aliases. It does not
+establish same-listener dual-stack behavior or Linux exact-binary acceptance.
+
+The affected limiter and transport tests pass on macOS with Rust 1.93.0 using
+the command above: two passed, zero failed, in 45.06 seconds. No node store,
+mining, proof generation or replay is involved.
+This is a local candidate awaiting narrow independent review, not accepted or
+deployed source. Exact-binary Linux service validation remains required after
+acceptance; GitHub main and the live seed were not changed by this correction.

@@ -180,7 +180,7 @@ mod tests {
                     "-subj",
                     "/CN=localhost",
                     "-addext",
-                    "subjectAltName=IP:127.0.0.1",
+                    "subjectAltName=IP:127.0.0.1,IP:::1",
                     "-addext",
                     "basicConstraints=critical,CA:FALSE",
                     "-addext",
@@ -274,103 +274,144 @@ mod tests {
     }
 
     #[test]
-    fn stalled_tls_and_hello_do_not_block_discovery_and_caps_clean_up() {
+    fn post_hello_peer_cap_reserves_discovery_and_releases_accounting() {
         let fixture = Fixture::new();
-        for complete_tls in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            // A mock application identity/status isolates transport scheduling;
-            // no node store, history, proof or work generation is involved.
-            let expected = [23; 140];
-            let mut server = Server::new(listener, fixture.server.clone(), expected).unwrap();
-            let mut idle = client(fixture.client.clone(), address);
-            accept_next(&mut server);
-            if complete_tls {
-                while idle.conn.is_handshaking() {
-                    idle.conn.complete_io(&mut idle.sock).unwrap();
-                }
-            }
-            let config = fixture.client.clone();
-            let legitimate = thread::spawn(move || {
-                let mut stream = client(config, address);
-                stream.write_all(&expected).unwrap();
-                stream.flush().unwrap();
-                let mut ack = [255];
-                stream.read_exact(&mut ack).unwrap();
-                assert_eq!(ack, [0]);
-                wire::write_frame(&mut stream, &[0]).unwrap();
-                wire::read_frame(&mut stream, wire::MAX_RESPONSE).unwrap()
-            });
-            let began = Instant::now();
-            let discovery = b"\0{\"schema\":\"silknode-public-status-v1\"}";
-            while !legitimate.is_finished() && began.elapsed() < Duration::from_secs(1) {
-                server
-                    .tick(|request| {
-                        assert_eq!(request, [0]);
-                        Ok(discovery.to_vec())
-                    })
-                    .unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert!(
-                legitimate.is_finished(),
-                "discovery waited behind the stalled peer"
-            );
-            assert_eq!(legitimate.join().unwrap(), discovery);
-            assert!(began.elapsed() < wire::HANDSHAKE_WINDOW);
-            let reap = Instant::now();
-            while server.workers.len() != 1 && reap.elapsed() < Duration::from_millis(250) {
-                server.tick(|_| panic!("unexpected request")).unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(
-                server.workers.len(),
-                1,
-                "idle handshake must still be occupying a slot"
-            );
-            let _second_idle = TcpStream::connect(address).unwrap();
-            let admitted = Instant::now();
-            while server.workers.len() != 2 && admitted.elapsed() < Duration::from_millis(250) {
-                server.tick(|_| panic!("unexpected request")).unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(server.workers.len(), 2);
-            let mut refused = TcpStream::connect(address).unwrap();
-            refused
-                .set_read_timeout(Some(Duration::from_secs(1)))
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_a = listener.local_addr().unwrap();
+        // Mock status only: no node store, history, proof or work generation.
+        let expected = [23; 140];
+        let mut server = Server::new(listener, fixture.server.clone(), expected).unwrap();
+        let limits = server.limits.clone();
+        let a = address_a.ip();
+        let mut stalled = client(fixture.client.clone(), address_a);
+        accept_next(&mut server);
+        stalled.write_all(&expected).unwrap();
+        stalled.flush().unwrap();
+        let mut ack = [255];
+        stalled.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [0]);
+        let payload_started = Instant::now();
+        // A has completed the valid hello, but sends no payload for the real
+        // production 45-second window (no shortened deadline or fake clock).
+        let admitted = limits.snapshot();
+        assert_eq!((admitted.active, admitted.starts), (1, 1));
+        let spent_a = admitted.peers[&a].2;
+        assert!(spent_a > 0);
+
+        let mut refused = TcpStream::connect(address_a).unwrap();
+        accept_next(&mut server);
+        assert_closed(&mut refused);
+        let after_refusal = limits.snapshot();
+        assert_eq!((after_refusal.active, after_refusal.starts), (1, 1));
+        assert_eq!(after_refusal.peers[&a], (1, 1, spent_a));
+        assert_eq!(after_refusal.bytes, admitted.bytes);
+        assert_eq!(server.workers.len(), 1);
+
+        while payload_started.elapsed() < wire::HANDSHAKE_WINDOW + Duration::from_millis(100) {
+            server
+                .tick(|_| panic!("stalled peer reached application"))
                 .unwrap();
-            accept_next(&mut server);
-            match refused.read(&mut [0]) {
-                Ok(0) => {}
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
-                other => panic!("per-IP cap did not close the excess connection: {other:?}"),
-            }
-            let wait = Instant::now();
-            while !server.workers.is_empty()
-                && wait.elapsed() < wire::HANDSHAKE_WINDOW + Duration::from_secs(1)
-            {
-                server
-                    .tick(|_| panic!("idle peer reached application"))
-                    .unwrap();
-                thread::sleep(Duration::from_millis(5));
-            }
-            assert!(
-                server.workers.is_empty(),
-                "handshake deadline did not release workers"
-            );
-            let mut cancelled = TcpStream::connect(address).unwrap();
-            cancelled
-                .set_read_timeout(Some(Duration::from_secs(1)))
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(limits.snapshot().active, 1);
+
+        // Keep every listener loopback-only. Switching this fixture's listener
+        // gives B a distinct IPv6 source without host aliases or an all-interface
+        // bind; the same Server retains A, worker queue and admission accounting.
+        let listener_b = TcpListener::bind("[::1]:0").unwrap();
+        listener_b.set_nonblocking(true).unwrap();
+        let address_b = listener_b.local_addr().unwrap();
+        let listener_a = std::mem::replace(&mut server.listener, listener_b);
+        let b = address_b.ip();
+        assert_ne!(a, b);
+        let config = fixture.client.clone();
+        let legitimate = thread::spawn(move || {
+            let mut stream = client(config, address_b);
+            stream.write_all(&expected).unwrap();
+            stream.flush().unwrap();
+            let mut ack = [255];
+            stream.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [0]);
+            wire::write_frame(&mut stream, &[0]).unwrap();
+            wire::read_frame(&mut stream, wire::MAX_RESPONSE).unwrap()
+        });
+        let began = Instant::now();
+        let discovery = b"\0{\"schema\":\"silknode-public-status-v1\"}";
+        while !legitimate.is_finished() && began.elapsed() < Duration::from_secs(1) {
+            server
+                .tick(|request| {
+                    assert_eq!(request, [0]);
+                    Ok(discovery.to_vec())
+                })
                 .unwrap();
-            accept_next(&mut server);
-            let cleanup = Instant::now();
-            drop(server);
-            assert!(cleanup.elapsed() < Duration::from_secs(1));
-            match cancelled.read(&mut [0]) {
-                Ok(0) => {}
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
-                other => panic!("shutdown did not close the worker socket: {other:?}"),
-            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            legitimate.is_finished(),
+            "B discovery waited behind post-hello A"
+        );
+        assert_eq!(legitimate.join().unwrap(), discovery);
+        assert!(began.elapsed() < Duration::from_secs(1));
+        let reap = Instant::now();
+        while server.workers.len() != 1 && reap.elapsed() < Duration::from_millis(250) {
+            server.tick(|_| panic!("unexpected request")).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(server.workers.len(), 1);
+        let served = limits.snapshot();
+        let spent_b = served.peers[&b].2;
+        assert!(spent_b > 0);
+        assert_eq!((served.active, served.starts), (1, 2));
+        assert_eq!(served.peers[&a], (1, 1, spent_a));
+        assert_eq!(served.peers[&b], (0, 1, spent_b));
+        assert_eq!(served.bytes, spent_a + spent_b);
+
+        while !server.workers.is_empty() && payload_started.elapsed() < Duration::from_secs(46) {
+            server
+                .tick(|_| panic!("stalled peer reached application"))
+                .unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            server.workers.is_empty(),
+            "payload expiry did not release A"
+        );
+        assert!(payload_started.elapsed() >= Duration::from_secs(44));
+        assert_closed(&mut stalled.sock);
+        let expired = limits.snapshot();
+        assert_eq!((expired.active, expired.starts), (0, 2));
+        assert_eq!(expired.peers[&a], (0, 1, spent_a));
+        assert_eq!(expired.peers[&b], (0, 1, spent_b));
+        assert_eq!(expired.bytes, served.bytes);
+
+        // Both sources can be re-admitted after expiry. Shutdown releases their
+        // active slots and joins workers without refunding starts or egress.
+        let listener_b = std::mem::replace(&mut server.listener, listener_a);
+        let mut cancelled_a = TcpStream::connect(address_a).unwrap();
+        accept_next(&mut server);
+        server.listener = listener_b;
+        let mut cancelled_b = TcpStream::connect(address_b).unwrap();
+        accept_next(&mut server);
+        assert_eq!(limits.snapshot().active, 2);
+        let cleanup = Instant::now();
+        drop(server);
+        assert!(cleanup.elapsed() < Duration::from_secs(1));
+        assert_closed(&mut cancelled_a);
+        assert_closed(&mut cancelled_b);
+        let cleaned = limits.snapshot();
+        assert_eq!((cleaned.active, cleaned.starts), (0, 4));
+        assert_eq!(cleaned.peers[&a], (0, 2, spent_a));
+        assert_eq!(cleaned.peers[&b], (0, 2, spent_b));
+        assert_eq!(cleaned.bytes, served.bytes);
+    }
+    fn assert_closed(socket: &mut TcpStream) {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        match socket.read(&mut [0]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("connection was not closed: {other:?}"),
         }
     }
     fn accept_next(server: &mut Server) {
