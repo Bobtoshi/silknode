@@ -1,6 +1,8 @@
 //! Explicit, Linux-only, zero-value public testnet seed and connecting miner.
 //! No mainnet activation, wallet submission, DNS, telemetry or valuable rewards.
 mod config;
+mod limits;
+mod server;
 mod wire;
 use config::{Config, digest};
 use rand_core::{OsRng, RngCore};
@@ -169,46 +171,40 @@ fn seed(mut node: Node, c: &Config, parameters: &SaplingParameters) -> Result<()
         "seed_listening={};value=ZERO;privacy=NOT_CLAIMED",
         listener.local_addr()?
     );
-    for accepted in listener.incoming() {
-        let mut publication_incomplete = false;
-        // Exactly one bounded connection and one foreground admission at a time.
-        let result = (|| -> Result<()> {
-            if let Some(mut stream) = wire::accept(accepted?, tls.clone(), &expected)? {
-                let request = wire::read_frame(&mut stream, wire::MAX_REQUEST)?;
-                let payload = response(
-                    &mut node,
-                    c,
-                    parameters,
-                    &request,
-                    &mut publication_incomplete,
-                );
-                let bytes = match payload {
-                    Ok(payload) => {
-                        let mut out = vec![0];
-                        out.extend(payload);
-                        out
-                    }
-                    Err(_) => vec![1],
-                };
-                wire::write_frame(&mut stream, &bytes)?;
-            }
-            Ok(())
-        })();
-        // Ordinary peer rejection is not a restart. A faulted writer STOPS; a
-        // service restart cannot adopt another head or clear an unfinished job.
-        if publication_incomplete
-            || node.status()? != NodeStatus::Ready
-            || c.load_pin()? != node.local_head()?
-        {
-            return fail(
-                "seed stopped after incomplete reconciliation or retained-pin publication",
+    let mut server = server::Server::new(listener, tls, expected)?;
+    loop {
+        server.tick(|request| {
+            let mut publication_incomplete = false;
+            let payload = response(
+                &mut node,
+                c,
+                parameters,
+                request,
+                &mut publication_incomplete,
             );
-        }
-        if result.is_err() {
-            eprintln!("bounded_peer_exchange=refused");
-        }
+            let bytes = match payload {
+                Ok(payload) => {
+                    let mut out = vec![0];
+                    out.extend(payload);
+                    out
+                }
+                Err(_) => vec![1],
+            };
+            // Ordinary peer rejection is not a restart. A faulted writer STOPS; a
+            // service restart cannot adopt another head or clear an unfinished job.
+            if publication_incomplete
+                || node.status()? != NodeStatus::Ready
+                || c.load_pin()? != node.local_head()?
+            {
+                return fail(
+                    "seed stopped after incomplete reconciliation or retained-pin publication",
+                );
+            }
+            Ok(bytes)
+        })?;
+        // Bound accept/refusal work too; a busy backlog cannot starve queued requests.
+        std::thread::sleep(Duration::from_millis(10));
     }
-    fail("listener stopped")
 }
 fn mine(mut node: Node, c: &Config, parameters: &SaplingParameters, count: usize) -> Result<()> {
     let owner = digest(&c.reward_owner)?;

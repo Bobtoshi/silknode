@@ -4,6 +4,7 @@ use crate::{
     Result,
     config::{Config, read_file, sha256},
     fail,
+    limits::Permit,
 };
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -25,6 +26,7 @@ pub const PROTOCOL_HEX: &str = "9f0c99bc6d025ee6d0716dce183ab4d564a651c1ca30a042
 pub const MAX_RESPONSE: usize = 32 * (90_000 + 4) + 4096;
 pub const MAX_REQUEST: usize = 90_001;
 const WINDOW: Duration = Duration::from_secs(45);
+pub const HANDSHAKE_WINDOW: Duration = Duration::from_secs(3);
 pub fn hello(g: &Genesis) -> Result<[u8; 140]> {
     let protocol = carriage_hash(
         "SilkNode/PublicZeroWire/v1",
@@ -47,20 +49,28 @@ pub fn hello(g: &Genesis) -> Result<[u8; 140]> {
 pub struct DeadlineSocket {
     socket: TcpStream,
     until: Instant,
+    budget: Option<Permit>,
 }
 impl DeadlineSocket {
     fn new(socket: TcpStream) -> Result<Self> {
+        // Accepted sockets can inherit the nonblocking listener mode on macOS.
+        // Worker I/O is blocking, with the remaining deadline applied below.
+        socket.set_nonblocking(false)?;
         socket.set_nodelay(true)?;
         Ok(Self {
             socket,
             until: Instant::now() + WINDOW,
+            budget: None,
         })
     }
-    fn remaining(&self) -> io::Result<Duration> {
+    pub fn remaining(&self) -> io::Result<Duration> {
         self.until
             .checked_duration_since(Instant::now())
             .filter(|v| !v.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "exchange deadline"))
+    }
+    pub fn until(&self) -> Instant {
+        self.until
     }
 }
 impl Read for DeadlineSocket {
@@ -72,6 +82,9 @@ impl Read for DeadlineSocket {
 impl Write for DeadlineSocket {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         self.socket.set_write_timeout(Some(self.remaining()?))?;
+        if let Some(budget) = &mut self.budget {
+            budget.charge(b.len(), Instant::now())?;
+        }
         self.socket.write(b)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -107,10 +120,14 @@ pub fn accept(
     socket: TcpStream,
     config: Arc<ServerConfig>,
     expected: &[u8; 140],
+    permit: Permit,
 ) -> Result<Option<StreamOwned<ServerConnection, DeadlineSocket>>> {
     let mut conn = ServerConnection::new(config)?;
     conn.set_buffer_limit(Some(128 * 1024));
-    let mut stream = StreamOwned::new(conn, DeadlineSocket::new(socket)?);
+    let mut socket = DeadlineSocket::new(socket)?;
+    socket.until = permit.began + HANDSHAKE_WINDOW;
+    socket.budget = Some(permit);
+    let mut stream = StreamOwned::new(conn, socket);
     let mut h = [0; 140];
     stream.read_exact(&mut h)?;
     if &h != expected {
@@ -120,6 +137,9 @@ pub fn accept(
     }
     stream.write_all(&[0])?;
     stream.flush()?;
+    // The payload window starts once, only after TLS and the exact hello succeed.
+    stream.sock.remaining()?;
+    stream.sock.until = Instant::now() + WINDOW;
     Ok(Some(stream))
 }
 pub fn connect(c: &Config) -> Result<StreamOwned<ClientConnection, DeadlineSocket>> {
