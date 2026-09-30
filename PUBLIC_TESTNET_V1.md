@@ -89,6 +89,26 @@ replay. Never copy store/HEAD into that pin to silence a failure. An interrupted
 operation, missing/mismatched pin, uncertain durable write, exhausted resource
 budget or unsupported platform is a STOP, not automatic recovery authority.
 
+### Optional pinned multi-source catch-up
+
+The opt-in `sync --config /ABS/config.json --peers /ABS/peers.json` grammar
+adds one to seven independently selected/pinned sources after the configured
+primary. See the [versioned peer manifest and failure contract](docs/F04_MULTI_SOURCE_SYNC_V1.md).
+When using first-join preparation, append `--peers /ABS/peers.json` to its
+printed **capped sync command**, not to `init` or `mine`; retain its resource
+properties, UID and 900-second outer lifetime. The client's cooperative
+1,800-second multi-source allowance does not override that shorter external
+ceiling or the node's native per-job limits. Do not raise limits to force a pass.
+
+Each source needs its own independently verified CA file, IP endpoint and exact
+leaf digest. None is automatically enrolled; the primary's store, retained pin,
+parameters and reward tag remain local. Every new carrier still receives local
+work/parent/clock/consensus validation. Transport loss can try another enrolled
+source from its own cursor zero; local admission/resource/storage errors STOP.
+Accepted prefixes are retained, never replaced by a peer checkpoint or store.
+Mining remains on the original primary; this is not cross-seed gossip, wallet
+submission, permissionless discovery or proof of bootstrap availability.
+
 ## Bootstrap identity
 
 - Seed: **152.53.113.247:28444**, TCP, TLS1.3, ALPN `silknode-zero/1`.

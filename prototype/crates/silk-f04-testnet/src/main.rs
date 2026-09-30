@@ -2,7 +2,9 @@
 //! No mainnet activation, wallet submission, DNS, telemetry or valuable rewards.
 mod config;
 mod limits;
+mod peers;
 mod server;
+mod sync;
 mod wire;
 use config::{Config, digest};
 use rand_core::{OsRng, RngCore};
@@ -24,7 +26,7 @@ fn fail<T>(message: &'static str) -> Result<T> {
     Err(message.into())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Info {
     schema: String,
@@ -72,15 +74,24 @@ fn settle(node: &mut Node, c: &Config) -> Result<()> {
     fail("bounded reconciliation incomplete; no new admission")
 }
 fn peer_info(c: &Config, g: &Genesis) -> Result<Info> {
-    let value: Info = serde_json::from_slice(&wire::request(c, g, &[0])?)?;
+    decode_peer_info(c, &wire::request(c, g, &[0])?)
+}
+fn decode_peer_info(c: &Config, bytes: &[u8]) -> Result<Info> {
+    if bytes.len() > 4096 {
+        return fail("peer status byte bound");
+    }
+    let value: Info = serde_json::from_slice(bytes)?;
     if value.schema != "silknode-public-status-v1"
         || value.domain != profile::DOMAIN_HEX
         || value.seed != c.seed.to_string()
         || value.vertices > 4096
         || value.initial_allocation != 0
+        || value.executed > value.vertices
     {
         return fail("peer discovery identity/bounds");
     }
+    digest(&value.checkpoint)?;
+    digest(&value.state)?;
     Ok(value)
 }
 fn same_state(local: &Info, remote: &Info) -> Result<()> {
@@ -95,41 +106,7 @@ fn same_state(local: &Info, remote: &Info) -> Result<()> {
     Ok(())
 }
 fn synchronize(node: &mut Node, c: &Config, parameters: &SaplingParameters) -> Result<()> {
-    let target = peer_info(c, node.genesis())?;
-    let mut start = 0_usize;
-    while start < target.vertices {
-        let mut request = vec![1];
-        request.extend_from_slice(&(start as u32).to_be_bytes());
-        let response = wire::request(c, node.genesis(), &request)?;
-        let count = usize::from(*response.first().ok_or("range count")?);
-        if count == 0 || count > 32 || start + count > target.vertices {
-            return fail("range count/bounds changed");
-        }
-        let mut at = 1;
-        for _ in 0..count {
-            let size: [u8; 4] = response.get(at..at + 4).ok_or("range length")?.try_into()?;
-            at += 4;
-            let size = u32::from_be_bytes(size) as usize;
-            if size > 90_000 {
-                return fail("range vertex size");
-            }
-            let bytes = response.get(at..at + size).ok_or("range truncated")?;
-            // No checkpoint, clock or peer work claim is trusted by this receiver.
-            node.ingest(bytes, parameters)?;
-            settle(node, c)?;
-            at += size;
-        }
-        if at != response.len() {
-            return fail("range trailing bytes");
-        }
-        start += count;
-    }
-    same_state(&info(node, c)?, &target)?;
-    println!(
-        "peer_discovered={};tls=verified;history=locally_verified",
-        target.seed
-    );
-    Ok(())
+    sync::synchronize(node, c, std::slice::from_ref(c), parameters)
 }
 fn response(
     node: &mut Node,
@@ -274,7 +251,7 @@ fn run() -> Result<()> {
         )
     {
         return fail(
-            "usage: silk-f04-testnet identity | init|seed|sync|probe|wrong-network --config ABS.json | mine --config ABS.json --count 1..32",
+            "usage: silk-f04-testnet identity | init|seed|sync|probe|wrong-network --config ABS.json | sync --config ABS.json --peers ABS.json | mine --config ABS.json --count 1..32",
         );
     }
     let command = &args[0];
@@ -288,12 +265,18 @@ fn run() -> Result<()> {
         }
         n
     } else {
-        if args.len() != 3 {
+        if args.len() != 3 && !(command == "sync" && args.len() == 5 && args[3] == "--peers") {
             return fail("unexpected options");
         }
         0
     };
     let c = Config::load(Path::new(&args[2]))?;
+    // Validate operator enrollment before opening/mutating the retained node.
+    let sources = if command == "sync" && args.len() == 5 {
+        peers::load(&c, Path::new(&args[4]))?
+    } else {
+        vec![c.clone()]
+    };
     if command == "probe" {
         println!("{}", serde_json::to_string(&peer_info(&c, &g)?)?);
         return Ok(());
@@ -321,7 +304,7 @@ fn run() -> Result<()> {
         "seed" => seed(node, &c, &parameters),
         "mine" => mine(node, &c, &parameters, count),
         "sync" => {
-            synchronize(&mut node, &c, &parameters)?;
+            sync::synchronize(&mut node, &c, &sources, &parameters)?;
             node.flush_clock()?;
             c.save_pin(&node)?;
             report(&node, &c)

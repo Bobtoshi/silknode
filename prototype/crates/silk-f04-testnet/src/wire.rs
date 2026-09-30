@@ -180,6 +180,12 @@ pub fn accept(
     Ok(Some(stream))
 }
 pub fn connect(c: &Config) -> Result<StreamOwned<ClientConnection, DeadlineSocket>> {
+    connect_with_deadline(c, None)
+}
+fn connect_with_deadline(
+    c: &Config,
+    until: Option<Instant>,
+) -> Result<StreamOwned<ClientConnection, DeadlineSocket>> {
     let ca_text = read_file(&c.ca_der_hex, 16384)?;
     let ca = hex::decode(std::str::from_utf8(&ca_text)?.trim())?;
     let mut roots = RootCertStore::empty();
@@ -196,8 +202,19 @@ pub fn connect(c: &Config) -> Result<StreamOwned<ClientConnection, DeadlineSocke
     let mut conn =
         ClientConnection::new(Arc::new(config), ServerName::IpAddress(c.seed.ip().into()))?;
     conn.set_buffer_limit(Some(128 * 1024));
-    let socket = TcpStream::connect_timeout(&c.seed, Duration::from_secs(5))?;
+    let connect_window = match until {
+        Some(until) => until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or("cumulative sync deadline")?
+            .min(Duration::from_secs(5)),
+        None => Duration::from_secs(5),
+    };
+    let socket = TcpStream::connect_timeout(&c.seed, connect_window)?;
     let mut socket = DeadlineSocket::new(socket)?;
+    if let Some(until) = until {
+        socket.until = socket.until.min(until);
+    }
     while conn.is_handshaking() {
         conn.complete_io(&mut socket)?;
     }
@@ -212,7 +229,18 @@ pub fn connect(c: &Config) -> Result<StreamOwned<ClientConnection, DeadlineSocke
     Ok(StreamOwned::new(conn, socket))
 }
 pub fn request(c: &Config, g: &Genesis, bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut stream = connect(c)?;
+    exchange(connect(c)?, g, bytes)
+}
+// An opt-in multi-source invocation shares one deadline across all exchanges.
+// This only tightens the existing TCP/45-second window; it never renews it.
+pub fn request_until(c: &Config, g: &Genesis, bytes: &[u8], until: Instant) -> Result<Vec<u8>> {
+    exchange(connect_with_deadline(c, Some(until))?, g, bytes)
+}
+fn exchange(
+    mut stream: StreamOwned<ClientConnection, DeadlineSocket>,
+    g: &Genesis,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
     stream.write_all(&hello(g)?)?;
     stream.flush()?;
     let mut ack = [0];

@@ -15,6 +15,7 @@ mod quantum;
 pub mod scanner;
 pub mod state;
 mod store;
+pub mod sync;
 pub(crate) mod wire;
 
 pub use silk_sapling_f04::Digest;

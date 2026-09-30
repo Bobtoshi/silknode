@@ -19,6 +19,13 @@ premine; mining produces nontransferable attribution credits, not spendable coin
 This successor remains separate from the published `v0.1.0-alpha.1` source tag.
 Do not assume that tag contains the new CLI.
 
+The optional [pinned multi-source catch-up](docs/F04_MULTI_SOURCE_SYNC_V1.md)
+adds `sync --peers` failover without trusting peer work or replacing local
+validation. The primary configuration and mining defaults stay unchanged.
+Focused checks and a small same-host receiver loss/restart experiment are
+described separately; they do not establish open discovery, independent
+operators, network privacy or whole-blockchain completion.
+
 ## Try a small local example
 
 Use a **Git checkout**, not a source ZIP: the RandomX build verifies the exact
