@@ -3,6 +3,7 @@
 pub mod address;
 pub mod auth;
 pub mod budget;
+pub mod capacity;
 pub mod carriage;
 mod core;
 mod deadline;

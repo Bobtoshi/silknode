@@ -3,6 +3,7 @@
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
+    capacity::{GENERATION_LIMIT_V1, HistoryCapacityV1},
     carriage::{Body, Candidate, encode_parents},
     core::{Admission, AdmissionJob, Core, Status},
     deadline::NativeGuard,
@@ -255,7 +256,7 @@ impl Node {
         let mut records = Vec::new();
         let mut cursor = head;
         loop {
-            if records.len() >= 20_000 {
+            if records.len() as u64 >= GENERATION_LIMIT_V1 {
                 return Err(Error::Paused("generation replay reference horizon"));
             }
             let b = store.object(cursor)?;
@@ -387,6 +388,19 @@ impl Node {
     pub fn accounted_bytes(&self) -> u64 {
         self.store.accounted_bytes()
     }
+    /// Local reference-horizon bounds for participation/resource controls. This
+    /// is read-only derived metadata, not a disk reservation or admission permit.
+    /// # Errors
+    /// Refuses a faulted writer or pending admission continuation.
+    pub fn history_capacity(&self) -> Result<HistoryCapacityV1> {
+        self.healthy()?;
+        self.idle()?;
+        HistoryCapacityV1::for_counts(
+            self.sequence,
+            self.core.graph.len(),
+            self.core.state.executed().len(),
+        )
+    }
     /// Reserve a bounded public output against the same whole-task store/margin
     /// policy. The runtime must place the actual output on that capped volume.
     pub fn check_public_output_capacity(&self, bytes: usize) -> Result<()> {
@@ -439,9 +453,9 @@ impl Node {
         for parent in c.header.parents.ordinary_parents() {
             self.core.graph.get(*parent)?;
         }
-        if self.core.graph.len() >= 4096 {
-            return Err(Error::Paused("admitted-vertex reference horizon"));
-        }
+        // Do not create an interrupted-attempt fence or start native work for
+        // an admission that cannot fit its eventual complete reconciliation.
+        self.history_capacity()?.check_admission()?;
         let mut marker = Vec::with_capacity(100 + bytes.len());
         marker.extend_from_slice(b"SNF04JB1");
         marker.extend_from_slice(&self.core.genesis.domain());
@@ -562,6 +576,8 @@ impl Node {
         if self.core.status == Status::Ready {
             return Ok(Status::Ready);
         }
+        self.history_capacity()?
+            .check_generations(self.core.reconciliation_generations()?)?;
         let budget = JobBudget::checkpoint()?;
         let mut marker = Vec::from(b"SNF04CJ1".as_slice());
         marker.extend_from_slice(&self.core.genesis.domain());
@@ -607,6 +623,10 @@ impl Node {
     pub fn flush_clock(&mut self) -> Result<()> {
         self.healthy()?;
         self.idle()?;
+        // Clock-only publication must not consume the slots needed to finish
+        // an already admitted preferred-history transition.
+        self.history_capacity()?
+            .check_generations(1 + self.core.reconciliation_generations()?)?;
         self.core.clock.observe(system_wall()?)?;
         self.commit(
             4,
@@ -656,6 +676,7 @@ impl Node {
         if self.core.status != Status::Ready {
             return Err(Error::Paused("mining during reconciliation"));
         }
+        self.history_capacity()?.check_admission()?;
         let budget = JobBudget::vertex()?;
         self.core.clock.observe(system_wall()?)?;
         if let Some(timestamp) = fixture_timestamp {
@@ -751,7 +772,7 @@ impl Node {
         vertices: u64,
         status: Status,
     ) -> Result<Digest> {
-        if self.sequence >= 20_000 {
+        if self.sequence >= GENERATION_LIMIT_V1 {
             return Err(Error::Paused("generation reference horizon"));
         }
         let manifest = state.manifest();

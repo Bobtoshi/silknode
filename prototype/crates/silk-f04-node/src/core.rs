@@ -2,6 +2,7 @@
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
+    capacity::HistoryCapacityV1,
     carriage::{Body, Candidate, Header, ParentFacts, WorkEngine},
     genesis::Genesis,
     graph::{CryptoCache, Graph, PreparedVertex},
@@ -293,6 +294,15 @@ impl Core {
             rollback: false,
             previous: self.state.checkpoint_id(),
         })
+    }
+    /// Upper bound for finishing the current preferred history, without work or
+    /// state mutation. A divergent prefix may require genesis rollback plus all
+    /// complete intervals; reuse of retained checkpoints can only lower the cost.
+    pub fn reconciliation_generations(&self) -> Result<u64> {
+        let ids = self.order.eligible_order();
+        let old = self.state.executed();
+        let common = old.iter().zip(ids).take_while(|(a, b)| a == b).count();
+        HistoryCapacityV1::reconciliation_generations(old.len(), common, ids.len())
     }
     pub fn publish_step(&mut self, s: Step) -> Result<()> {
         if s.previous != self.state.checkpoint_id() {
