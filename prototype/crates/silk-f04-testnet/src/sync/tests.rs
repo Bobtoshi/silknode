@@ -36,12 +36,18 @@ struct MemoryReceiver {
     values: BTreeSet<Vec<u8>>,
     calls: usize,
     fail_local: bool,
+    reject_peer: Option<&'static [u8]>,
 }
 impl Receiver for MemoryReceiver {
-    fn ingest(&mut self, bytes: &[u8]) -> Result<()> {
+    fn ingest(&mut self, bytes: &[u8]) -> std::result::Result<(), Failure> {
         self.calls += 1;
         if self.fail_local {
-            return fail("synthetic local clock/storage/resource refusal");
+            return Err(Failure::Local(
+                "synthetic local clock/storage/resource refusal".into(),
+            ));
+        }
+        if self.reject_peer == Some(bytes) {
+            return Err(Failure::Peer("synthetic definite carrier rejection".into()));
         }
         self.values.insert(bytes.to_vec());
         Ok(())
@@ -71,6 +77,192 @@ fn sources() -> Vec<Config> {
         fixture_config("127.0.0.1:10001".parse().unwrap()),
         fixture_config("127.0.0.1:10002".parse().unwrap()),
     ]
+}
+
+#[test]
+fn rejection_failover_preserves_prefix_and_one_deadline_without_ingesting_batch_suffix() {
+    let sources = sources();
+    let mut receiver = MemoryReceiver {
+        reject_peer: Some(b"invalid"),
+        ..MemoryReceiver::default()
+    };
+    let until = Some(Instant::now() + Duration::from_secs(10));
+    let target = run_until(
+        &mut receiver,
+        &sources,
+        |peer, request, actual| {
+            assert_eq!(actual, until);
+            if request == [0] {
+                return Ok(serde_json::to_vec(&status(
+                    peer,
+                    if peer.seed == sources[0].seed { 3 } else { 2 },
+                ))?);
+            }
+            assert_eq!(offset(request), 0);
+            if peer.seed == sources[0].seed {
+                Ok(frame(&[b"accepted", b"invalid", b"must-not-ingest"]))
+            } else {
+                Ok(frame(&[b"accepted", b"other"]))
+            }
+        },
+        until,
+    )
+    .unwrap();
+    assert_eq!(target.seed, sources[1].seed.to_string());
+    assert_eq!(
+        receiver.values,
+        BTreeSet::from([b"accepted".to_vec(), b"other".to_vec()])
+    );
+    assert_eq!(receiver.calls, 4);
+}
+
+#[test]
+fn rejection_repeated_at_another_source_never_renews_admission() {
+    let sources = sources();
+    let mut receiver = MemoryReceiver {
+        reject_peer: Some(b"invalid"),
+        ..MemoryReceiver::default()
+    };
+    assert!(
+        run_sources(&mut receiver, &sources, |peer, request, _| {
+            if request == [0] {
+                Ok(serde_json::to_vec(&status(peer, 2))?)
+            } else {
+                Ok(frame(&[b"invalid", b"must-not-ingest"]))
+            }
+        })
+        .is_err()
+    );
+    assert_eq!(receiver.calls, 1);
+    assert!(receiver.values.is_empty());
+}
+
+fn rejection_node() -> (Node, Config) {
+    use std::os::unix::fs::DirBuilderExt;
+    let nonce = rand_core::RngCore::next_u64(&mut rand_core::OsRng);
+    let root =
+        std::env::temp_dir().join(format!("silknode-rejection-{}-{nonce}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("pins"))
+        .unwrap();
+    let mut operator = sources()[0].clone();
+    operator.store = root.join("node");
+    operator.retained_head = root.join("pins/head");
+    operator.host_margin = root.clone();
+    let node = Node::create(
+        &operator.store,
+        &root,
+        public_testnet_v1::genesis().unwrap(),
+    )
+    .unwrap();
+    operator.save_pin(&node).unwrap();
+    (node, operator)
+}
+
+#[test]
+fn rejection_actual_node_framing_refusal_can_switch_to_matching_pinned_source() {
+    struct FramingReceiver {
+        node: Node,
+        operator: Config,
+    }
+    impl Receiver for FramingReceiver {
+        fn ingest(&mut self, bytes: &[u8]) -> std::result::Result<(), Failure> {
+            // Actual ordinary first admission phase. No mocked node validity,
+            // parameters, proofs or mining are needed to reject malformed bytes.
+            ingest_peer(&mut self.node, &self.operator, |node| {
+                node.begin_ingest(bytes)
+            })
+        }
+        fn snapshot(&self) -> Result<Info> {
+            info(&self.node, &self.operator)
+        }
+    }
+    let (node, operator) = rejection_node();
+    let head = node.local_head().unwrap();
+    let accounted = node.accounted_bytes();
+    let mut receiver = FramingReceiver { node, operator };
+    let sources = sources();
+    let target = run_sources(&mut receiver, &sources, |peer, request, _| {
+        if request == [0] {
+            let mut target = receiver_info_for_genesis(peer);
+            if peer.seed == sources[0].seed {
+                target.vertices = 1;
+            }
+            Ok(serde_json::to_vec(&target)?)
+        } else {
+            assert_eq!(peer.seed, sources[0].seed);
+            Ok(frame(&[b"not a blockchain vertex"]))
+        }
+    })
+    .unwrap();
+    assert_eq!(target.seed, sources[1].seed.to_string());
+    assert_eq!(receiver.node.local_head().unwrap(), head);
+    assert_eq!(receiver.operator.load_pin().unwrap(), head);
+    assert_eq!(receiver.node.accounted_bytes(), accounted);
+    assert_eq!(receiver.node.vertex_count(), 0);
+}
+
+fn receiver_info_for_genesis(peer: &Config) -> Info {
+    let state =
+        silk_f04_node::state::BranchState::genesis(&public_testnet_v1::genesis().unwrap()).unwrap();
+    Info {
+        schema: "silknode-public-status-v1".into(),
+        seed: peer.seed.to_string(),
+        domain: public_testnet_v1::DOMAIN_HEX.into(),
+        vertices: 0,
+        checkpoint_index: 0,
+        checkpoint: hex::encode(state.checkpoint_id()),
+        state: hex::encode(state.digest()),
+        executed: 0,
+        initial_allocation: 0,
+    }
+}
+
+#[test]
+fn rejection_uncertain_errors_changed_lineage_and_stale_pin_still_stop_locally() {
+    use silk_f04_node::Error as NodeError;
+    let (mut node, operator) = rejection_node();
+    for error in [
+        NodeError::Paused("clock or original job budget"),
+        NodeError::Unavailable("local history"),
+        NodeError::Io(std::io::Error::other("store I/O")),
+        NodeError::Sapling(silk_sapling_f04::Error::Parameters("parameter identity")),
+        NodeError::Sapling(silk_sapling_f04::Error::Resource("crypto capacity")),
+    ] {
+        assert!(matches!(
+            ingest_peer(&mut node, &operator, |_| Err(error)),
+            Err(Failure::Local(_))
+        ));
+    }
+    for error in [
+        NodeError::Sapling(silk_sapling_f04::Error::Encoding("synthetic")),
+        NodeError::Sapling(silk_sapling_f04::Error::Crypto("synthetic")),
+    ] {
+        assert!(matches!(
+            ingest_peer(&mut node, &operator, |_| Err(error)),
+            Err(Failure::Peer(_))
+        ));
+    }
+    // A changed complete lineage cannot be excused by a subsequent invalid error.
+    assert!(matches!(
+        ingest_peer(&mut node, &operator, |node| {
+            node.flush_clock()?;
+            Err(NodeError::Invalid("synthetic after mutation"))
+        }),
+        Err(Failure::Local(_))
+    ));
+    // The independent pin is now stale. Even an actual framing rejection stops.
+    assert!(matches!(
+        ingest_peer(&mut node, &operator, |node| node.begin_ingest(b"invalid")),
+        Err(Failure::Local(_))
+    ));
+    operator.save_pin(&node).unwrap();
+    assert!(matches!(
+        ingest_peer(&mut node, &operator, |node| node.begin_ingest(b"invalid")),
+        Err(Failure::Peer(_))
+    ));
 }
 
 #[test]

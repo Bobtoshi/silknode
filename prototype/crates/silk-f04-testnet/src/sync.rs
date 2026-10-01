@@ -9,7 +9,10 @@ use silk_f04_node::{
     sync::RangeBatchV1,
 };
 use silk_sapling_f04::parameters::SaplingParameters;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 const MULTI_SOURCE_WINDOW: Duration = Duration::from_secs(1800);
 
@@ -20,13 +23,14 @@ fn check_deadline(until: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 enum Failure {
     Peer(Box<dyn std::error::Error>),
     Local(Box<dyn std::error::Error>),
 }
 
 trait Receiver {
-    fn ingest(&mut self, bytes: &[u8]) -> Result<()>;
+    fn ingest(&mut self, bytes: &[u8]) -> std::result::Result<(), Failure>;
     fn snapshot(&self) -> Result<Info>;
 }
 
@@ -34,18 +38,67 @@ struct LiveReceiver<'a> {
     node: &'a mut Node,
     operator: &'a Config,
     parameters: &'a SaplingParameters,
+    allow_rejection_failover: bool,
 }
 impl Receiver for LiveReceiver<'_> {
-    fn ingest(&mut self, bytes: &[u8]) -> Result<()> {
+    fn ingest(&mut self, bytes: &[u8]) -> std::result::Result<(), Failure> {
         // Exact duplicates are still compared by the receiver. No positional
         // prefix, remote checkpoint or asserted work skips ordinary ingress.
-        if self.node.ingest(bytes, self.parameters)? != Ingress::AlreadyKnown {
-            settle(self.node, self.operator)?;
+        if !self.allow_rejection_failover {
+            let ingress = self
+                .node
+                .ingest(bytes, self.parameters)
+                .map_err(|error| Failure::Local(error.into()))?;
+            if ingress != Ingress::AlreadyKnown {
+                settle(self.node, self.operator).map_err(Failure::Local)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        ingest_peer(self.node, self.operator, |node| {
+            node.ingest(bytes, self.parameters)
+        })
     }
     fn snapshot(&self) -> Result<Info> {
         info(self.node, self.operator)
+    }
+}
+
+// A definite rejection may abandon a source ONLY after the ordinary receiver
+// has closed its attempt and preserved READY state and the independent local pin.
+// Settlement failures are always local, even if their error resembles invalidity.
+fn ingest_peer(
+    node: &mut Node,
+    operator: &Config,
+    ingest: impl FnOnce(&mut Node) -> silk_f04_node::Result<Ingress>,
+) -> std::result::Result<(), Failure> {
+    fn continuity(node: &Node) -> Result<(silk_f04_node::Digest, usize, silk_f04_node::Digest)> {
+        Ok((
+            node.local_head()?,
+            node.vertex_count(),
+            node.state()?.digest(),
+        ))
+    }
+    let before = continuity(node).map_err(Failure::Local)?;
+    match ingest(node) {
+        Ok(Ingress::AlreadyKnown) => Ok(()),
+        Ok(_) => settle(node, operator).map_err(Failure::Local),
+        Err(error) => {
+            let definite = matches!(
+                &error,
+                silk_f04_node::Error::Invalid(_)
+                    | silk_f04_node::Error::Sapling(
+                        silk_sapling_f04::Error::Encoding(_) | silk_sapling_f04::Error::Crypto(_)
+                    )
+            );
+            if definite {
+                let after = continuity(node).map_err(Failure::Local)?;
+                let pin = operator.load_pin().map_err(Failure::Local)?;
+                if after == before && pin == before.0 {
+                    return Err(Failure::Peer(error.into()));
+                }
+            }
+            Err(Failure::Local(error.into()))
+        }
     }
 }
 
@@ -54,6 +107,7 @@ fn attempt(
     peer: &Config,
     request: &mut impl FnMut(&Config, &[u8], Option<Instant>) -> Result<Vec<u8>>,
     until: Option<Instant>,
+    rejected: &mut BTreeSet<String>,
 ) -> std::result::Result<Info, Failure> {
     check_deadline(until).map_err(Failure::Local)?;
     let bytes = request(peer, &[0], until).map_err(Failure::Peer)?;
@@ -74,9 +128,22 @@ fn attempt(
             .map_err(|e| Failure::Peer(e.into()))?;
         for bytes in batch.carriers() {
             check_deadline(until).map_err(Failure::Local)?;
-            // A local work/proof/resource/storage/clock error STOPS the whole
-            // invocation. Failover must not renew an uncertain job's allowance.
-            receiver.ingest(bytes).map_err(Failure::Local)?;
+            let identity = crate::config::sha256(bytes);
+            if rejected.contains(&identity) {
+                return Err(Failure::Peer(
+                    "previously rejected carrier; no renewed admission".into(),
+                ));
+            }
+            match receiver.ingest(bytes) {
+                Ok(()) => {}
+                Err(Failure::Peer(error)) => {
+                    // At most one rejection per attempted source, hence <=8
+                    // retained hashes. Never retry these bytes at another peer.
+                    rejected.insert(identity);
+                    return Err(Failure::Peer(error));
+                }
+                Err(error @ Failure::Local(_)) => return Err(error),
+            }
         }
         start += batch.carriers().len();
     }
@@ -106,9 +173,10 @@ fn run_until(
     if sources.is_empty() || sources.len() > MAX_SOURCES {
         return fail("sync source bound");
     }
+    let mut rejected = BTreeSet::new();
     for source in sources {
         check_deadline(until)?;
-        match attempt(receiver, source, &mut request, until) {
+        match attempt(receiver, source, &mut request, until, &mut rejected) {
             Ok(target) => return Ok(target),
             Err(Failure::Local(error)) => return Err(error),
             Err(Failure::Peer(_error)) => {
@@ -135,6 +203,7 @@ pub fn synchronize(
         node,
         operator,
         parameters,
+        allow_rejection_failover: sources.len() > 1,
     };
     let target = run_sources(&mut receiver, sources, |source, bytes, until| {
         if let Some(until) = until {

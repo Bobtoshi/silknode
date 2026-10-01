@@ -53,11 +53,21 @@ unsupported schemas and excessive source counts refuse before opening the node.
 - Every new carrier still enters the ordinary local work/proof/parent/clock/
   consensus admission and reconciliation route. No remote checkpoint, claimed
   work, saved verification flag or received store grants authority.
-- A local ingress, proof, storage, resource, clock, reconciliation or retained-pin
-  error stops the whole invocation. It is not reclassified as transport failure
-  to obtain a fresh allowance from another peer. This conservative rule also
-  stops on a carrier rejected by ordinary ingress; it does not promise automatic
-  malicious-peer recovery after every definite protocol refusal.
+- A storage, resource, clock, reconciliation, retained-pin or uncertain ingress
+  failure stops the whole invocation. It is not reclassified to obtain a fresh
+  allowance from another peer. In explicit multi-source mode only, a definite
+  ordinary ingress rejection (`Invalid`, Sapling `Encoding` or `Crypto`) may
+  abandon that source after the receiver remains READY with exactly the same
+  local head, graph count and state digest, and the independent retained pin
+  still matches. Other error variants remain local STOPs. Settlement failures
+  are never peer failures. Original single-source ingress failure behavior is
+  unchanged.
+- A rejected carrier's SHA-256 is retained for this invocation. The same bytes
+  from another source abandon that source before another admission attempt;
+  no rejected job receives renewed work/proof time. At most eight rejection
+  hashes are retained, one per attempted source. The rest of a rejected batch
+  is not ingested. Different valid data from another explicitly pinned source
+  can continue from the already accepted local prefix.
 - Completed, locally accepted prefixes remain retained after source loss or
   exhaustion. There is no rollback, store replacement, automatic retry of an
   uncertain job, or adoption of a remotely supplied local-head pin.
@@ -132,6 +142,27 @@ one pre-existing style lint in unchanged server/mining code, not an admission or
 runtime check. It is not a claim of strict whole-workspace lint cleanliness.
 Formatting/diff checks cover the changed files. No historical costly maturity,
 proof-generation, canary, mining or relay experiment was repeated.
+
+## Definite-rejection failover implementation — 1 October 2026
+
+This increment addresses a concrete availability gap: one source's definite
+invalid carrier previously prevented catch-up from any other configured source.
+The ordinary node verifier and consensus bytes are unchanged. Four new focused
+checks cover accepted-prefix retention, batch-suffix refusal, the unchanged
+cumulative deadline across rejection failover, no repeat admission of rejected
+bytes, actual node framing rejection with matching-source continuation, and
+local STOP on uncertain errors, changed lineage or stale independent pins.
+The cryptographic-error classification checks inject typed errors; they do not
+generate proofs or claim an independently operated adversarial network journey.
+
+Reproduce only the new checks with the same manifest/target command above,
+replacing the filters with `--bin silk-f04-testnet rejection_ -- --test-threads=1`.
+This is a local implementation increment, not deployment, full malicious-peer
+recovery, history scaling, privacy acceptance or blockchain completion.
+
+All four new checks and the two affected existing local-STOP/cumulative-deadline
+checks passed. Scoped Clippy passed with the same pre-existing `collapsible_if`
+allowance documented above; formatting and diff checks passed.
 
 ## Still unproven
 
