@@ -262,6 +262,13 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
             .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
             .unwrap();
         let retained = node.core.graph.get(*id).unwrap();
+        let header = node
+            .core
+            .graph
+            .header(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
+            .unwrap();
+        assert_eq!(header.bytes, loaded.candidate().header.bytes);
+        assert!(!std::ptr::eq(header.as_ref(), &loaded.candidate().header));
         let source = retained.source_id().unwrap();
         assert_eq!(
             loaded.retained_record().unwrap(),
@@ -352,6 +359,14 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     let held = path.with_extension("held");
     fs::rename(&path, &held).unwrap();
     assert!(matches!(node.begin_ingest(&repeated), Err(Error::Io(_))));
+    assert!(matches!(
+        node.core.graph.header(
+            ids[position],
+            &node.core.genesis,
+            &JobBudget::checkpoint().unwrap()
+        ),
+        Err(Error::Io(_))
+    ));
     assert!(node.export_range(0, 16).is_err());
     assert!(
         node.core
@@ -399,7 +414,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; full_graph_headers_disk_backed=true; owned_original_header_reads_exact=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_header_and_reducers_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
     );
 }
 

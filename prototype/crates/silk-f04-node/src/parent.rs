@@ -88,7 +88,7 @@ impl PrefixCache {
         pv.push(q as u8);
         pv.extend_from_slice(&[0; 7]);
         for (t, id) in e.iter().enumerate().skip(m - q) {
-            let header = graph.header(*id)?;
+            let header = graph.header(*id, g, budget)?;
             pv.extend_from_slice(&(t as u64).to_le_bytes());
             pv.extend_from_slice(&id.into_bytes());
             pv.extend_from_slice(&header.timestamp.to_le_bytes());
@@ -99,7 +99,7 @@ impl PrefixCache {
         let tparent = parents
             .ordinary_parents()
             .iter()
-            .map(|id| graph.header(*id).map(|h| h.timestamp))
+            .map(|id| graph.header(*id, g, budget).map(|h| h.timestamp))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .max()
@@ -107,11 +107,11 @@ impl PrefixCache {
         let tmtp = if m == 0 {
             g.timestamp()
         } else {
-            mtp(graph, e, m - 1)?
+            mtp(graph, e, m - 1, g, budget)?
         };
         let wref = order
             .selected_tip()
-            .map(|id| graph.header(id).map(|h| h.work))
+            .map(|id| graph.header(id, g, budget).map(|h| h.work))
             .transpose()?
             .unwrap_or(1);
         let epoch = 1 + m as u64 / 8;
@@ -122,13 +122,13 @@ impl PrefixCache {
             let n = last.min(32);
             let start = last - n;
             let observed = e[start + 1..=last].iter().try_fold(0_u128, |sum, id| {
-                Ok::<_, Error>(sum + u128::from(graph.header(*id)?.work))
+                Ok::<_, Error>(sum + u128::from(graph.header(*id, g, budget)?.work))
             })?;
             Sample::derive(
                 start as u64,
                 last as u64,
-                mtp(graph, e, start)?,
-                mtp(graph, e, last)?,
+                mtp(graph, e, start, g, budget)?,
+                mtp(graph, e, last, g, budget)?,
                 observed,
                 wref,
             )?
@@ -143,7 +143,7 @@ impl PrefixCache {
         dx.extend_from_slice(&[0; 7]);
         for id in parents.ordinary_parents() {
             dx.extend_from_slice(&id.into_bytes());
-            dx.extend_from_slice(&graph.header(*id)?.timestamp.to_le_bytes());
+            dx.extend_from_slice(&graph.header(*id, g, budget)?.timestamp.to_le_bytes());
         }
         for v in [m as u64, epoch, tmtp, tparent, wref] {
             dx.extend_from_slice(&v.to_le_bytes());
@@ -338,10 +338,16 @@ pub(crate) fn replay_source_for_test(
     cache.reconstruct(graph, ids, &js, genesis, budget)
 }
 
-fn mtp(graph: &Graph, e: &[VertexId], i: usize) -> Result<u64> {
+fn mtp(
+    graph: &Graph,
+    e: &[VertexId],
+    i: usize,
+    genesis: &Genesis,
+    budget: &JobBudget,
+) -> Result<u64> {
     let mut times = e[(i + 1).saturating_sub(11)..=i]
         .iter()
-        .map(|id| graph.header(*id).map(|h| h.timestamp))
+        .map(|id| graph.header(*id, genesis, budget).map(|h| h.timestamp))
         .collect::<Result<Vec<_>>>()?;
     times.sort_unstable();
     Ok(times[(times.len() - 1) / 2])

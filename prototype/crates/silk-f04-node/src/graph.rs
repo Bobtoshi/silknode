@@ -34,11 +34,64 @@ pub struct VerifiedVertex {
 #[derive(Clone)]
 pub struct GraphInfo {
     id: Digest,
-    header: Header,
+    header: HeaderRecord,
     facts: ParentFacts,
     metadata: Option<Metadata>,
     ancestors: PagedAncestry,
     retained_source: Option<RetainedSource>,
+}
+// Full headers are owned only by resident/execution carriers. Durable entries
+// retain the minimum sealed SG0 summary plus exact representation binding.
+#[derive(Clone)]
+enum HeaderRecord {
+    Resident(Arc<Header>),
+    Retained {
+        hash: Digest,
+        domain: Digest,
+        parents: Sg0ParentSetV1,
+        work: u64,
+    },
+}
+impl HeaderRecord {
+    fn retain(&self) -> Self {
+        match self {
+            Self::Resident(header) => Self::Retained {
+                hash: raw_hash(&header.bytes),
+                domain: header.bytes[560..].try_into().expect("fixed header domain"),
+                parents: header.parents.clone(),
+                work: header.work,
+            },
+            Self::Retained { .. } => self.clone(),
+        }
+    }
+    fn matches(&self, header: &Header) -> bool {
+        match self {
+            Self::Resident(original) => original.bytes == header.bytes,
+            Self::Retained {
+                hash,
+                domain,
+                parents,
+                work,
+            } => {
+                raw_hash(&header.bytes) == *hash
+                    && header.bytes[560..] == *domain
+                    && header.parents == *parents
+                    && header.work == *work
+            }
+        }
+    }
+    fn parents(&self) -> &Sg0ParentSetV1 {
+        match self {
+            Self::Resident(header) => &header.parents,
+            Self::Retained { parents, .. } => parents,
+        }
+    }
+    fn work(&self) -> u64 {
+        match self {
+            Self::Resident(header) => header.work,
+            Self::Retained { work, .. } => *work,
+        }
+    }
 }
 // Only fresh receiver sealing creates Resident. Retained is a live binding to
 // that same exact original record, never an imported saved-validity flag.
@@ -86,8 +139,12 @@ impl GraphInfo {
         }
         Ok(metadata)
     }
-    fn execution_info(&self, bytes: &[u8]) -> Result<Self> {
+    fn execution_info(&self, bytes: &[u8], header: &Header) -> Result<Self> {
         let mut info = self.clone();
+        if !self.header.matches(header) {
+            return Err(Error::Unavailable("retained execution header binding"));
+        }
+        info.header = HeaderRecord::Resident(Arc::new(header.clone()));
         if matches!(self.metadata, Some(Metadata::Retained { .. })) {
             info.metadata = Some(Metadata::Resident(Arc::new(self.bound_metadata(bytes)?)));
         }
@@ -175,10 +232,11 @@ impl RetainEntry for VerifiedVertex {
                 "live verified execution source mismatch",
             ));
         }
+        let info = self.info.execution_info(record, &candidate.header)?;
         Ok(Self {
             candidate,
             envelopes: self.envelopes.clone(),
-            info: self.info.execution_info(record)?,
+            info,
         })
     }
 }
@@ -208,6 +266,7 @@ impl RetainEntry for RetainedVertex {
             .collect();
         let mut info = vertex.info;
         info.metadata = Some(Metadata::Retained { len: metadata_len });
+        info.header = info.header.retain();
         // Candidate, full envelopes AND sealed SG0 data drop before graph credit.
         Ok(Arc::new(Self { info, bindings }))
     }
@@ -216,7 +275,7 @@ impl RetainEntry for RetainedVertex {
     }
     fn restore(&self, candidate: Candidate, record: &[u8]) -> Result<VerifiedVertex> {
         if candidate.id != self.info.id
-            || candidate.header.bytes != self.info.header.bytes
+            || !self.info.header.matches(&candidate.header)
             || candidate.body.representations().len() != self.bindings.len()
         {
             return Err(Error::Unavailable("durable execution metadata mismatch"));
@@ -230,17 +289,18 @@ impl RetainEntry for RetainedVertex {
                 binding
                     .reattach(Envelope::decode(
                         bytes,
-                        &self.info.header.bytes[560..]
+                        &candidate.header.bytes[560..]
                             .try_into()
                             .map_err(|_| Error::Unavailable("durable vertex domain"))?,
                     )?)
                     .map_err(Error::from)
             })
             .collect::<Result<Vec<_>>>()?;
+        let info = self.info.execution_info(record, &candidate.header)?;
         Ok(VerifiedVertex {
             candidate,
             envelopes,
-            info: self.info.execution_info(record)?,
+            info,
         })
     }
 }
@@ -466,8 +526,49 @@ impl<V: GraphEntry> GraphData<V> {
             .map(|i| self.vertices[*i].as_ref())
             .ok_or(Error::Unavailable("missing admitted vertex"))
     }
-    pub(crate) fn header(&self, id: VertexId) -> Result<&Header> {
-        Ok(&self.get(id)?.graph_info().header)
+    pub(crate) fn header(
+        &self,
+        id: VertexId,
+        genesis: &Genesis,
+        budget: &JobBudget,
+    ) -> Result<Arc<Header>> {
+        budget.check()?;
+        let info = self.get(id)?.graph_info();
+        if let HeaderRecord::Resident(header) = &info.header {
+            return Ok(header.clone());
+        }
+        let source = info
+            .retained_source
+            .as_ref()
+            .ok_or(Error::Unavailable("retained header source absent"))?;
+        let reader = self
+            .ancestry_reader
+            .as_ref()
+            .ok_or(Error::Unavailable("retained header reader absent"))?;
+        budget.source()?;
+        let bytes = reader.objects().object(source.id, source.record_len)?;
+        let end = 12_usize
+            .checked_add(source.candidate_len)
+            .ok_or(Error::Unavailable("retained header candidate length"))?;
+        if bytes.len() != source.record_len
+            || bytes.get(..8) != Some(b"SNF04VR1")
+            || u32le(&bytes, 8)? as usize != source.candidate_len
+        {
+            return Err(Error::Unavailable("retained header source framing"));
+        }
+        let candidate = Candidate::decode(
+            bytes
+                .get(12..end)
+                .ok_or(Error::Unavailable("retained header candidate framing"))?,
+            genesis,
+        )?;
+        if candidate.id != info.id || !info.header.matches(&candidate.header) {
+            return Err(Error::Unavailable(
+                "retained header representation mismatch",
+            ));
+        }
+        budget.check()?;
+        Ok(Arc::new(candidate.header))
     }
     pub(crate) fn retained_candidate_matches(&self, id: VertexId, expected: &[u8]) -> Result<bool> {
         let index = *self
@@ -660,7 +761,7 @@ impl<V: GraphEntry> GraphData<V> {
         Ok(VerifiedVertex {
             info: GraphInfo {
                 id: candidate.id,
-                header: candidate.header.clone(),
+                header: HeaderRecord::Resident(Arc::new(candidate.header.clone())),
                 facts,
                 ancestors: self.parent_closure(&candidate.header.parents)?,
                 metadata: None,
@@ -773,10 +874,10 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         }
     }
     fn parent_set(&self, id: VertexId) -> std::result::Result<Sg0ParentSetV1, Sg0Error> {
-        Ok(self.lookup(id)?.header.parents.clone())
+        Ok(self.lookup(id)?.header.parents().clone())
     }
     fn receiver_verified_work_be(&self, id: VertexId) -> std::result::Result<Digest, Sg0Error> {
-        Ok(Uint256::from_u64(self.lookup(id)?.header.work).to_be_bytes())
+        Ok(Uint256::from_u64(self.lookup(id)?.header.work()).to_be_bytes())
     }
     fn vertex_data(&self, id: VertexId) -> std::result::Result<Option<Sg0VertexDataV1>, Sg0Error> {
         self.lookup(id)?
@@ -871,7 +972,7 @@ mod tests {
         VerifiedVertex {
             info: GraphInfo {
                 id: candidate.id,
-                header: candidate.header.clone(),
+                header: HeaderRecord::Resident(Arc::new(candidate.header.clone())),
                 facts,
                 ancestors,
                 metadata: None,
@@ -940,12 +1041,17 @@ mod tests {
                 .unwrap();
             prepared.bind_retained_source(&record).unwrap();
             let weak_body = Arc::downgrade(&prepared.vertex);
+            let weak_header = match &prepared.vertex.info.header {
+                HeaderRecord::Resident(header) => Arc::downgrade(header),
+                HeaderRecord::Retained { .. } => panic!("fresh sealing must own full header"),
+            };
             let weak_metadata = match &prepared.vertex.info.metadata {
                 Some(Metadata::Resident(metadata)) => Arc::downgrade(metadata),
                 _ => panic!("fresh sealing must own receiver-derived metadata"),
             };
             durable.publish(prepared).unwrap();
             assert!(weak_body.upgrade().is_none());
+            assert!(weak_header.upgrade().is_none());
             assert!(weak_metadata.upgrade().is_none());
         }
         assert_eq!(
@@ -963,6 +1069,11 @@ mod tests {
             resident.is_ancestor(id(1), id(4)).unwrap()
         );
         assert!(durable.vertices().all(|v| v.bindings.is_empty()));
+        assert!(
+            durable
+                .vertices()
+                .all(|v| matches!(v.info.header, HeaderRecord::Retained { .. }))
+        );
         assert!(
             durable
                 .vertices()
@@ -989,6 +1100,29 @@ mod tests {
         drop(store);
         assert_eq!(durable.export_retained_range(0, 32).unwrap(), originals);
     }
+    #[test]
+    fn disk_header_binding_is_exact_and_keeps_only_immutable_sg0_summary() {
+        let graph = Graph::default();
+        let vertex = synthetic_vertex(&graph, 1, &[]);
+        let full = vertex.candidate.header.clone();
+        let retained = vertex.info.header.retain();
+        assert!(retained.matches(&full));
+        assert_eq!(retained.parents(), &full.parents);
+        assert_eq!(retained.work(), full.work);
+        let mut changed = full.clone();
+        changed.bytes[100] ^= 1;
+        assert!(!retained.matches(&changed));
+        let mut changed = full.clone();
+        changed.bytes[560] ^= 1;
+        assert!(!retained.matches(&changed));
+        let mut changed = full.clone();
+        changed.work += 1;
+        assert!(!retained.matches(&changed));
+        let mut changed = full;
+        changed.parents = Sg0ParentSetV1::vertices(vec![id(2)]).unwrap();
+        assert!(!retained.matches(&changed));
+    }
+
     #[test]
     fn disk_metadata_missing_or_tampered_source_refuses_order_and_staging_without_credit() {
         let (temp, mut store) = crate::store::ancestry_test_store();
