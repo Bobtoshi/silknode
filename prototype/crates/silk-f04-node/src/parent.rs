@@ -280,17 +280,17 @@ impl PrefixCache {
             .states
             .iter()
             .filter(|s| {
-                s.executed().len() <= ids.len()
-                    && s.eligible_commitment() == js[s.executed().len()]
-                    && s.executed() == &ids[..s.executed().len()]
+                s.executed_len() <= ids.len()
+                    && s.eligible_commitment() == js[s.executed_len()]
+                    && s.executed_prefix_matches(ids)
             })
-            .max_by_key(|s| s.executed().len())
+            .max_by_key(|s| s.executed_len())
             .cloned()
             .unwrap_or_else(|| self.genesis.clone());
-        while state.executed().len() < ids.len() {
+        while state.executed_len() < ids.len() {
             budget.replay()?;
             budget.check()?;
-            let start = state.executed().len();
+            let start = state.executed_len();
             let batch = ids[start..start + 8]
                 .iter()
                 .map(|id| graph.get(*id))

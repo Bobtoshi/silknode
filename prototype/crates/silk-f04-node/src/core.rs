@@ -239,15 +239,15 @@ impl Core {
         }
         budget.check()?;
         let ids = self.order.eligible_order();
-        let old = self.state.executed();
-        let common = old.iter().zip(ids).take_while(|(a, b)| a == b).count();
-        if common < old.len() {
+        let old_len = self.state.executed_len();
+        let common = self.state.common_executed_prefix(ids);
+        if common < old_len {
             let end = common / 8 * 8;
             let state = self
                 .history
                 .iter()
-                .filter(|s| s.executed().len() <= end && s.executed() == &ids[..s.executed().len()])
-                .max_by_key(|s| s.executed().len())
+                .filter(|s| s.executed_len() <= end && s.executed_prefix_matches(ids))
+                .max_by_key(|s| s.executed_len())
                 .cloned()
                 .unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
             let status = if status_for(&state, ids) == Status::Ready {
@@ -266,7 +266,7 @@ impl Core {
                 previous: self.state.checkpoint_id(),
             });
         }
-        let start = old.len();
+        let start = old_len;
         let batch = ids
             .get(start..start + 8)
             .ok_or(Error::Unavailable("incomplete replay interval"))?;
@@ -300,9 +300,8 @@ impl Core {
     /// complete intervals; reuse of retained checkpoints can only lower the cost.
     pub fn reconciliation_generations(&self) -> Result<u64> {
         let ids = self.order.eligible_order();
-        let old = self.state.executed();
-        let common = old.iter().zip(ids).take_while(|(a, b)| a == b).count();
-        HistoryCapacityV1::reconciliation_generations(old.len(), common, ids.len())
+        let common = self.state.common_executed_prefix(ids);
+        HistoryCapacityV1::reconciliation_generations(self.state.executed_len(), common, ids.len())
     }
     pub fn publish_step(&mut self, s: Step) -> Result<()> {
         if s.previous != self.state.checkpoint_id() {
@@ -375,15 +374,10 @@ impl Core {
     }
 }
 fn status_for(state: &BranchState, ids: &[VertexId]) -> Status {
-    let common = state
-        .executed()
-        .iter()
-        .zip(ids)
-        .take_while(|(a, b)| a == b)
-        .count();
-    if common == state.executed().len() && ids.len() / 8 * 8 == state.executed().len() {
+    let common = state.common_executed_prefix(ids);
+    if common == state.executed_len() && ids.len() / 8 * 8 == state.executed_len() {
         Status::Ready
-    } else if state.executed().len().saturating_sub(common / 8 * 8) > 32 {
+    } else if state.executed_len().saturating_sub(common / 8 * 8) > 32 {
         Status::ArchiveReplay
     } else {
         Status::NeedsReconcile

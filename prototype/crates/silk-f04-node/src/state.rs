@@ -1,9 +1,13 @@
 //! One checkpoint reducer shared by canonical execution and parent-prefix replay.
 //! A cut is a reversible prefix reference, never a finality certificate.
+mod sequence;
 mod sets;
-use crate::economics::{CREDIT_MATURITY_V1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1};
+use crate::economics::{
+    CREDIT_MATURITY_V1, EconomicCountsV1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1,
+};
 use crate::{Digest, Error, Result, genesis::Genesis, graph::VerifiedVertex, wire::raw_hash};
 use sapling_crypto::{CommitmentTree, Node};
+use sequence::PagedSequence;
 use sets::PagedLedgerSet;
 use sha2::{Digest as _, Sha256};
 use silk_pow::randomx_v2_work_key_id;
@@ -102,11 +106,11 @@ pub struct BranchState {
     recovery: Vec<Arc<[u8; RECOVERY_BYTES]>>,
     // Derived only; NEVER added to current hashes, manifests, deltas or wire bytes.
     accepted_outputs: Vec<Arc<AcceptedOutputs>>,
-    rewards: Vec<[u8; 112]>,
+    rewards: PagedSequence<[u8; 112]>,
     pool: u64,
     burned: u64,
     issued: u128,
-    executed: Vec<VertexId>,
+    executed: PagedSequence<VertexId>,
     j: Digest,
     tail: VecDeque<[u8; 56]>,
     dc: Digest,
@@ -142,11 +146,11 @@ impl BranchState {
             effects: PagedLedgerSet::new(50_000),
             recovery: g.recoveries().iter().map(|e| Arc::new(*e)).collect(),
             accepted_outputs: Vec::new(),
-            rewards: Vec::new(),
+            rewards: PagedSequence::new(crate::sync::HISTORY_LIMIT_V1),
             pool: g.total(),
             burned: 0,
             issued: 0,
-            executed: Vec::new(),
+            executed: PagedSequence::new(crate::sync::HISTORY_LIMIT_V1),
             j,
             tail: VecDeque::new(),
             dc: [0; 32],
@@ -313,7 +317,7 @@ impl BranchState {
             return Err(Error::Paused("eligible reference horizon"));
         }
         self.j = fold_j(&self.domain, self.j, i, candidate.id);
-        self.executed.push(VertexId::from_bytes(candidate.id));
+        self.executed.push(VertexId::from_bytes(candidate.id))?;
         let mut row = [0; 56];
         row[..8].copy_from_slice(&(i - 1).to_le_bytes());
         row[8..40].copy_from_slice(&candidate.id);
@@ -346,7 +350,7 @@ impl BranchState {
         r[40..72].copy_from_slice(&h.owner);
         r[72..104].copy_from_slice(&h.reward_nonce);
         r[104..].copy_from_slice(&PUBLIC_CREDIT_V1.to_le_bytes());
-        self.rewards.push(r);
+        self.rewards.push(r)?;
         self.issued = u128::from(i) * u128::from(PUBLIC_CREDIT_V1);
         Ok(())
     }
@@ -423,8 +427,13 @@ impl BranchState {
     }
 
     fn check_invariants(&self) -> Result<()> {
-        self.economic_ledger()
-            .validate(&self.domain, self.initial_pool)
+        self.economic_counts()
+            .validate(
+                &self.domain,
+                self.initial_pool,
+                self.executed.iter(),
+                self.rewards.iter(),
+            )
             .map_err(|_| Error::Unavailable("complete economic ledger invariants"))?;
         if self.nullifiers.len() != self.effects.len() * 2
             || self.accepted_outputs.len() != self.effects.len()
@@ -447,8 +456,8 @@ impl BranchState {
             + self.nullifiers.len() * 128
             + self.effects.len() * 128
             + self.accepted_outputs.len() * 192
-            + self.rewards.len() * 160
-            + self.executed.len() * 64
+            + self.rewards.cache_charge()
+            + self.executed.cache_charge()
             + self.cuts.len() * 256
     }
 
@@ -562,7 +571,7 @@ impl BranchState {
             for x in added {
                 b.extend_from_slice(x.as_slice());
             }
-            for r in &self.rewards[prior.rewards.len()..] {
+            for r in self.rewards.iter_from(prior.rewards.len())? {
                 b.extend_from_slice(r);
             }
         }
@@ -610,9 +619,23 @@ impl BranchState {
         self.j
     }
     /// Completed eligible IDs only; an incomplete interval is graph evidence.
+    /// Materializes a complete compatibility view on demand, not for core replay.
     #[must_use]
     pub fn executed(&self) -> &[VertexId] {
-        &self.executed
+        self.executed.as_slice()
+    }
+    pub(crate) const fn executed_len(&self) -> usize {
+        self.executed.len()
+    }
+    pub(crate) fn common_executed_prefix(&self, ids: &[VertexId]) -> usize {
+        self.executed
+            .iter()
+            .zip(ids)
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+    pub(crate) fn executed_prefix_matches(&self, ids: &[VertexId]) -> bool {
+        self.executed.len() <= ids.len() && self.common_executed_prefix(ids) == self.executed.len()
     }
     /// Public pool and cumulative private burn counters.
     #[must_use]
@@ -656,7 +679,8 @@ impl BranchState {
     pub fn root(&self) -> Digest {
         self.tree.root().to_bytes()
     }
-    /// Borrow current receiver-derived accounting without copying reward history.
+    /// Borrow complete receiver-derived accounting through compatibility slices.
+    /// Complete slice views are materialized once on demand for compatibility.
     /// This is not a consensus proof or a transferable credit balance.
     #[must_use]
     pub fn economic_ledger(&self) -> EconomicLedgerV1<'_> {
@@ -666,8 +690,19 @@ impl BranchState {
             private_burned: self.burned,
             accepted_effects: self.effects.len() as u64,
             public_issued: self.issued,
-            executed: &self.executed,
-            reward_records: &self.rewards,
+            executed: self.executed.as_slice(),
+            reward_records: self.rewards.as_slice(),
+        }
+    }
+    const fn economic_counts(&self) -> EconomicCountsV1 {
+        EconomicCountsV1 {
+            domain: self.domain,
+            private_pool: self.pool,
+            private_burned: self.burned,
+            accepted_effects: self.effects.len() as u64,
+            public_issued: self.issued,
+            executed: self.executed.len(),
+            rewards: self.rewards.len(),
         }
     }
     /// Issued/mature public nontransferable attribution credits.
@@ -675,7 +710,7 @@ impl BranchState {
     pub fn public_balance(&self, owner: &Digest) -> (u128, u128) {
         let mut issued = 0;
         let mut mature = 0;
-        for r in &self.rewards {
+        for r in self.rewards.iter() {
             if r[40..72] == *owner {
                 issued += u128::from(PUBLIC_CREDIT_V1);
                 let i = u64::from_le_bytes(r[..8].try_into().expect("fixed reward"));
@@ -741,6 +776,132 @@ mod tests {
         let mut key = [0; 32];
         key[30..].copy_from_slice(&position.to_be_bytes());
         key
+    }
+
+    // Synthetic ordered accounting rows, not mined or cryptographically admitted
+    // checkpoints. These exercise representation and private core read adapters.
+    fn ordered_fixture(count: u16) -> (BranchState, Vec<VertexId>, Vec<[u8; 112]>) {
+        let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
+        let mut state = BranchState::genesis(&genesis).unwrap();
+        let mut ids = Vec::new();
+        let mut rewards = Vec::new();
+        for position in 1..=count {
+            let id = VertexId::from_bytes(set_key(position));
+            let mut row = [0; 112];
+            row[..8].copy_from_slice(&u64::from(position).to_le_bytes());
+            row[8..40].copy_from_slice(id.as_bytes());
+            row[40..72].copy_from_slice(&[3; 32]);
+            row[104..].copy_from_slice(&PUBLIC_CREDIT_V1.to_le_bytes());
+            state.executed.push(id).unwrap();
+            state.rewards.push(row).unwrap();
+            state.j = fold_j(&state.domain, state.j, u64::from(position), id.into_bytes());
+            ids.push(id);
+            rewards.push(row);
+        }
+        state.issued = u128::from(count) * u128::from(PUBLIC_CREDIT_V1);
+        state.checkpoint_index = u64::from(count) / 8;
+        state.state_digest = state.hash_state();
+        (state, ids, rewards)
+    }
+
+    #[test]
+    fn paged_ledger_sequence_accounting_prefix_and_balance_do_not_flatten() {
+        let (state, ids, rewards) = ordered_fixture(64);
+        state.check_invariants().unwrap();
+        assert_eq!(state.common_executed_prefix(&ids), ids.len());
+        assert!(state.executed_prefix_matches(&ids));
+        assert!(!state.executed_prefix_matches(&ids[..63]));
+        let mut fork = ids.clone();
+        fork[61] = VertexId::from_bytes([99; 32]);
+        assert_eq!(state.common_executed_prefix(&fork), 61);
+        assert!(!state.executed_prefix_matches(&fork));
+        assert_eq!(state.public_balance(&[3; 32]), (640, 480));
+        assert!(!state.executed.is_materialized());
+        assert!(!state.rewards.is_materialized());
+        assert_eq!(state.executed(), ids);
+        let view = state.economic_ledger();
+        assert_eq!(view.reward_records, rewards);
+        view.validate(&state.domain, 0).unwrap();
+        assert!(state.executed.is_materialized());
+        assert!(state.rewards.is_materialized());
+        let cloned = state.clone();
+        assert!(!cloned.executed.is_materialized());
+        assert!(!cloned.rewards.is_materialized());
+        cloned.check_invariants().unwrap();
+        assert!(!cloned.executed.is_materialized());
+        assert!(!cloned.rewards.is_materialized());
+    }
+
+    #[test]
+    fn paged_ledger_sequence_reward_hash_and_reversible_delta_match_flat_rows() {
+        let (prior, ids, rewards) = ordered_fixture(64);
+        let before = prior.manifest();
+        let mut next = prior.clone();
+        let (_, next_ids, next_rewards) = ordered_fixture(72);
+        for (id, row) in next_ids[64..].iter().zip(&next_rewards[64..]) {
+            next.executed.push(*id).unwrap();
+            next.rewards.push(*row).unwrap();
+        }
+        next.issued = 720;
+        next.checkpoint_index = 9;
+        next.checkpoint_id = [9; 32];
+        next.state_digest = next.hash_state();
+        next.check_invariants().unwrap();
+        let nf = hash_stream("SilkNode-F0-NF", &next.domain, 0, std::iter::empty());
+        let ef = hash_stream("SilkNode-F0-EF", &next.domain, 0, std::iter::empty());
+        let rh = hash_stream(
+            "SilkNode-F0-recovery-history",
+            &next.domain,
+            0,
+            std::iter::empty(),
+        );
+        let pr = hash_stream(
+            "SilkNode-F0-public-rewards",
+            &next.domain,
+            next_rewards.len(),
+            next_rewards.iter().map(|row| row.as_slice()),
+        );
+        let expected = domain_hash(
+            "SilkNode-F0-state",
+            &[
+                &next.domain,
+                &next.root(),
+                &0_u64.to_le_bytes(),
+                &nf,
+                &ef,
+                &0_u64.to_le_bytes(),
+                &0_u64.to_le_bytes(),
+                &rh,
+                &pr,
+                &720_u128.to_le_bytes(),
+            ],
+        );
+        assert_eq!(next.hash_state(), expected);
+        let mut delta = Vec::from(b"SNF04DL1\0\0\0\0\0\0\0\0".as_slice());
+        delta.extend_from_slice(&prior.checkpoint_id);
+        delta.extend_from_slice(&next.checkpoint_id);
+        for _ in 0..4 {
+            delta.extend_from_slice(&0_u32.to_le_bytes());
+        } // outcomes/NF/EF/recovery
+        for row in &next_rewards[64..] {
+            delta.extend_from_slice(row);
+        }
+        assert_eq!(next.delta(&prior, &[], false).unwrap(), delta);
+        let mut rollback = Vec::from(b"SNF04DL1\x01\0\0\0\0\0\0\0".as_slice());
+        rollback.extend_from_slice(&next.checkpoint_id);
+        rollback.extend_from_slice(&prior.checkpoint_id);
+        rollback.extend_from_slice(&0_u32.to_le_bytes());
+        for state in [&next, &prior] {
+            let manifest = state.manifest();
+            rollback.extend_from_slice(&u32::try_from(manifest.len()).unwrap().to_le_bytes());
+            rollback.extend_from_slice(&manifest);
+        }
+        assert_eq!(prior.delta(&next, &[], true).unwrap(), rollback);
+        assert!(!next.executed.is_materialized());
+        assert!(!next.rewards.is_materialized());
+        assert_eq!(prior.manifest(), before);
+        assert_eq!(prior.executed(), ids);
+        assert_eq!(prior.economic_ledger().reward_records, rewards);
     }
 
     // Private serializer fixtures, NOT accepted effects/economic states. No
@@ -837,8 +998,10 @@ mod tests {
             new_ef.insert(set_key(i));
         }
         for label in 1..=8_u8 {
-            next.executed.push(VertexId::from_bytes([label; 32]));
-            next.rewards.push([label; 112]);
+            next.executed
+                .push(VertexId::from_bytes([label; 32]))
+                .unwrap();
+            next.rewards.push([label; 112]).unwrap();
         }
         next.checkpoint_id = [9; 32];
         next.state_digest = next.hash_state();
@@ -856,7 +1019,7 @@ mod tests {
             }
         }
         literal.extend_from_slice(&0_u32.to_le_bytes()); // no new recovery rows
-        for row in &next.rewards {
+        for row in next.rewards.iter() {
             literal.extend_from_slice(row);
         }
         assert_eq!(next.delta(&prior, &outcomes, false).unwrap(), literal);

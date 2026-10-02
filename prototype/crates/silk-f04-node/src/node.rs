@@ -387,7 +387,7 @@ impl Node {
         HistoryCapacityV1::for_counts(
             self.sequence,
             self.core.graph.len(),
-            self.core.state.executed().len(),
+            self.core.state.executed_len(),
         )
     }
     /// Reserve a bounded public output against the same whole-task store/margin
