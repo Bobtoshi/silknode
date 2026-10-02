@@ -1,5 +1,6 @@
 //! Explicit F0.4 durable node API. No legacy default, network listener or wallet secret.
 //! Full-range synchronization uses the same live receiver as direct ingress.
+mod replay;
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
@@ -172,14 +173,14 @@ impl Node {
         let replay_job = store.begin_replay(&replay_marker)?;
         let genesis = Arc::new(genesis);
         let attempted = match store.head() {
-            Some(head) => Self::replay(&store, head, genesis.clone(), parameters),
+            Some(head) => Self::replay(&mut store, head, genesis.clone(), parameters),
             None => Err(Error::Unavailable("no complete local head")),
         };
         let (core, sequence, recovered_previous) = match attempted {
             Ok((core, sequence)) => (core, sequence, false),
             Err(e) if allow_previous_recovery && storage_integrity_failure(&e) => {
                 let previous = store.previous()?.ok_or(e)?;
-                let (core, sequence) = Self::replay(&store, previous, genesis, parameters)?;
+                let (core, sequence) = Self::replay(&mut store, previous, genesis, parameters)?;
                 // No restoration until the previous COMPLETE generation has
                 // passed fresh work, crypto, ordering and ledger replay.
                 store.restore_verified(previous)?;
@@ -248,33 +249,20 @@ impl Node {
     }
 
     fn replay(
-        store: &Store,
+        store: &mut Store,
         head: Digest,
         genesis: Arc<Genesis>,
         parameters: &SaplingParameters,
     ) -> Result<(Core, u64)> {
-        let mut records = Vec::new();
-        let mut cursor = head;
-        loop {
-            if records.len() as u64 >= GENERATION_LIMIT_V1 {
-                return Err(Error::Paused("generation replay reference horizon"));
-            }
-            let b = store.object(cursor)?;
-            let r = Record::decode(&b)?;
-            if r.domain != genesis.domain() {
-                return Err(Error::Unavailable("retained generation context"));
-            }
-            cursor = r.previous;
-            records.push(r);
-            if cursor == [0; 32] {
-                break;
-            }
-        }
-        records.reverse();
+        // The index contains only authenticated record addresses, never saved
+        // validity or a decoded branch snapshot. Full semantic replay below is
+        // unchanged; at most one fixed-size page is resident during traversal.
+        let mut records = replay::ReplayPagesV1::build(store, head, genesis.domain())?;
         let mut core = Core::new(genesis, LocalClock::default())?;
         let mut previous = [0; 32];
         let mut last_sequence = 0;
-        for (index, r) in records.into_iter().enumerate() {
+        let mut index = 0_u64;
+        while let Some(r) = records.next(store)? {
             // ACTIVE_REPLAY already durably fences this complete reopen. Each
             // record retains one original allowance through generation checks.
             // Outer traversal/initialization remains under the runtime's cap.
@@ -284,7 +272,7 @@ impl Node {
                 JobBudget::checkpoint()?
             };
             let mut guard = NativeGuard::arm(&budget)?;
-            if r.sequence != index as u64 || r.previous != previous {
+            if r.sequence != index || r.previous != previous {
                 return Err(Error::Unavailable("generation lineage"));
             }
             if r.clock < core.clock.high_water() {
@@ -344,6 +332,7 @@ impl Node {
             last_sequence = r.sequence;
             budget.check()?;
             guard.finish();
+            index += 1;
         }
         if previous != head {
             return Err(Error::Unavailable("terminal head mismatch"));

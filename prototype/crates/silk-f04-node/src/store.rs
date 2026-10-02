@@ -191,6 +191,45 @@ impl Store {
         }
         Ok(b)
     }
+    /// Retain a bounded traversal page ONLY inside an already fenced cold replay.
+    /// No HEAD/PREVIOUS pointer is changed and no saved page conveys validity.
+    pub(crate) fn retain_replay_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        if bytes.len() > 4096 || self.active_replay()?.is_none() {
+            return Err(Error::Unavailable(
+                "retained replay page requires bounded active replay",
+            ));
+        }
+        // The existing verified-previous route can traverse while a malformed
+        // current HEAD remains quarantined. Preserve that poison; this is not
+        // restoration or permission for any ordinary publication.
+        let was_poisoned = self.poisoned;
+        self.poisoned = false;
+        let charged = charge(bytes.len() as u64) + 2 * 4096;
+        let reserved = self.reserve(charged);
+        self.poisoned = was_poisoned;
+        reserved?;
+        self.used += charged;
+        self.poisoned = true;
+        let retained = (|| {
+            let id = self.put(bytes)?;
+            self.directory.sync_all()?;
+            if fs2::available_space(&self.margin)? < MARGIN {
+                return Err(Error::Paused("post-replay-page host margin"));
+            }
+            Ok(id)
+        })();
+        match retained {
+            Ok(id) => {
+                self.poisoned = was_poisoned;
+                Ok(id)
+            }
+            // An uncertain new write must not be mistaken for old HEAD damage
+            // and trigger the verified-previous fallback in this same attempt.
+            Err(_) => Err(Error::Unavailable(
+                "retained replay page publication failed",
+            )),
+        }
+    }
     fn reserve(&self, bytes: u64) -> Result<()> {
         if self.poisoned {
             return Err(Error::Unavailable(
