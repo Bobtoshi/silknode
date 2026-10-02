@@ -1,8 +1,10 @@
 //! One checkpoint reducer shared by canonical execution and parent-prefix replay.
 //! A cut is a reversible prefix reference, never a finality certificate.
+mod sets;
 use crate::economics::{CREDIT_MATURITY_V1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1};
 use crate::{Digest, Error, Result, genesis::Genesis, graph::VerifiedVertex, wire::raw_hash};
 use sapling_crypto::{CommitmentTree, Node};
+use sets::PagedLedgerSet;
 use sha2::{Digest as _, Sha256};
 use silk_pow::randomx_v2_work_key_id;
 use silk_sapling_f04::{
@@ -11,10 +13,7 @@ use silk_sapling_f04::{
     wallet::CutReference,
 };
 use silk_types::VertexId;
-use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::Arc,
-};
+use std::{collections::VecDeque, sync::Arc};
 
 /// Canonical cut with its exact prefix and leaf-count lineage.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,8 +96,8 @@ pub struct BranchState {
     initial_leaves: u64,
     initial_pool: u64,
     tree: CommitmentTree,
-    nullifiers: BTreeSet<Digest>,
-    effects: BTreeSet<Digest>,
+    nullifiers: PagedLedgerSet,
+    effects: PagedLedgerSet,
     // Share immutable entries across reversible states; do not copy ciphertext history.
     recovery: Vec<Arc<[u8; RECOVERY_BYTES]>>,
     // Derived only; NEVER added to current hashes, manifests, deltas or wire bytes.
@@ -139,8 +138,8 @@ impl BranchState {
             initial_leaves: g.recoveries().len() as u64,
             initial_pool: g.total(),
             tree: g.tree().clone(),
-            nullifiers: BTreeSet::new(),
-            effects: BTreeSet::new(),
+            nullifiers: PagedLedgerSet::new(100_000),
+            effects: PagedLedgerSet::new(50_000),
             recovery: g.recoveries().iter().map(|e| Arc::new(*e)).collect(),
             accepted_outputs: Vec::new(),
             rewards: Vec::new(),
@@ -294,9 +293,9 @@ impl BranchState {
         }
         self.tree = tree;
         for nf in nfs {
-            self.nullifiers.insert(nf);
+            self.nullifiers.insert(nf)?;
         }
-        self.effects.insert(effect);
+        self.effects.insert(effect)?;
         self.recovery.extend(entries.into_iter().map(Arc::new));
         self.accepted_outputs.push(Arc::new(linkage));
         self.pool = next_pool;
@@ -736,6 +735,149 @@ fn hash_stream_checked<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn set_key(position: u16) -> Digest {
+        let mut key = [0; 32];
+        key[30..].copy_from_slice(&position.to_be_bytes());
+        key
+    }
+
+    // Private serializer fixtures, NOT accepted effects/economic states. No
+    // work, proof, payment or genuine checkpoint/reorganization is constructed.
+    #[test]
+    fn paged_ledger_set_state_hash_matches_literal_btree_streams() {
+        let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
+        let mut state = BranchState::genesis(&genesis).unwrap();
+        let mut nullifiers = BTreeSet::new();
+        let mut effects = BTreeSet::new();
+        for i in (0..130_u16).rev() {
+            state.nullifiers.insert(set_key(i)).unwrap();
+            nullifiers.insert(set_key(i));
+            if i % 2 == 0 {
+                state.effects.insert(set_key(i)).unwrap();
+                effects.insert(set_key(i));
+            }
+        }
+        let nf = hash_stream(
+            "SilkNode-F0-NF",
+            &state.domain,
+            nullifiers.len(),
+            nullifiers.iter().map(|key| key.as_slice()),
+        );
+        let ef = hash_stream(
+            "SilkNode-F0-EF",
+            &state.domain,
+            effects.len(),
+            effects.iter().map(|key| key.as_slice()),
+        );
+        let rh = hash_stream(
+            "SilkNode-F0-recovery-history",
+            &state.domain,
+            0,
+            std::iter::empty(),
+        );
+        let pr = hash_stream(
+            "SilkNode-F0-public-rewards",
+            &state.domain,
+            0,
+            std::iter::empty(),
+        );
+        let expected = domain_hash(
+            "SilkNode-F0-state",
+            &[
+                &state.domain,
+                &state.root(),
+                &state.leaves().to_le_bytes(),
+                &nf,
+                &ef,
+                &state.pool.to_le_bytes(),
+                &state.burned.to_le_bytes(),
+                &rh,
+                &pr,
+                &state.issued.to_le_bytes(),
+            ],
+        );
+        assert_eq!(state.hash_state(), expected);
+        for i in 0..132_u16 {
+            assert_eq!(
+                state.contains_nullifier(&set_key(i)),
+                nullifiers.contains(&set_key(i))
+            );
+            assert_eq!(
+                state.contains_effect(&set_key(i)),
+                effects.contains(&set_key(i))
+            );
+        }
+    }
+
+    #[test]
+    fn paged_ledger_set_forward_and_rollback_delta_bytes_match_btree() {
+        let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
+        let mut prior = BranchState::genesis(&genesis).unwrap();
+        let mut old_nf = BTreeSet::new();
+        let mut old_ef = BTreeSet::new();
+        for i in 0..128_u16 {
+            prior.nullifiers.insert(set_key(i * 2)).unwrap();
+            old_nf.insert(set_key(i * 2));
+            if i < 64 {
+                prior.effects.insert(set_key(i * 2)).unwrap();
+                old_ef.insert(set_key(i * 2));
+            }
+        }
+        prior.state_digest = prior.hash_state();
+        let before = prior.manifest();
+        let mut next = prior.clone();
+        let mut new_nf = old_nf.clone();
+        let mut new_ef = old_ef.clone();
+        for i in [1, 31, 127, 255, 257] {
+            next.nullifiers.insert(set_key(i)).unwrap();
+            new_nf.insert(set_key(i));
+            next.effects.insert(set_key(i)).unwrap();
+            new_ef.insert(set_key(i));
+        }
+        for label in 1..=8_u8 {
+            next.executed.push(VertexId::from_bytes([label; 32]));
+            next.rewards.push([label; 112]);
+        }
+        next.checkpoint_id = [9; 32];
+        next.state_digest = next.hash_state();
+        let outcomes = [EffectOutcome::Accepted, EffectOutcome::Conflict];
+        let mut literal = Vec::from(b"SNF04DL1\0\0\0\0\0\0\0\0".as_slice());
+        literal.extend_from_slice(&prior.checkpoint_id);
+        literal.extend_from_slice(&next.checkpoint_id);
+        literal.extend_from_slice(&2_u32.to_le_bytes());
+        literal.extend_from_slice(&[0, 3]);
+        for (current, old) in [(&new_nf, &old_nf), (&new_ef, &old_ef)] {
+            let added = current.difference(old).collect::<Vec<_>>();
+            literal.extend_from_slice(&u32::try_from(added.len()).unwrap().to_le_bytes());
+            for key in added {
+                literal.extend_from_slice(key);
+            }
+        }
+        literal.extend_from_slice(&0_u32.to_le_bytes()); // no new recovery rows
+        for row in &next.rewards {
+            literal.extend_from_slice(row);
+        }
+        assert_eq!(next.delta(&prior, &outcomes, false).unwrap(), literal);
+        let mut rollback = Vec::from(b"SNF04DL1\x01\0\0\0\0\0\0\0".as_slice());
+        rollback.extend_from_slice(&next.checkpoint_id);
+        rollback.extend_from_slice(&prior.checkpoint_id);
+        rollback.extend_from_slice(&0_u32.to_le_bytes());
+        for state in [&next, &prior] {
+            let manifest = state.manifest();
+            rollback.extend_from_slice(&u32::try_from(manifest.len()).unwrap().to_le_bytes());
+            rollback.extend_from_slice(&manifest);
+        }
+        assert_eq!(prior.delta(&next, &[], true).unwrap(), rollback);
+        assert_eq!(prior.manifest(), before);
+        let restored = prior.clone();
+        assert_eq!(restored.manifest(), before);
+        assert_eq!(restored.hash_state(), prior.hash_state());
+        assert!(!restored.contains_nullifier(&set_key(31)));
+        assert!(!restored.contains_effect(&set_key(31)));
+    }
+
     #[test]
     fn exact_cut_eligibility_boundaries() {
         for j in [1, 127, 128, 129, 256, 384] {
