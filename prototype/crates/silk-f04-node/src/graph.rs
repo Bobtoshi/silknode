@@ -231,6 +231,29 @@ impl Graph {
             .map(|i| self.vertices[*i].as_ref())
             .ok_or(Error::Unavailable("missing admitted vertex"))
     }
+    /// Internal reducer dependency read. A durable node must still possess the
+    /// exact original source, even while its verified body remains resident.
+    /// Default standalone graphs retain their existing borrowed resident API.
+    pub(crate) fn get_for_execution(
+        &self,
+        id: VertexId,
+        budget: &JobBudget,
+    ) -> Result<&VerifiedVertex> {
+        budget.check()?;
+        let vertex = self.get(id)?;
+        if let Some(reader) = &self.ancestry_reader {
+            let source = vertex
+                .retained_source
+                .as_ref()
+                .ok_or(Error::Unavailable("verified durable source binding absent"))?;
+            budget.source()?;
+            // The live binding was established from the complete exact record.
+            // No saved page/flag or decoded peer record constructs a capability.
+            reader.objects().object(source.id, source.record_len)?;
+            budget.check()?;
+        }
+        Ok(vertex)
+    }
     pub(crate) fn order(&self, budget: &JobBudget) -> Result<Sg0OrderSnapshotV1> {
         Ok(derive_virtual_order_chain_fast_v1(&View {
             graph: self,
@@ -654,6 +677,40 @@ mod tests {
         assert!(graph.export_retained_range(0, 3).is_err());
         std::fs::remove_file(&held).unwrap();
         assert_eq!(graph.export_retained_range(0, 3).unwrap(), expected);
+    }
+    #[test]
+    fn disk_execution_resident_body_never_substitutes_missing_durable_source() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let graph = source_graph(&mut store, &budget);
+        assert_eq!(
+            graph
+                .get_for_execution(id(3), &budget)
+                .unwrap()
+                .candidate()
+                .id,
+            id(3).into_bytes()
+        );
+        let source = graph
+            .vertices
+            .last()
+            .unwrap()
+            .retained_source
+            .as_ref()
+            .unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(source.id)));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(graph.get_for_execution(id(3), &budget).is_err());
+        assert!(graph.get(id(3)).is_ok());
+        assert_eq!(graph.len(), 3);
+        std::fs::rename(&held, &path).unwrap();
+        assert!(graph.get_for_execution(id(3), &budget).is_ok());
+        let resident = diamond(&budget);
+        assert!(resident.get_for_execution(id(4), &budget).is_ok());
     }
     fn disk_diamond(store: &mut crate::store::Store, budget: &JobBudget) -> Graph {
         let mut graph = Graph::default();

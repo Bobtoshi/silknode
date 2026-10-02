@@ -272,7 +272,7 @@ impl Core {
             .ok_or(Error::Unavailable("incomplete replay interval"))?;
         let verified = batch
             .iter()
-            .map(|id| self.graph.get(*id))
+            .map(|id| self.graph.get_for_execution(*id, budget))
             .collect::<Result<Vec<_>>>()?;
         let t = self.state.execute(
             verified

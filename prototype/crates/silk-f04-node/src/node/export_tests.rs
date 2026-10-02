@@ -72,3 +72,99 @@ fn disk_source_native_fresh_replay_exports_exact_originals_and_missing_last_refu
         "retained_vertices=8; full_replay=true; original_export_bytes=true; missing_last_refuses_whole_range=true; resident_fallback=false; source_bytes_unchanged=true; mined=0"
     );
 }
+
+#[test]
+#[ignore = "requires isolated COPY of a genuine eight-vertex corpus and canonical parameters"]
+fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_without_publication() {
+    assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
+    let root = PathBuf::from(std::env::var_os("SILK_F04_SOURCE_NATIVE_STORE").unwrap());
+    let margin = PathBuf::from(std::env::var_os("SILK_F04_HOST_MARGIN").unwrap());
+    let parameter_dir = PathBuf::from(std::env::var_os("SILK_F04_PARAMETER_DIR").unwrap());
+    let pin: Digest = hex::decode(std::env::var("SILK_F04_ANCESTRY_NATIVE_PIN").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let original: BTreeMap<_, _> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_owned(),
+                raw_hash(&fs::read(path).unwrap()),
+            )
+        })
+        .collect();
+    let parameters = SaplingParameters::load(
+        &parameter_dir.join("sapling-spend.params"),
+        &parameter_dir.join("sapling-output.params"),
+    )
+    .unwrap();
+    let mut node = Node::open_retained_pinned(
+        &root,
+        &margin,
+        crate::genesis::public_testnet_v1::genesis().unwrap(),
+        &parameters,
+        pin,
+    )
+    .unwrap();
+    assert_eq!(node.core.graph.len(), 8);
+    let completed = node.core.state.clone();
+    let ids = node.core.order.eligible_order().to_vec();
+    // Scratch reconstruction exercises the real reducers over genuine records;
+    // it is not a new live transition, native reorg, mined history or cap evidence.
+    node.core.state = Arc::new(BranchState::genesis(&node.core.genesis).unwrap());
+    node.core.status = Status::NeedsReconcile;
+    let scratch_digest = node.core.state.digest();
+    let step = node
+        .core
+        .prepare_step(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    assert_eq!(step.state.digest(), completed.digest());
+    assert_eq!(step.state.checkpoint_id(), completed.checkpoint_id());
+    let parent = crate::parent::replay_source_for_test(
+        &node.core.graph,
+        &node.core.genesis,
+        &ids,
+        &JobBudget::checkpoint().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parent.digest(), completed.digest());
+    assert_eq!(parent.checkpoint_id(), completed.checkpoint_id());
+    let record = node
+        .core
+        .graph
+        .vertices()
+        .last()
+        .unwrap()
+        .retained_record()
+        .unwrap();
+    let path = root.join(format!("{}.obj", hex::encode(raw_hash(&record))));
+    let held = path.with_extension("held");
+    fs::rename(&path, &held).unwrap();
+    assert!(
+        node.core
+            .prepare_step(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(
+        crate::parent::replay_source_for_test(
+            &node.core.graph,
+            &node.core.genesis,
+            &ids,
+            &JobBudget::checkpoint().unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(node.core.state.digest(), scratch_digest);
+    assert_eq!(node.core.graph.len(), 8);
+    assert_eq!(node.local_head().unwrap(), pin);
+    assert_eq!(node.core.status, Status::NeedsReconcile);
+    fs::rename(&held, &path).unwrap();
+    drop(node);
+    for (name, hash) in original {
+        assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
+    }
+    println!(
+        "retained_vertices=8; full_replay=true; checkpoint_and_parent_scratch_exact=true; missing_source_refuses_both=true; resident_fallback=false; no_publication=true; native_reorg=false; source_bytes_unchanged=true; mined=0"
+    );
+}

@@ -293,7 +293,7 @@ impl PrefixCache {
             let start = state.executed_len();
             let batch = ids[start..start + 8]
                 .iter()
-                .map(|id| graph.get(*id))
+                .map(|id| graph.get_for_execution(*id, budget))
                 .collect::<Result<Vec<_>>>()?;
             state = Arc::new(
                 state
@@ -310,6 +310,26 @@ impl PrefixCache {
         }
         Ok(state)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn replay_source_for_test(
+    graph: &Graph,
+    genesis: &Genesis,
+    ids: &[VertexId],
+    budget: &JobBudget,
+) -> Result<Arc<BranchState>> {
+    let mut cache = PrefixCache::new(genesis)?;
+    let mut js = vec![cache.genesis.eligible_commitment()];
+    for (i, id) in ids.iter().enumerate() {
+        js.push(fold_j(
+            &genesis.domain(),
+            js[i],
+            i as u64 + 1,
+            id.into_bytes(),
+        ));
+    }
+    cache.reconstruct(graph, ids, &js, budget)
 }
 
 fn mtp(graph: &Graph, e: &[VertexId], i: usize) -> Result<u64> {
