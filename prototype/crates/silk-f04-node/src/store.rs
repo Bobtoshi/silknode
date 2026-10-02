@@ -7,12 +7,57 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const MAX_OBJECT: usize = 8 * 1024 * 1024;
 const MAX_GROUP: u64 = 16 * 1024 * 1024;
 const PAUSE_BYTES: u64 = 14 * 1024 * 1024 * 1024;
 const MARGIN: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Read-only descriptor anchored to this owned directory, not a received path.
+/// An object hash checks bytes, never graph/crypto/economic validity.
+pub struct ObjectReader {
+    directory: File,
+    owner: u32,
+}
+impl ObjectReader {
+    pub(crate) fn object(&self, id: Digest, limit: usize) -> Result<Vec<u8>> {
+        if limit > MAX_OBJECT {
+            return Err(Error::Unavailable("owned object reader limit"));
+        }
+        let name = format!("{}.obj", hex::encode(id));
+        let file: File = rustix::fs::openat(
+            &self.directory,
+            name.as_str(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?
+        .into();
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != self.owner
+            || meta.len()
+                > u64::try_from(limit).map_err(|_| Error::Unavailable("object read limit"))?
+        {
+            return Err(Error::Unavailable("owned object reader type/length"));
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(meta.len()).map_err(|_| Error::Unavailable("object read length"))?,
+        );
+        file.take(u64::try_from(limit).map_err(|_| Error::Unavailable("object read limit"))? + 1)
+            .read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).ok() != Some(meta.len()) || raw_hash(&bytes) != id {
+            return Err(Error::Unavailable("owned object reader content"));
+        }
+        Ok(bytes)
+    }
+}
 
 /// Only a definite capacity refusal before any attempt write is resumable.
 /// Existing attempts, read uncertainty and every write-stage failure stay STOPs.
@@ -190,6 +235,54 @@ impl Store {
             return Err(Error::Unavailable("content object hash"));
         }
         Ok(b)
+    }
+    pub(crate) fn object_reader(&self) -> Result<Arc<ObjectReader>> {
+        Ok(Arc::new(ObjectReader {
+            directory: self.directory.try_clone()?,
+            owner: self.directory.metadata()?.uid(),
+        }))
+    }
+    /// Receiver-derived ancestry leaf ONLY during a fenced admission/replay.
+    /// No head, state, consensus record or validity constructor is installed.
+    pub(crate) fn retain_ancestry_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        if bytes.len() != 112
+            || &bytes[..8] != b"SNF04AP1"
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "ancestry page requires active verified transition",
+            ));
+        }
+        let was_poisoned = self.poisoned;
+        // Only the already-fenced cold replay may traverse a quarantined HEAD.
+        if was_poisoned && self.active_replay()?.is_none() {
+            return Err(Error::Unavailable("ancestry page writer stopped"));
+        }
+        self.poisoned = false;
+        let charged = charge(bytes.len() as u64) + 2 * 4096;
+        let reserved = self.reserve(charged);
+        self.poisoned = was_poisoned;
+        reserved?;
+        self.used += charged;
+        self.poisoned = true;
+        let retained = (|| {
+            let id = self.put(bytes)?;
+            self.directory.sync_all()?;
+            if fs2::available_space(&self.margin)? < MARGIN {
+                return Err(Error::Paused("post-ancestry-page host margin"));
+            }
+            Ok(id)
+        })();
+        match retained {
+            Ok(id) => {
+                self.poisoned = was_poisoned;
+                Ok(id)
+            }
+            // Never classify a failed new auxiliary write as old HEAD damage.
+            Err(_) => Err(Error::Unavailable(
+                "retained ancestry page publication failed",
+            )),
+        }
     }
     /// Retain a bounded traversal page ONLY inside an already fenced cold replay.
     /// No HEAD/PREVIOUS pointer is changed and no saved page conveys validity.
@@ -472,6 +565,18 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) fn ancestry_test_store() -> (tempfile::TempDir, Store) {
+    let temp = std::env::var_os("SILK_F04_ANCESTRY_TEST_PARENT").map_or_else(
+        || tempfile::tempdir().unwrap(),
+        |path| tempfile::tempdir_in(path).unwrap(),
+    );
+    let margin = std::env::var_os("SILK_F04_HOST_MARGIN")
+        .map_or_else(|| temp.path().to_path_buf(), PathBuf::from);
+    let store = Store::create(&temp.path().join("store"), &margin).unwrap();
+    (temp, store)
+}
 fn charge(bytes: u64) -> u64 {
     bytes.saturating_add(4095) / 4096 * 4096 + 4096
 }
@@ -479,6 +584,80 @@ fn charge(bytes: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disk_ancestry_owned_reader_bounds_types_hashes_and_directory_anchor() {
+        use std::os::unix::fs::symlink;
+        let (temp, mut store) = ancestry_test_store();
+        let value = b"locally retained bytes, not validity";
+        store.commit(&[value], b"synthetic head").unwrap();
+        let id = raw_hash(value);
+        let name = format!("{}.obj", hex::encode(id));
+        let path = temp.path().join("store").join(&name);
+        let reader = store.object_reader().unwrap();
+        assert_eq!(reader.object(id, 64).unwrap(), value);
+        assert!(reader.object(id, 1).is_err());
+        assert!(reader.object(id, usize::MAX).is_err());
+        let link = temp.path().join("extra-link");
+        fs::hard_link(&path, &link).unwrap();
+        assert!(reader.object(id, 64).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::write(&path, b"changed bytes").unwrap();
+        assert!(reader.object(id, 64).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(reader.object(id, 64).is_err());
+        let target = temp.path().join("untrusted-target");
+        fs::write(&target, value).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(reader.object(id, 64).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, value).unwrap();
+        fs::rename(temp.path().join("store"), temp.path().join("original")).unwrap();
+        fs::create_dir(temp.path().join("store")).unwrap();
+        fs::write(
+            temp.path().join("store").join(name),
+            b"replacement directory",
+        )
+        .unwrap();
+        assert_eq!(reader.object(id, 64).unwrap(), value);
+    }
+    #[test]
+    fn disk_ancestry_writer_requires_fence_and_auxiliary_damage_is_stop() {
+        let (temp, mut store) = ancestry_test_store();
+        store.commit(&[], b"prior synthetic head").unwrap();
+        let head = store.commit(&[], b"current synthetic head").unwrap();
+        let previous = fs::read(temp.path().join("store/PREVIOUS")).unwrap();
+        let mut page = [0; 112];
+        page[..8].copy_from_slice(b"SNF04AP1");
+        let used = store.accounted_bytes();
+        assert!(store.retain_ancestry_page(&page).is_err());
+        assert_eq!(store.accounted_bytes(), used);
+        store
+            .begin_job(b"synthetic freshly verified transition")
+            .unwrap();
+        assert!(store.retain_ancestry_page(&page[..111]).is_err());
+        let id = store.retain_ancestry_page(&page).unwrap();
+        assert_eq!(store.head(), Some(head));
+        assert!(store.accounted_bytes() > used);
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(id)));
+        page[48] ^= 1;
+        fs::write(path, page).unwrap();
+        page[48] ^= 1;
+        let error = store.retain_ancestry_page(&page).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Unavailable("retained ancestry page publication failed")
+        ));
+        assert!(!crate::node::storage_integrity_failure(&error));
+        assert!(store.commit(&[], b"must not publish").is_err());
+        assert_eq!(store.head(), Some(head));
+        assert_eq!(
+            fs::read(temp.path().join("store/PREVIOUS")).unwrap(),
+            previous
+        );
+    }
     #[test]
     fn pinned_open_refuses_changed_head_or_missing_lock_without_adoption() {
         let dir = tempfile::tempdir().unwrap();

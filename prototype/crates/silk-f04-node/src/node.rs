@@ -1,5 +1,7 @@
 //! Explicit F0.4 durable node API. No legacy default, network listener or wallet secret.
 //! Full-range synchronization uses the same live receiver as direct ingress.
+#[cfg(test)]
+mod ancestry_tests;
 mod replay;
 use crate::{
     Digest, Error, Result,
@@ -64,8 +66,10 @@ impl Node {
     pub fn create(root: &Path, margin: &Path, genesis: Genesis) -> Result<Self> {
         let mut clock = LocalClock::default();
         clock.observe(system_wall()?)?;
-        let core = Core::new(Arc::new(genesis), clock)?;
+        let mut core = Core::new(Arc::new(genesis), clock)?;
         let store = Store::create(root, margin)?;
+        core.graph
+            .attach_ancestry_reader(store.object_reader()?, core.genesis.domain())?;
         let mut node = Self {
             core,
             store,
@@ -259,6 +263,8 @@ impl Node {
         // unchanged; at most one fixed-size page is resident during traversal.
         let mut records = replay::ReplayPagesV1::build(store, head, genesis.domain())?;
         let mut core = Core::new(genesis, LocalClock::default())?;
+        core.graph
+            .attach_ancestry_reader(store.object_reader()?, core.genesis.domain())?;
         let mut previous = [0; 32];
         let mut last_sequence = 0;
         let mut index = 0_u64;
@@ -296,10 +302,11 @@ impl Node {
                     {
                         return Err(Error::Unavailable("retained vertex framing"));
                     }
-                    let a = core.prepare(&data[12..12 + len], parameters, true, budget)?;
+                    let mut a = core.prepare(&data[12..12 + len], parameters, true, budget)?;
                     if a.vertex.vertex().retained_record()? != data {
                         return Err(Error::Unavailable("retained source/SG0 metadata mismatch"));
                     }
+                    a.vertex.retain_ancestry(&core.graph, store, &a.budget)?;
                     core.publish(a)?
                 }
                 2 | 3 if index > 0 => {
@@ -531,7 +538,7 @@ impl Node {
         }
         Err(error)
     }
-    fn publish_admission(&mut self, a: Admission) -> Result<JobBudget> {
+    fn publish_admission(&mut self, mut a: Admission) -> Result<JobBudget> {
         a.budget.check()?;
         let data = a.vertex.vertex().retained_record()?;
         let order = order_bytes(&a.order);
@@ -543,6 +550,13 @@ impl Node {
             self.core.graph.len() as u64 + 1,
             a.status,
         )?;
+        if let Err(error) = a
+            .vertex
+            .retain_ancestry(&self.core.graph, &mut self.store, &a.budget)
+        {
+            self.faulted = true;
+            return Err(error);
+        }
         match self.core.publish(a) {
             Ok(budget) => Ok(budget),
             Err(e) => {
@@ -810,7 +824,7 @@ fn marker_terminal_shape(marker: &[u8], terminal: &Record) -> Result<bool> {
     }
 }
 
-fn storage_integrity_failure(e: &Error) -> bool {
+pub(crate) fn storage_integrity_failure(e: &Error) -> bool {
     match e {
         Error::Unavailable(
             "no complete local head"

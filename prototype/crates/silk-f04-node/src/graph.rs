@@ -6,7 +6,7 @@ use crate::{
     carriage::{Candidate, ParentFacts, WorkEngine},
     genesis::Genesis,
 };
-use ancestry::PagedAncestry;
+use ancestry::{PagedAncestry, RetainedContext};
 use silk_order::sg0_v1::{
     ReceiverVerifiedSg0Graph, Sg0Error, Sg0OrderSnapshotV1, Sg0ParentSetV1, Sg0VertexDataV1,
     budgeted::{derive_append_vertex_data_v1, derive_virtual_order_chain_fast_v1},
@@ -70,6 +70,7 @@ impl VerifiedVertex {
 pub struct Graph {
     vertices: Vec<Arc<VerifiedVertex>>,
     index: BTreeMap<VertexId, usize>,
+    ancestry_reader: Option<Arc<RetainedContext>>,
 }
 
 /// Prepared atomic graph insertion, not visible until durable publication succeeds.
@@ -80,6 +81,22 @@ pub(crate) struct PreparedVertex {
 impl PreparedVertex {
     pub fn vertex(&self) -> &VerifiedVertex {
         &self.vertex
+    }
+    pub(crate) fn retain_ancestry(
+        &mut self,
+        graph: &Graph,
+        store: &mut crate::store::Store,
+        budget: &JobBudget,
+    ) -> Result<()> {
+        let reader = graph
+            .ancestry_reader
+            .as_ref()
+            .ok_or(Error::Unavailable("durable graph ancestry reader absent"))?
+            .clone();
+        Arc::get_mut(&mut self.vertex)
+            .ok_or(Error::Unavailable("shared prepared ancestry publication"))?
+            .ancestors
+            .retain(store, reader, budget)
     }
 }
 
@@ -114,6 +131,26 @@ impl CryptoCache {
 }
 
 impl Graph {
+    #[cfg(test)]
+    pub(crate) fn retained_ancestry_pages(&self) -> usize {
+        self.vertices
+            .iter()
+            .map(|v| v.ancestors.retained_ids().len())
+            .sum()
+    }
+    pub(crate) fn attach_ancestry_reader(
+        &mut self,
+        reader: Arc<crate::store::ObjectReader>,
+        domain: Digest,
+    ) -> Result<()> {
+        if !self.is_empty() || self.ancestry_reader.is_some() {
+            return Err(Error::Unavailable(
+                "ancestry reader must precede fresh replay",
+            ));
+        }
+        self.ancestry_reader = Some(RetainedContext::new(reader, domain));
+        Ok(())
+    }
     /// Number of fully admitted records, including red evidence.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -182,7 +219,7 @@ impl Graph {
                 .get(p)
                 .ok_or(Error::Unavailable("candidate parent dependency"))?;
             let v = &self.vertices[i];
-            bits.union(&v.ancestors);
+            bits.union(&v.ancestors)?;
             bits.insert(i)?;
         }
         if let [a, b] = parents.ordinary_parents()
@@ -374,7 +411,7 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
         id: VertexId,
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
     ) -> std::result::Result<(), Sg0Error> {
-        let bits = &self.lookup(id)?.ancestors;
+        let bits = self.lookup(id)?.ancestors.materialize()?;
         for (i, v) in self.graph.vertices.iter().enumerate() {
             self.budget.graph_read()?;
             if bits.contains(i)? {
@@ -461,6 +498,105 @@ mod tests {
             graph.publish(prepared).unwrap();
         }
         graph
+    }
+    fn disk_diamond(store: &mut crate::store::Store, budget: &JobBudget) -> Graph {
+        let mut graph = Graph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        for (label, parents) in [(1, &[][..]), (2, &[1][..]), (3, &[1][..]), (4, &[2, 3][..])] {
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, parents), budget)
+                .unwrap();
+            prepared.retain_ancestry(&graph, store, budget).unwrap();
+            graph.publish(prepared).unwrap();
+        }
+        graph
+    }
+    #[test]
+    fn disk_ancestry_graph_order_parent_views_and_replay_rederive_exact_records() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let head = store.commit(&[], b"synthetic original source").unwrap();
+        let fence = store
+            .begin_replay(b"synthetic full source rederivation")
+            .unwrap();
+        let flat = diamond(&budget);
+        let graph = disk_diamond(&mut store, &budget);
+        assert_eq!(graph.order(&budget).unwrap(), flat.order(&budget).unwrap());
+        let parents = Sg0ParentSetV1::vertices(vec![id(2), id(3)]).unwrap();
+        assert_eq!(
+            graph.parent_order(&parents, &budget).unwrap(),
+            flat.parent_order(&parents, &budget).unwrap()
+        );
+        assert_eq!(
+            graph
+                .vertices()
+                .map(|v| v.retained_record().unwrap())
+                .collect::<Vec<_>>(),
+            flat.vertices()
+                .map(|v| v.retained_record().unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(graph.get(id(4)).unwrap().ancestors.retained_ids().len(), 1);
+        store.finish_replay(fence).unwrap();
+        drop(graph);
+        drop(store);
+        let margin = std::env::var_os("SILK_F04_HOST_MARGIN")
+            .map_or_else(|| temp.path().to_path_buf(), std::path::PathBuf::from);
+        let mut reopened = crate::store::Store::open(&temp.path().join("store"), &margin).unwrap();
+        let fence = reopened
+            .begin_replay(b"new synthetic source rederivation")
+            .unwrap();
+        let fresh = disk_diamond(&mut reopened, &budget);
+        assert_eq!(fresh.order(&budget).unwrap(), flat.order(&budget).unwrap());
+        assert_eq!(reopened.head(), Some(head));
+        reopened.finish_replay(fence).unwrap();
+    }
+    #[test]
+    fn disk_ancestry_graph_missing_past_refuses_without_false_or_head_fallback() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let head = store.commit(&[], b"synthetic complete source").unwrap();
+        store
+            .begin_job(b"synthetic already-verified graph")
+            .unwrap();
+        let graph = disk_diamond(&mut store, &budget);
+        let page = graph.get(id(3)).unwrap().ancestors.retained_ids()[0];
+        std::fs::remove_file(
+            temp.path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(page))),
+        )
+        .unwrap();
+        let error = graph.is_ancestor(id(1), id(3)).unwrap_err();
+        assert!(matches!(error, Error::Order(Sg0Error::Invariant)));
+        assert!(!crate::node::storage_integrity_failure(&error));
+        let view = View {
+            graph: &graph,
+            added: None,
+            members: None,
+            budget: &budget,
+        };
+        assert_eq!(
+            view.receiver_verified_is_ancestor(id(1), id(3)),
+            Err(Sg0Error::Invariant)
+        );
+        let mut visited = Vec::new();
+        assert_eq!(
+            view.visit_strict_past_ids(id(3), &mut |id| {
+                visited.push(id);
+                Ok(())
+            }),
+            Err(Sg0Error::Invariant)
+        );
+        assert!(visited.is_empty());
+        assert!(
+            graph
+                .parent_order(&Sg0ParentSetV1::vertices(vec![id(3)]).unwrap(), &budget)
+                .is_err()
+        );
+        assert_eq!(store.head(), Some(head));
     }
 
     #[test]
