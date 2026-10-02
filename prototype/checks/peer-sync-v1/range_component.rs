@@ -202,14 +202,79 @@ mod sync {
 }
 
 #[cfg(test)]
+mod carriage_preflight {
+    use silk_f04_node::{Error, carriage::Body};
+    use silk_sapling_f04::codec::{ENVELOPE_BYTES, Envelope};
+
+    pub fn framed_body(domain: &[u8; 32], count: usize) -> Vec<u8> {
+        let mut envelope = [0; ENVELOPE_BYTES];
+        envelope[..8].copy_from_slice(b"SNPRV003");
+        envelope[8] = 3;
+        envelope[12..44].copy_from_slice(domain);
+        envelope[84] = 2;
+        envelope[277] = 2;
+        envelope[213] = 1;
+        envelope[1790..1798].copy_from_slice(&1_i64.to_le_bytes());
+        let mut body = vec![0; 20];
+        body[..8].copy_from_slice(b"SLKDGBF0");
+        body[9] = 3;
+        body[12] = count as u8;
+        body[16..20].copy_from_slice(&((count * ENVELOPE_BYTES) as u32).to_be_bytes());
+        for _ in 0..count {
+            body.extend_from_slice(&envelope);
+        }
+        body
+    }
+
+    #[test]
+    fn carriage_preflight_checks_each_inner_frame_without_granting_proof_validity() {
+        let domain = [7; 32];
+        let body = framed_body(&domain, 32);
+        assert_eq!(Body::decode(&body, &domain).unwrap().bytes(), body);
+        // Every slot is inspected, including the final committed representation.
+        for index in 0..32 {
+            let mut changed = body.clone();
+            changed[20 + index * ENVELOPE_BYTES + 12] ^= 1;
+            assert!(matches!(
+                Body::decode(&changed, &domain),
+                Err(Error::Sapling(silk_sapling_f04::Error::Encoding(_)))
+            ));
+        }
+        for index in [0, 31] {
+            for offset in [0, 8, 9, 84, 277, 1790, 1797, 213] {
+                let mut changed = body.clone();
+                changed[20 + index * ENVELOPE_BYTES + offset] ^= 1;
+                assert!(Body::decode(&changed, &domain).is_err());
+            }
+        }
+        let mut unverified = body.clone();
+        unverified[20 + 1830] ^= 1; // A proof byte is NOT a framing/validity check.
+        assert_eq!(
+            Body::decode(&unverified, &domain).unwrap().bytes(),
+            unverified
+        );
+        let envelope = Envelope::decode(&body[20..20 + ENVELOPE_BYTES], &domain).unwrap();
+        assert!(Body::new(&[99; 32], &[envelope]).is_err());
+        assert_eq!(
+            Body::decode(&framed_body(&domain, 0), &domain)
+                .unwrap()
+                .representations()
+                .len(),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
 mod storage {
     use silk_f04_node::{
         Error,
-        carriage::Body,
+        carriage::{Body, Candidate},
         genesis::public_testnet_v1,
         node::{Node, NodeStatus},
         sync::RangeBatchV1,
     };
+    use silk_sapling_f04::codec::{ENVELOPE_BYTES, carriage_hash};
     use std::{
         collections::BTreeMap,
         fs,
@@ -252,6 +317,80 @@ mod storage {
                 (entry.file_name(), fs::read(entry.path()).unwrap())
             })
             .collect()
+    }
+
+    // Rebind a raw synthetic body without using Body's decoder. The outer header
+    // commitments are valid, but neither the claimed work nor proofs are verified.
+    fn bound_carrier(base: &Candidate, domain: &[u8; 32], body: &[u8]) -> Vec<u8> {
+        let count = [body[12]];
+        let mut proof_parts: Vec<&[u8]> = vec![domain, &count];
+        let mut recovery_parts: Vec<&[u8]> = vec![domain, &count];
+        for envelope in body[20..].chunks_exact(ENVELOPE_BYTES) {
+            proof_parts.push(&envelope[1830..]);
+            recovery_parts.push(&envelope[278..1790]);
+        }
+        let id = carriage_hash("SilkNode/F0-BodyId/v1", &[domain, body]);
+        let proof = carriage_hash("SilkNode/F0-ProofSet/v1", &proof_parts);
+        let recovery = carriage_hash("SilkNode/F0-Recovery/v1", &recovery_parts);
+        let digest = carriage_hash(
+            "SilkNode/F0-BodyDigest/v1",
+            &[domain, &id, &proof, &recovery],
+        );
+        let binding = carriage_hash(
+            "SilkNode/F0-BodyBinding/v1",
+            &[
+                domain,
+                &id,
+                &digest,
+                &proof,
+                &recovery,
+                &base.header.owner,
+                &base.header.reward_nonce,
+            ],
+        );
+        let mut bytes = base.encode();
+        bytes[48..52].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        for (index, commitment) in [id, digest, proof, recovery, binding].iter().enumerate() {
+            bytes[56 + 176 + index * 32..56 + 208 + index * 32].copy_from_slice(commitment);
+        }
+        bytes.truncate(648);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&base.proof);
+        bytes
+    }
+
+    #[test]
+    fn carriage_preflight_bad_bound_envelopes_preserve_idle_ready_store() {
+        let (mut node, root, _margin) = fixture();
+        let genesis = node.genesis();
+        let domain = genesis.domain();
+        let base = Candidate::decode(&candidate(), genesis).unwrap();
+        let body = super::carriage_preflight::framed_body(&domain, 32);
+        let bytes = bound_carrier(&base, &domain, &body);
+        assert_eq!(Candidate::decode(&bytes, genesis).unwrap().encode(), bytes);
+        let store = root.join("node");
+        let before = inventory(&store);
+        let head = node.local_head().unwrap();
+        let accounted = node.accounted_bytes();
+        let digest = node.state().unwrap().digest();
+        let capacity = node.history_capacity().unwrap();
+        for offset in [12, 0, 1790, 213] {
+            let mut changed = body.clone();
+            changed[20 + 31 * ENVELOPE_BYTES + offset] ^= 1;
+            let carrier = bound_carrier(&base, &domain, &changed);
+            assert!(matches!(
+                node.begin_ingest(&carrier),
+                Err(Error::Sapling(silk_sapling_f04::Error::Encoding(_)))
+            ));
+            assert_eq!(node.status().unwrap(), NodeStatus::Ready);
+            assert_eq!(node.local_head().unwrap(), head); // Also checks healthy+idle.
+            assert_eq!(node.state().unwrap().digest(), digest);
+            assert_eq!(node.vertex_count(), 0);
+            assert_eq!(node.accounted_bytes(), accounted);
+            assert_eq!(node.history_capacity().unwrap(), capacity);
+            assert_eq!(inventory(&store), before); // No ACTIVE_JOB or any store write.
+        }
+        node.flush_clock().unwrap(); // Remains usable without a cold reopen.
     }
 
     #[test]

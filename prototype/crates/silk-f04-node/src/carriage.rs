@@ -3,7 +3,7 @@ use crate::{Digest, Error, Result, budget::JobBudget, genesis::Genesis, wire::fi
 use silk_order::sg0_v1::Sg0ParentSetV1;
 use silk_pow::{Uint256, dag_randomx_v3::dag_target_for_work_v3, randomx_v2_work_key_id};
 use silk_randomx::RandomXV2Vm;
-use silk_sapling_f04::codec::{ENVELOPE_BYTES, Envelope, carriage_hash};
+use silk_sapling_f04::codec::{ENVELOPE_BYTES, Envelope, EnvelopeView, carriage_hash};
 use silk_types::VertexId;
 
 /// Maximum full canonical work-bearing vertex.
@@ -68,8 +68,9 @@ impl Body {
         }
         Self::decode(&bytes, domain)
     }
-    /// Pure framing before any work or elliptic-curve checks.
-    pub fn decode(bytes: &[u8], _domain: &Digest) -> Result<Self> {
+    /// Outer and every inner envelope frame/context before retaining body data,
+    /// durable admission attempts, work or elliptic-curve checks. Not proof validity.
+    pub fn decode(bytes: &[u8], domain: &Digest) -> Result<Self> {
         if bytes.len() < 20
             || bytes.len() > 89_300
             || &bytes[..8] != b"SLKDGBF0"
@@ -84,6 +85,9 @@ impl Body {
             || u32::from_be_bytes(field(bytes, 16)?) as usize != ENVELOPE_BYTES * n
         {
             return Err(Error::Invalid("body length"));
+        }
+        for envelope in bytes[20..].chunks_exact(ENVELOPE_BYTES) {
+            EnvelopeView::decode(envelope, domain)?;
         }
         let envelopes = bytes[20..]
             .chunks_exact(ENVELOPE_BYTES)
