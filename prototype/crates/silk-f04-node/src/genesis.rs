@@ -5,6 +5,7 @@
 use crate::{
     Digest, Error, Result,
     auth::{admit_role_key, verify_role_signature},
+    economics::{CREDIT_MATURITY_V1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1},
     wire::{field, prefixed_message, raw_hash, u32le, u64le},
 };
 use sapling_crypto::{CommitmentTree, Node};
@@ -21,8 +22,38 @@ pub mod public_testnet_v1;
 #[must_use]
 pub fn parameter_bytes() -> [u8; 656] {
     let values: [u64; 32] = [
-        2, 2, 10, 11, 32, 5, 15, 4, 2, 1, 1_000_000, 8, 10, 16, 128, 2, 4, 16, 4, 32, 128, 32, 8,
-        64, 32, 2790, 32, MAX_VALUE, 1, 0, 0, 0,
+        2,
+        2,
+        10,
+        11,
+        32,
+        5,
+        15,
+        4,
+        2,
+        1,
+        1_000_000,
+        8,
+        PUBLIC_CREDIT_V1,
+        CREDIT_MATURITY_V1,
+        128,
+        2,
+        4,
+        16,
+        4,
+        32,
+        128,
+        32,
+        8,
+        64,
+        32,
+        2790,
+        32,
+        MAX_VALUE,
+        PRIVATE_BURN_V1,
+        0,
+        0,
+        0,
     ];
     let mut b = [0; 656];
     b[..8].copy_from_slice(b"SNPARF01");

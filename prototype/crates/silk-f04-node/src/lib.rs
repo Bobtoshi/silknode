@@ -7,6 +7,7 @@ pub mod capacity;
 pub mod carriage;
 mod core;
 mod deadline;
+pub mod economics;
 pub mod genesis;
 pub mod graph;
 pub mod node;
@@ -20,6 +21,7 @@ pub mod sync;
 pub(crate) mod wire;
 
 pub use silk_sapling_f04::Digest;
+pub use silk_types::VertexId;
 
 /// Protocol rejection is distinct from local unavailable/resource/storage failures.
 #[derive(Debug, thiserror::Error)]

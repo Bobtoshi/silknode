@@ -1,5 +1,6 @@
 //! One checkpoint reducer shared by canonical execution and parent-prefix replay.
 //! A cut is a reversible prefix reference, never a finality certificate.
+use crate::economics::{CREDIT_MATURITY_V1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1};
 use crate::{Digest, Error, Result, genesis::Genesis, graph::VerifiedVertex, wire::raw_hash};
 use sapling_crypto::{CommitmentTree, Node};
 use sha2::{Digest as _, Sha256};
@@ -235,6 +236,7 @@ impl BranchState {
             ));
         }
         next.check_invariants()?;
+        budget.check()?;
         Ok(CheckpointTransition {
             state: next,
             outcomes,
@@ -265,7 +267,13 @@ impl BranchState {
         if self.effects.len() >= 50_000 {
             return Err(Error::Paused("accepted-effect reference horizon"));
         }
-        if self.pool == 0 || self.burned == u64::MAX || self.leaves() > (1_u64 << 32) - 2 {
+        let Some(next_pool) = self.pool.checked_sub(PRIVATE_BURN_V1) else {
+            return Ok(EffectOutcome::Bounds);
+        };
+        let Some(next_burned) = self.burned.checked_add(PRIVATE_BURN_V1) else {
+            return Ok(EffectOutcome::Bounds);
+        };
+        if self.leaves() > (1_u64 << 32) - 2 {
             return Ok(EffectOutcome::Bounds);
         }
         let entries = e.recovery();
@@ -291,8 +299,8 @@ impl BranchState {
         self.effects.insert(effect);
         self.recovery.extend(entries.into_iter().map(Arc::new));
         self.accepted_outputs.push(Arc::new(linkage));
-        self.pool -= 1;
-        self.burned += 1;
+        self.pool = next_pool;
+        self.burned = next_burned;
         Ok(EffectOutcome::Accepted)
     }
 
@@ -338,9 +346,9 @@ impl BranchState {
         r[8..40].copy_from_slice(&candidate.id);
         r[40..72].copy_from_slice(&h.owner);
         r[72..104].copy_from_slice(&h.reward_nonce);
-        r[104..].copy_from_slice(&10_u64.to_le_bytes());
+        r[104..].copy_from_slice(&PUBLIC_CREDIT_V1.to_le_bytes());
         self.rewards.push(r);
-        self.issued = u128::from(i) * 10;
+        self.issued = u128::from(i) * u128::from(PUBLIC_CREDIT_V1);
         Ok(())
     }
 
@@ -416,18 +424,17 @@ impl BranchState {
     }
 
     fn check_invariants(&self) -> Result<()> {
+        self.economic_ledger()
+            .validate(&self.domain, self.initial_pool)
+            .map_err(|_| Error::Unavailable("complete economic ledger invariants"))?;
         if self.nullifiers.len() != self.effects.len() * 2
             || self.accepted_outputs.len() != self.effects.len()
             || self
                 .accepted_outputs
                 .last()
                 .is_some_and(|row| row.first_position.checked_add(2) != Some(self.leaves()))
-            || self.burned != self.effects.len() as u64
             || self.leaves() != self.initial_leaves + 2 * self.burned
-            || self.pool.checked_add(self.burned) != Some(self.initial_pool)
             || self.tree.size() as u64 != self.leaves()
-            || self.rewards.len() != self.executed.len()
-            || self.issued != self.executed.len() as u128 * 10
         {
             return Err(Error::Unavailable("complete state invariants"));
         }
@@ -650,6 +657,20 @@ impl BranchState {
     pub fn root(&self) -> Digest {
         self.tree.root().to_bytes()
     }
+    /// Borrow current receiver-derived accounting without copying reward history.
+    /// This is not a consensus proof or a transferable credit balance.
+    #[must_use]
+    pub fn economic_ledger(&self) -> EconomicLedgerV1<'_> {
+        EconomicLedgerV1 {
+            domain: self.domain,
+            private_pool: self.pool,
+            private_burned: self.burned,
+            accepted_effects: self.effects.len() as u64,
+            public_issued: self.issued,
+            executed: &self.executed,
+            reward_records: &self.rewards,
+        }
+    }
     /// Issued/mature public nontransferable attribution credits.
     #[must_use]
     pub fn public_balance(&self, owner: &Digest) -> (u128, u128) {
@@ -657,10 +678,10 @@ impl BranchState {
         let mut mature = 0;
         for r in &self.rewards {
             if r[40..72] == *owner {
-                issued += 10;
+                issued += u128::from(PUBLIC_CREDIT_V1);
                 let i = u64::from_le_bytes(r[..8].try_into().expect("fixed reward"));
-                if u128::from(i) + 16 <= self.executed.len() as u128 {
-                    mature += 10;
+                if u128::from(i) + u128::from(CREDIT_MATURITY_V1) <= self.executed.len() as u128 {
+                    mature += u128::from(PUBLIC_CREDIT_V1);
                 }
             }
         }

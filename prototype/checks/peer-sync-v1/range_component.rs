@@ -1,5 +1,143 @@
 //! Third-party-style checks use the public compiled library, not private source.
 #[cfg(test)]
+mod economics {
+    use silk_f04_node::{
+        VertexId,
+        economics::{CREDIT_MATURITY_V1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1},
+        genesis::{parameter_bytes, public_testnet_v1},
+        state::BranchState,
+    };
+
+    fn synthetic_rows(count: u8) -> (Vec<VertexId>, Vec<[u8; 112]>) {
+        let executed = (1..=count).map(|i| VertexId::from_bytes([i; 32])).collect();
+        let mut rows = vec![[0_u8; 112]; usize::from(count)];
+        for (index, row) in rows.iter_mut().enumerate() {
+            row[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            row[8..40].copy_from_slice(&[index as u8 + 1; 32]);
+            row[104..].copy_from_slice(&10_u64.to_le_bytes());
+        }
+        (executed, rows)
+    }
+
+    #[test]
+    fn economic_ledger_genesis_and_committed_rules_preserve_existing_profile() {
+        // Construction checks the independently pinned complete bundle/domain.
+        let genesis = public_testnet_v1::genesis().unwrap();
+        let state = BranchState::genesis(&genesis).unwrap();
+        let ledger = state.economic_ledger();
+        ledger.validate(&genesis.domain(), genesis.total()).unwrap();
+        assert_eq!(
+            (
+                ledger.public_issued,
+                ledger.private_pool,
+                ledger.private_burned
+            ),
+            (0, 0, 0)
+        );
+        assert!(ledger.reward_records.is_empty());
+        assert_eq!(state.public_balance(&[7; 32]), (0, 0));
+        let parameters = parameter_bytes();
+        for (id, value, frozen) in [
+            (13, PUBLIC_CREDIT_V1, 10),
+            (14, CREDIT_MATURITY_V1, 16),
+            (29, PRIVATE_BURN_V1, 1),
+        ] {
+            let at = 16 + 16 * (id - 1) + 8;
+            assert_eq!(
+                u64::from_le_bytes(parameters[at..at + 8].try_into().unwrap()),
+                frozen
+            );
+            assert_eq!(value, frozen);
+        }
+    }
+
+    #[test]
+    fn economic_ledger_rejects_each_changed_reward_lineage_and_amount() {
+        let genesis = public_testnet_v1::genesis().unwrap();
+        let state = BranchState::genesis(&genesis).unwrap();
+        let mut ledger = state.economic_ledger();
+        let (executed, rows) = synthetic_rows(8);
+        ledger.executed = &executed;
+        ledger.public_issued = 80;
+        ledger.reward_records = &rows;
+        ledger.validate(&genesis.domain(), 0).unwrap();
+        for index in 0..rows.len() {
+            for offset in [0, 8, 104] {
+                let mut changed = rows.clone();
+                changed[index][offset] ^= 1;
+                let altered = EconomicLedgerV1 {
+                    reward_records: &changed,
+                    ..ledger
+                };
+                assert!(altered.validate(&genesis.domain(), 0).is_err());
+            }
+        }
+        let mut reordered = rows.clone();
+        reordered.swap(0, 1);
+        ledger.reward_records = &reordered;
+        assert!(ledger.validate(&genesis.domain(), 0).is_err());
+        ledger.reward_records = &rows[..7];
+        assert!(ledger.validate(&genesis.domain(), 0).is_err());
+    }
+
+    #[test]
+    fn economic_ledger_keeps_credit_issuance_separate_from_private_conservation() {
+        let genesis = public_testnet_v1::genesis().unwrap();
+        let state = BranchState::genesis(&genesis).unwrap();
+        let mut ledger = state.economic_ledger();
+        let (executed, rows) = synthetic_rows(8);
+        ledger.executed = &executed;
+        ledger.reward_records = &rows;
+        ledger.public_issued = 80;
+        ledger.private_pool = 97;
+        ledger.private_burned = 3;
+        ledger.accepted_effects = 3;
+        ledger.validate(&genesis.domain(), 100).unwrap();
+        assert!(ledger.validate(&[99; 32], 100).is_err());
+        assert!(ledger.validate(&genesis.domain(), 101).is_err());
+        ledger.public_issued = 81; // Credits cannot cover private supply loss.
+        assert!(ledger.validate(&genesis.domain(), 100).is_err());
+        ledger.public_issued = 80;
+        ledger.accepted_effects = 4; // Burn count must equal distinct effect count.
+        assert!(ledger.validate(&genesis.domain(), 100).is_err());
+        ledger.private_pool = u64::MAX;
+        ledger.private_burned = 1;
+        ledger.accepted_effects = 1;
+        assert!(ledger.validate(&genesis.domain(), 0).is_err());
+        ledger.private_pool = 0;
+        ledger.private_burned = 50_001;
+        ledger.accepted_effects = 50_001;
+        assert!(ledger.validate(&genesis.domain(), 50_001).is_err());
+        ledger.executed = &[];
+        ledger.reward_records = &[];
+        ledger.public_issued = 0;
+        ledger.private_burned = 1;
+        ledger.accepted_effects = 1;
+        assert!(ledger.validate(&genesis.domain(), 1).is_err());
+    }
+
+    #[test]
+    fn economic_ledger_reversible_prefix_recomputes_issuance_not_accumulated_mints() {
+        let genesis = public_testnet_v1::genesis().unwrap();
+        let state = BranchState::genesis(&genesis).unwrap();
+        let mut ledger = state.economic_ledger();
+        let (executed, rows) = synthetic_rows(24);
+        for count in [24, 8, 0, 16, 24] {
+            ledger.executed = &executed[..count];
+            ledger.reward_records = &rows[..count];
+            ledger.public_issued = count as u128 * 10;
+            ledger.validate(&genesis.domain(), 0).unwrap();
+            ledger.public_issued += 10;
+            assert!(ledger.validate(&genesis.domain(), 0).is_err());
+        }
+        ledger.executed = &executed[..7];
+        ledger.reward_records = &rows[..7];
+        ledger.public_issued = 70;
+        assert!(ledger.validate(&genesis.domain(), 0).is_err());
+    }
+}
+
+#[cfg(test)]
 mod sync {
     use silk_f04_node::{
         carriage::MAX_VERTEX_BYTES,
