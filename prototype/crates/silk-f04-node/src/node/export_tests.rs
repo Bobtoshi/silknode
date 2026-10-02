@@ -3,6 +3,177 @@ use super::*;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[test]
+#[ignore = "requires isolated COPY of the authenticated sixteen-vertex nonempty lineage and canonical parameters"]
+fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_state() {
+    assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
+    let root = PathBuf::from(std::env::var_os("SILK_F04_SOURCE_NATIVE_STORE").unwrap());
+    let margin = PathBuf::from(std::env::var_os("SILK_F04_HOST_MARGIN").unwrap());
+    let parameter_dir = PathBuf::from(std::env::var_os("SILK_F04_PARAMETER_DIR").unwrap());
+    let pin: Digest = hex::decode(std::env::var("SILK_F04_ANCESTRY_NATIVE_PIN").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let checkpoint: Digest = hex::decode(std::env::var("SILK_F04_NONEMPTY_CHECKPOINT").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let domain: Digest = hex::decode(std::env::var("SILK_F04_NONEMPTY_DOMAIN").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let genesis_source: Digest =
+        hex::decode(std::env::var("SILK_F04_NONEMPTY_GENESIS_HASH").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let genesis_bytes =
+        fs::read(root.join(format!("{}.obj", hex::encode(genesis_source)))).unwrap();
+    assert_eq!(raw_hash(&genesis_bytes), genesis_source);
+    // Explicitly accepted valueless historical test-role premise ONLY. This
+    // independently supplied fixture pin does not alter any node default or
+    // allow a received bundle to select its own genesis domain.
+    let genesis = Genesis::admit_local_bundle(&genesis_bytes, &domain, true).unwrap();
+    let original: BTreeMap<_, _> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_owned(),
+                raw_hash(&fs::read(path).unwrap()),
+            )
+        })
+        .collect();
+    let parameters = SaplingParameters::load(
+        &parameter_dir.join("sapling-spend.params"),
+        &parameter_dir.join("sapling-output.params"),
+    )
+    .unwrap();
+    let mut node = Node::open_retained_pinned(&root, &margin, genesis, &parameters, pin).unwrap();
+    assert_eq!(node.core.graph.len(), 16);
+    assert_eq!(node.core.status, Status::Ready);
+    assert_eq!(node.core.state.checkpoint_index(), 2);
+    assert_eq!(node.core.state.checkpoint_id(), checkpoint);
+    assert_eq!(node.core.state.private_counters(), (58, 2));
+    assert_eq!(node.core.state.leaves(), 7);
+    let completed = node.core.state.clone();
+    let ids = node.core.order.eligible_order().to_vec();
+    let exports = node.export_range(0, 32).unwrap();
+    assert_eq!(exports.len(), 16);
+    let mut representations = 0;
+    let mut first_nonempty = None;
+    for (position, id) in ids.iter().enumerate() {
+        let loaded = node
+            .core
+            .graph
+            .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
+            .unwrap();
+        let retained = node.core.graph.get(*id).unwrap();
+        let source = retained.source_id().unwrap();
+        assert_eq!(
+            loaded.retained_record().unwrap(),
+            fs::read(root.join(format!("{}.obj", hex::encode(source)))).unwrap()
+        );
+        assert!(!std::ptr::eq(
+            crate::graph::GraphEntry::graph_info(loaded.as_ref()),
+            crate::graph::GraphEntry::graph_info(retained),
+        ));
+        assert_eq!(
+            loaded.envelopes().len(),
+            loaded.candidate().body.representations().len()
+        );
+        for (verified, original_bytes) in loaded
+            .envelopes()
+            .iter()
+            .zip(loaded.candidate().body.representations())
+        {
+            assert_eq!(
+                verified.envelope().bytes().as_slice(),
+                original_bytes.as_slice()
+            );
+        }
+        representations += loaded.envelopes().len();
+        if !loaded.envelopes().is_empty() {
+            first_nonempty.get_or_insert((position, source, loaded.candidate().encode()));
+        }
+        // No full loaded carrier survives this iteration in the retained graph.
+    }
+    assert!(representations >= 3);
+    let (position, source, repeated) = first_nonempty.unwrap();
+    assert!(
+        position < 8,
+        "fixture must contain a nonempty first checkpoint carrier"
+    );
+    assert_eq!(
+        node.ingest(&repeated, &parameters).unwrap(),
+        Ingress::AlreadyKnown
+    );
+    assert_eq!(node.local_head().unwrap(), pin);
+    assert_eq!(node.core.state.manifest(), completed.manifest());
+    // Exercise both real scratch reducers, not a new durable checkpoint/reorg.
+    node.core.state = Arc::new(BranchState::genesis(&node.core.genesis).unwrap());
+    node.core.status = Status::NeedsReconcile;
+    let first = node
+        .core
+        .prepare_step(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    assert_eq!(first.state.checkpoint_index(), 1);
+    node.core.publish_step(first).unwrap();
+    let second = node
+        .core
+        .prepare_step(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    assert_eq!(second.state.manifest(), completed.manifest());
+    assert_eq!(
+        second.state.checkpoint_bytes(),
+        completed.checkpoint_bytes()
+    );
+    let parent = crate::parent::replay_source_for_test(
+        &node.core.graph,
+        &node.core.genesis,
+        &ids,
+        &JobBudget::checkpoint().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parent.manifest(), completed.manifest());
+    assert_eq!(parent.checkpoint_bytes(), completed.checkpoint_bytes());
+    node.core.state = Arc::new(BranchState::genesis(&node.core.genesis).unwrap());
+    node.core.status = Status::NeedsReconcile;
+    let scratch_manifest = node.core.state.manifest();
+    let path = root.join(format!("{}.obj", hex::encode(source)));
+    let held = path.with_extension("held");
+    fs::rename(&path, &held).unwrap();
+    assert!(matches!(node.begin_ingest(&repeated), Err(Error::Io(_))));
+    assert!(node.export_range(0, 16).is_err());
+    assert!(
+        node.core
+            .prepare_step(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(
+        crate::parent::replay_source_for_test(
+            &node.core.graph,
+            &node.core.genesis,
+            &ids,
+            &JobBudget::checkpoint().unwrap(),
+        )
+        .is_err()
+    );
+    assert_eq!(node.core.state.manifest(), scratch_manifest);
+    assert_eq!(node.core.graph.len(), 16);
+    assert_eq!(node.core.status, Status::NeedsReconcile);
+    assert_eq!(node.local_head().unwrap(), pin);
+    fs::rename(&held, &path).unwrap();
+    assert_eq!(node.export_range(0, 32).unwrap(), exports);
+    drop(node);
+    for (name, hash) in original {
+        assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
+    }
+    println!(
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+    );
+}
+
+#[test]
 #[ignore = "requires isolated COPY of a genuine eight-vertex corpus and canonical parameters"]
 fn disk_source_native_fresh_replay_exports_exact_originals_and_missing_last_refuses() {
     assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
