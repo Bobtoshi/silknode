@@ -1,10 +1,12 @@
 //! Receiver-owned full-data graph. No decoded peer object can construct validity.
+mod ancestry;
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
     carriage::{Candidate, ParentFacts, WorkEngine},
     genesis::Genesis,
 };
+use ancestry::PagedAncestry;
 use silk_order::sg0_v1::{
     ReceiverVerifiedSg0Graph, Sg0Error, Sg0OrderSnapshotV1, Sg0ParentSetV1, Sg0VertexDataV1,
     budgeted::{derive_append_vertex_data_v1, derive_virtual_order_chain_fast_v1},
@@ -27,7 +29,7 @@ pub struct VerifiedVertex {
     envelopes: Vec<VerifiedEnvelope>,
     facts: ParentFacts,
     metadata: Option<Sg0VertexDataV1>,
-    ancestors: [u64; 64],
+    ancestors: PagedAncestry,
 }
 impl VerifiedVertex {
     /// Immutable exact carrier; parsed fields were rederived from its bytes.
@@ -169,26 +171,24 @@ impl Graph {
             budget,
         })?)
     }
-    fn parent_closure(&self, parents: &Sg0ParentSetV1) -> Result<[u64; 64]> {
+    fn parent_closure(&self, parents: &Sg0ParentSetV1) -> Result<PagedAncestry> {
         if let Sg0ParentSetV1::Vertices(p) = parents {
             Sg0ParentSetV1::vertices(p.clone())?;
         }
-        let mut bits = [0; 64];
+        let mut bits = PagedAncestry::default();
         for p in parents.ordinary_parents() {
             let i = *self
                 .index
                 .get(p)
                 .ok_or(Error::Unavailable("candidate parent dependency"))?;
             let v = &self.vertices[i];
-            for (b, a) in bits.iter_mut().zip(v.ancestors) {
-                *b |= a;
-            }
-            bits[i / 64] |= 1 << (i % 64);
+            bits.union(&v.ancestors);
+            bits.insert(i)?;
         }
-        if let [a, b] = parents.ordinary_parents() {
-            if self.is_ancestor(*a, *b)? || self.is_ancestor(*b, *a)? {
-                return Err(Error::Invalid("comparable parents"));
-            }
+        if let [a, b] = parents.ordinary_parents()
+            && (self.is_ancestor(*a, *b)? || self.is_ancestor(*b, *a)?)
+        {
+            return Err(Error::Invalid("comparable parents"));
         }
         Ok(bits)
     }
@@ -197,7 +197,7 @@ impl Graph {
             .index
             .get(&a)
             .ok_or(Error::Unavailable("missing ancestor"))?;
-        Ok(self.get(b)?.ancestors[ai / 64] & (1 << (ai % 64)) != 0)
+        Ok(self.get(b)?.ancestors.contains(ai)?)
     }
 
     /// Only freshly decoded canonical bytes enter the validity pipeline.
@@ -314,7 +314,7 @@ impl Graph {
 struct View<'a> {
     graph: &'a Graph,
     added: Option<&'a VerifiedVertex>,
-    members: Option<&'a [u64; 64]>,
+    members: Option<&'a PagedAncestry>,
     budget: &'a JobBudget,
 }
 impl View<'_> {
@@ -324,9 +324,8 @@ impl View<'_> {
             return Ok(v);
         }
         let i = *self.graph.index.get(&id).ok_or(Sg0Error::MissingVertex)?;
-        if self
-            .members
-            .is_some_and(|bits| bits[i / 64] & (1 << (i % 64)) == 0)
+        if let Some(bits) = self.members
+            && !bits.contains(i)?
         {
             return Err(Sg0Error::MissingVertex);
         }
@@ -342,7 +341,9 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
             self.budget.graph_read()?;
             if self
                 .members
-                .is_none_or(|bits| bits[*i / 64] & (1 << (*i % 64)) != 0)
+                .map(|bits| bits.contains(*i))
+                .transpose()?
+                .unwrap_or(true)
             {
                 visitor(*id)?;
             }
@@ -376,7 +377,7 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
         let bits = &self.lookup(id)?.ancestors;
         for (i, v) in self.graph.vertices.iter().enumerate() {
             self.budget.graph_read()?;
-            if bits[i / 64] & (1 << (i % 64)) != 0 {
+            if bits.contains(i)? {
                 visitor(VertexId::from_bytes(v.candidate.id))?;
             }
         }
@@ -389,10 +390,180 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
     ) -> std::result::Result<bool, Sg0Error> {
         self.lookup(a)?;
         let v = self.lookup(b)?;
-        if let Some(i) = self.graph.index.get(&a) {
-            Ok(v.ancestors[*i / 64] & (1 << (*i % 64)) != 0)
+        self.graph
+            .index
+            .get(&a)
+            .map_or(Ok(false), |i| v.ancestors.contains(*i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::carriage::{Body, Header};
+
+    fn id(label: u8) -> VertexId {
+        VertexId::from_bytes([label; 32])
+    }
+
+    // Synthetic receiver-view fixture ONLY. No work, proof or live admission
+    // acceptance follows from these private test-only vertex constructions.
+    fn synthetic_vertex(graph: &Graph, label: u8, labels: &[u8]) -> VerifiedVertex {
+        let parents = if labels.is_empty() {
+            Sg0ParentSetV1::Anchor
         } else {
-            Ok(false)
+            Sg0ParentSetV1::vertices(labels.iter().map(|n| id(*n)).collect()).unwrap()
+        };
+        let facts = ParentFacts {
+            source_record: [0; 184],
+            epoch: 0,
+            daa: [0; 32],
+            work: 1,
+            minimum_time: 0,
+            source_index: 0,
+            source_checkpoint: [0; 32],
+            source_j: [0; 32],
+            seed: [0; 32],
+            key_material: [0; 32],
+        };
+        VerifiedVertex {
+            ancestors: graph.parent_closure(&parents).unwrap(),
+            candidate: Candidate {
+                id: id(label).into_bytes(),
+                body: Body::new(&[9; 32], &[]).unwrap(),
+                proof: [0; 52],
+                header: Header {
+                    bytes: [0; 592],
+                    parents,
+                    timestamp: u64::from(label),
+                    epoch: 0,
+                    daa: [0; 32],
+                    work: 1,
+                    source_index: 0,
+                    source_checkpoint: [0; 32],
+                    source_j: [0; 32],
+                    seed: [0; 32],
+                    owner: [0; 32],
+                    reward_nonce: [0; 32],
+                },
+            },
+            envelopes: Vec::new(),
+            facts,
+            metadata: None,
         }
+    }
+
+    fn diamond(budget: &JobBudget) -> Graph {
+        let mut graph = Graph::default();
+        for (label, parents) in [(1, &[][..]), (2, &[1][..]), (3, &[1][..]), (4, &[2, 3][..])] {
+            let vertex = synthetic_vertex(&graph, label, parents);
+            let prepared = graph.seal(vertex, budget).unwrap();
+            graph.publish(prepared).unwrap();
+        }
+        graph
+    }
+
+    #[test]
+    fn paged_ancestry_graph_fork_merge_and_parent_views_are_exact() {
+        let budget = JobBudget::checkpoint().unwrap();
+        let graph = diamond(&budget);
+        assert!(graph.is_ancestor(id(1), id(4)).unwrap());
+        assert!(graph.is_ancestor(id(2), id(4)).unwrap());
+        assert!(!graph.is_ancestor(id(2), id(3)).unwrap());
+        assert!(!graph.is_ancestor(id(4), id(4)).unwrap());
+        let parents = Sg0ParentSetV1::vertices(vec![id(2), id(3)]).unwrap();
+        let members = graph.parent_closure(&parents).unwrap();
+        let view = View {
+            graph: &graph,
+            added: None,
+            members: Some(&members),
+            budget: &budget,
+        };
+        let mut visible = Vec::new();
+        view.visit_vertex_ids(&mut |v| {
+            visible.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visible, vec![id(1), id(2), id(3)]);
+        assert!(!view.receiver_verified_contains(id(4)).unwrap());
+        let mut past = Vec::new();
+        view.visit_strict_past_ids(id(3), &mut |v| {
+            past.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(past, vec![id(1)]);
+        assert!(view.receiver_verified_is_ancestor(id(1), id(3)).unwrap());
+        assert_eq!(
+            view.receiver_verified_is_ancestor(id(4), id(3)),
+            Err(Sg0Error::MissingVertex)
+        );
+        let comparable = Sg0ParentSetV1::vertices(vec![id(1), id(2)]).unwrap();
+        assert!(matches!(
+            graph.parent_closure(&comparable),
+            Err(Error::Invalid("comparable parents"))
+        ));
+        assert!(
+            graph
+                .parent_closure(&Sg0ParentSetV1::vertices(vec![id(9)]).unwrap())
+                .is_err()
+        );
+        let mut parent_order = graph
+            .parent_order(&parents, &budget)
+            .unwrap()
+            .eligible_order()
+            .to_vec();
+        parent_order.sort_unstable();
+        assert_eq!(parent_order, visible);
+        let mut all_order = graph.order(&budget).unwrap().eligible_order().to_vec();
+        all_order.sort_unstable();
+        assert_eq!(all_order, vec![id(1), id(2), id(3), id(4)]);
+    }
+
+    #[test]
+    fn paged_ancestry_graph_staging_and_clone_preserve_original_evidence() {
+        let budget = JobBudget::checkpoint().unwrap();
+        let original = diamond(&budget);
+        let retained = original
+            .vertices()
+            .map(|v| v.retained_record().unwrap())
+            .collect::<Vec<_>>();
+        let mut branch = original.clone();
+        let prepared = branch
+            .seal(synthetic_vertex(&branch, 5, &[4]), &budget)
+            .unwrap();
+        let view = View {
+            graph: &branch,
+            added: Some(prepared.vertex()),
+            members: None,
+            budget: &budget,
+        };
+        let mut past = Vec::new();
+        view.visit_strict_past_ids(id(5), &mut |v| {
+            past.push(v);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(past, vec![id(1), id(2), id(3), id(4)]);
+        assert!(view.receiver_verified_is_ancestor(id(4), id(5)).unwrap());
+        assert!(!view.receiver_verified_is_ancestor(id(5), id(5)).unwrap());
+        let staged = branch.order_with(&prepared, &budget).unwrap();
+        branch.publish(prepared).unwrap();
+        assert_eq!(
+            branch.order(&budget).unwrap().eligible_order(),
+            staged.eligible_order()
+        );
+        assert!(branch.is_ancestor(id(4), id(5)).unwrap());
+        assert_eq!(original.len(), 4);
+        assert!(original.get(id(5)).is_err());
+        assert_eq!(
+            original
+                .vertices()
+                .map(|v| v.retained_record().unwrap())
+                .collect::<Vec<_>>(),
+            retained
+        );
+        assert!(!original.is_ancestor(id(4), id(4)).unwrap());
     }
 }
