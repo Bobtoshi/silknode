@@ -27,6 +27,9 @@ pub(super) struct RetainedContext {
     domain: Digest,
 }
 impl RetainedContext {
+    pub(super) fn objects(&self) -> &ObjectReader {
+        &self.objects
+    }
     pub(super) fn new(objects: Arc<ObjectReader>, domain: Digest) -> Arc<Self> {
         Arc::new(Self { objects, domain })
     }

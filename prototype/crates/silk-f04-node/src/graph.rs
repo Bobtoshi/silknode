@@ -5,6 +5,7 @@ use crate::{
     budget::{JobBudget, LocalClock},
     carriage::{Candidate, ParentFacts, WorkEngine},
     genesis::Genesis,
+    wire::{raw_hash, u32le},
 };
 use ancestry::{PagedAncestry, RetainedContext};
 use silk_order::sg0_v1::{
@@ -30,6 +31,13 @@ pub struct VerifiedVertex {
     facts: ParentFacts,
     metadata: Option<Sg0VertexDataV1>,
     ancestors: PagedAncestry,
+    retained_source: Option<RetainedSource>,
+}
+/// Live receiver-derived source binding, never serialized or imported as validity.
+struct RetainedSource {
+    id: Digest,
+    record_len: usize,
+    candidate_len: usize,
 }
 impl VerifiedVertex {
     /// Immutable exact carrier; parsed fields were rederived from its bytes.
@@ -81,6 +89,21 @@ pub(crate) struct PreparedVertex {
 impl PreparedVertex {
     pub fn vertex(&self) -> &VerifiedVertex {
         &self.vertex
+    }
+    /// Call only after the complete original record is durable or freshly replayed.
+    /// Exact comparison keeps this address bound to the already verified vertex.
+    pub(crate) fn bind_retained_source(&mut self, bytes: &[u8]) -> Result<()> {
+        let vertex = Arc::get_mut(&mut self.vertex)
+            .ok_or(Error::Unavailable("shared prepared source binding"))?;
+        if vertex.retained_source.is_some() || vertex.retained_record()? != bytes {
+            return Err(Error::Unavailable("retained source binding mismatch"));
+        }
+        vertex.retained_source = Some(RetainedSource {
+            id: raw_hash(bytes),
+            record_len: bytes.len(),
+            candidate_len: u32le(bytes, 8)? as usize,
+        });
+        Ok(())
     }
     pub(crate) fn retain_ancestry(
         &mut self,
@@ -164,6 +187,42 @@ impl Graph {
     /// Complete admitted evidence in topological admission order, for full-range sync.
     pub fn vertices(&self) -> impl Iterator<Item = &VerifiedVertex> {
         self.vertices.iter().map(AsRef::as_ref)
+    }
+    /// Disk-backed full evidence export, not a validity constructor. Missing or
+    /// damaged source objects refuse the whole range; no resident-byte fallback.
+    pub(crate) fn export_retained_range(&self, start: usize, count: usize) -> Result<Vec<Vec<u8>>> {
+        if count == 0 || count > 32 || start > self.len() {
+            return Err(Error::Unavailable("public range bounds"));
+        }
+        let reader = self
+            .ancestry_reader
+            .as_ref()
+            .ok_or(Error::Unavailable("durable graph source reader absent"))?;
+        self.vertices
+            .iter()
+            .skip(start)
+            .take(count)
+            .map(|vertex| {
+                let source = vertex
+                    .retained_source
+                    .as_ref()
+                    .ok_or(Error::Unavailable("verified durable source binding absent"))?;
+                let bytes = reader.objects().object(source.id, source.record_len)?;
+                let end = 12_usize
+                    .checked_add(source.candidate_len)
+                    .ok_or(Error::Unavailable("retained export length"))?;
+                if bytes.len() != source.record_len
+                    || bytes.get(..8) != Some(b"SNF04VR1")
+                    || u32le(&bytes, 8)? as usize != source.candidate_len
+                    || bytes.get(12..end).is_none()
+                {
+                    return Err(Error::Unavailable("retained export framing"));
+                }
+                // The checked object hash is bound after fresh full admission;
+                // it authenticates original bytes, not externally saved validity.
+                Ok(bytes[12..end].to_vec())
+            })
+            .collect()
     }
     /// Indexed receiver-verified evidence lookup.
     pub fn get(&self, id: VertexId) -> Result<&VerifiedVertex> {
@@ -298,6 +357,7 @@ impl Graph {
                 .map(|v| v.expect("complete exact verification"))
                 .collect(),
             metadata: None,
+            retained_source: None,
         })
     }
     pub(crate) fn seal(
@@ -487,6 +547,7 @@ mod tests {
             envelopes: Vec::new(),
             facts,
             metadata: None,
+            retained_source: None,
         }
     }
 
@@ -498,6 +559,101 @@ mod tests {
             graph.publish(prepared).unwrap();
         }
         graph
+    }
+    fn source_graph(store: &mut crate::store::Store, budget: &JobBudget) -> Graph {
+        let mut graph = Graph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic source export fixture")
+            .unwrap();
+        for (label, parents) in [(1, &[][..]), (2, &[1][..]), (3, &[1][..])] {
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, parents), budget)
+                .unwrap();
+            let bytes = prepared.vertex().retained_record().unwrap();
+            store
+                .commit(&[&bytes], b"synthetic complete source head")
+                .unwrap();
+            prepared.retain_ancestry(&graph, store, budget).unwrap();
+            prepared.bind_retained_source(&bytes).unwrap();
+            graph.publish(prepared).unwrap();
+        }
+        graph
+    }
+    #[test]
+    fn disk_source_export_exact_order_bounds_and_held_directory() {
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let graph = source_graph(&mut store, &JobBudget::checkpoint().unwrap());
+        let expected: Vec<_> = graph.vertices().map(|v| v.candidate().encode()).collect();
+        assert_eq!(graph.export_retained_range(0, 32).unwrap(), expected);
+        assert_eq!(graph.export_retained_range(1, 2).unwrap(), expected[1..]);
+        assert!(graph.export_retained_range(3, 1).unwrap().is_empty());
+        for (start, count) in [(0, 0), (0, 33), (4, 1), (usize::MAX, 1)] {
+            assert!(graph.export_retained_range(start, count).is_err());
+        }
+        drop(store);
+        assert_eq!(graph.export_retained_range(0, 32).unwrap(), expected);
+    }
+    #[test]
+    fn disk_source_binding_requires_exact_sealed_bytes_without_mutation() {
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut graph = Graph::default();
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 1, &[]), &budget)
+            .unwrap();
+        let bytes = prepared.vertex().retained_record().unwrap();
+        let mut wrong = bytes.clone();
+        *wrong.last_mut().unwrap() ^= 1;
+        assert!(prepared.bind_retained_source(&wrong).is_err());
+        assert!(prepared.vertex.retained_source.is_none());
+        prepared.bind_retained_source(&bytes).unwrap();
+        assert!(prepared.bind_retained_source(&bytes).is_err());
+        graph.publish(prepared).unwrap();
+        assert!(graph.export_retained_range(0, 1).is_err());
+        let (_temp, store) = crate::store::ancestry_test_store();
+        let mut graph = Graph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        let prepared = graph
+            .seal(synthetic_vertex(&graph, 1, &[]), &budget)
+            .unwrap();
+        graph.publish(prepared).unwrap();
+        assert!(graph.export_retained_range(0, 1).is_err());
+    }
+    #[test]
+    fn disk_source_missing_tampered_and_hardlinked_objects_refuse_whole_range() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let graph = source_graph(&mut store, &JobBudget::checkpoint().unwrap());
+        let expected = graph.export_retained_range(0, 3).unwrap();
+        let source = graph
+            .vertices
+            .last()
+            .unwrap()
+            .retained_source
+            .as_ref()
+            .unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(source.id)));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(graph.export_retained_range(0, 3).is_err());
+        assert_eq!(graph.len(), 3);
+        std::fs::rename(&held, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut wrong = bytes.clone();
+        wrong[12] ^= 1;
+        std::fs::write(&path, wrong).unwrap();
+        assert!(graph.export_retained_range(0, 3).is_err());
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::hard_link(&path, &held).unwrap();
+        assert!(graph.export_retained_range(0, 3).is_err());
+        std::fs::remove_file(&held).unwrap();
+        assert_eq!(graph.export_retained_range(0, 3).unwrap(), expected);
     }
     fn disk_diamond(store: &mut crate::store::Store, budget: &JobBudget) -> Graph {
         let mut graph = Graph::default();

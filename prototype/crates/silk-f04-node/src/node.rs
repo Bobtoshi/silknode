@@ -2,6 +2,8 @@
 //! Full-range synchronization uses the same live receiver as direct ingress.
 #[cfg(test)]
 mod ancestry_tests;
+#[cfg(test)]
+mod export_tests;
 mod replay;
 use crate::{
     Digest, Error, Result,
@@ -307,6 +309,7 @@ impl Node {
                         return Err(Error::Unavailable("retained source/SG0 metadata mismatch"));
                     }
                     a.vertex.retain_ancestry(&core.graph, store, &a.budget)?;
+                    a.vertex.bind_retained_source(&data)?;
                     core.publish(a)?
                 }
                 2 | 3 if index > 0 => {
@@ -550,10 +553,11 @@ impl Node {
             self.core.graph.len() as u64 + 1,
             a.status,
         )?;
-        if let Err(error) = a
-            .vertex
-            .retain_ancestry(&self.core.graph, &mut self.store, &a.budget)
-        {
+        if let Err(error) = (|| {
+            a.vertex
+                .retain_ancestry(&self.core.graph, &mut self.store, &a.budget)?;
+            a.vertex.bind_retained_source(&data)
+        })() {
             self.faulted = true;
             return Err(error);
         }
@@ -726,17 +730,7 @@ impl Node {
     /// Receivers ingest these bytes through their normal live admission route.
     pub fn export_range(&self, start: usize, count: usize) -> Result<Vec<Vec<u8>>> {
         self.healthy()?;
-        if count == 0 || count > 32 || start > self.core.graph.len() {
-            return Err(Error::Unavailable("public range bounds"));
-        }
-        Ok(self
-            .core
-            .graph
-            .vertices()
-            .skip(start)
-            .take(count)
-            .map(|v| v.candidate().encode())
-            .collect())
+        self.core.graph.export_retained_range(start, count)
     }
     fn healthy(&self) -> Result<()> {
         if self.faulted {
