@@ -338,6 +338,36 @@ impl Store {
             "retained ledger set page publication failed",
         )
     }
+    /// Live receiver-derived execution, reward or output linkage history only.
+    pub(crate) fn retain_ledger_history_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        const HEADER: usize = 52;
+        let width = match bytes.get(..8) {
+            Some(b"SNF04XP1") => 32,
+            Some(b"SNF04WP1") => 112,
+            Some(b"SNF04OP1") => 104,
+            _ => return Err(Error::Unavailable("ledger history page kind")),
+        };
+        let count = if bytes.len() >= HEADER {
+            u32le(bytes, 48)? as usize
+        } else {
+            0
+        };
+        if !(1..=64).contains(&count)
+            || bytes.len() != HEADER + count * width
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "ledger history page requires active verified transition",
+            ));
+        }
+        self.retain_ledger_page(
+            bytes,
+            "ledger history page writer stopped",
+            "retained ledger history page damaged",
+            "post-ledger-history-page host margin",
+            "retained ledger history page publication failed",
+        )
+    }
     fn retain_ledger_page(
         &mut self,
         bytes: &[u8],

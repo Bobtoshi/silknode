@@ -205,7 +205,7 @@ impl Core {
                 Progress::Complete(result, budget) => {
                     budget.check()?;
                     let (vertex, order) = result?;
-                    let status = status_for(&self.state, order.eligible_order());
+                    let status = status_for(&self.state, order.eligible_order(), &budget)?;
                     budget.check()?;
                     for envelope in vertex.vertex().envelopes() {
                         self.crypto.insert(envelope.clone());
@@ -244,25 +244,33 @@ impl Core {
         budget.check()?;
         let ids = self.order.eligible_order();
         let old_len = self.state.executed_len();
-        let common = self.state.common_executed_prefix(ids);
+        let common = self
+            .state
+            .common_executed_prefix_checked(ids, Some(budget))?;
         if common < old_len {
             let end = common / 8 * 8;
-            let state = self
-                .history
-                .iter()
-                .filter(|s| s.executed_len() <= end && s.executed_prefix_matches(ids))
-                .max_by_key(|s| s.executed_len())
-                .cloned()
-                .unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
+            let mut selected: Option<Arc<BranchState>> = None;
+            for state in &self.history {
+                if state.executed_len() <= end
+                    && state.executed_prefix_matches_checked(ids, Some(budget))?
+                    && selected
+                        .as_ref()
+                        .is_none_or(|selected| state.executed_len() >= selected.executed_len())
+                {
+                    selected = Some(state.clone());
+                }
+            }
+            let state = selected.unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
             // A cached reversible snapshot is not permission to publish a
             // rollback whose original ledger pages are now unreadable.
             let state = Arc::new(state.materialize_ledger(Some(budget))?);
-            let status = if status_for(&state, ids) == Status::Ready {
+            let derived_status = status_for(&state, ids, budget)?;
+            let status = if derived_status == Status::Ready {
                 Status::Ready
             } else if self.status == Status::ArchiveReplay {
                 Status::ArchiveReplay
             } else {
-                status_for(&state, ids)
+                derived_status
             };
             budget.check()?;
             return Ok(Step {
@@ -292,7 +300,7 @@ impl Core {
         )?;
         budget.check()?;
         let state = Arc::new(t.state);
-        let status = if status_for(&state, ids) == Status::Ready {
+        let status = if status_for(&state, ids, budget)? == Status::Ready {
             Status::Ready
         } else {
             self.status
@@ -308,9 +316,11 @@ impl Core {
     /// Upper bound for finishing the current preferred history, without work or
     /// state mutation. A divergent prefix may require genesis rollback plus all
     /// complete intervals; reuse of retained checkpoints can only lower the cost.
-    pub fn reconciliation_generations(&self) -> Result<u64> {
+    pub fn reconciliation_generations(&self, budget: &JobBudget) -> Result<u64> {
         let ids = self.order.eligible_order();
-        let common = self.state.common_executed_prefix(ids);
+        let common = self
+            .state
+            .common_executed_prefix_checked(ids, Some(budget))?;
         HistoryCapacityV1::reconciliation_generations(self.state.executed_len(), common, ids.len())
     }
     pub fn publish_step(&mut self, s: Step) -> Result<()> {
@@ -383,13 +393,15 @@ impl Core {
             })
     }
 }
-fn status_for(state: &BranchState, ids: &[VertexId]) -> Status {
-    let common = state.common_executed_prefix(ids);
-    if common == state.executed_len() && ids.len() / 8 * 8 == state.executed_len() {
-        Status::Ready
-    } else if state.executed_len().saturating_sub(common / 8 * 8) > 32 {
-        Status::ArchiveReplay
-    } else {
-        Status::NeedsReconcile
-    }
+fn status_for(state: &BranchState, ids: &[VertexId], budget: &JobBudget) -> Result<Status> {
+    let common = state.common_executed_prefix_checked(ids, Some(budget))?;
+    Ok(
+        if common == state.executed_len() && ids.len() / 8 * 8 == state.executed_len() {
+            Status::Ready
+        } else if state.executed_len().saturating_sub(common / 8 * 8) > 32 {
+            Status::ArchiveReplay
+        } else {
+            Status::NeedsReconcile
+        },
+    )
 }

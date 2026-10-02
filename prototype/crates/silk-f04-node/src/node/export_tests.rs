@@ -64,9 +64,19 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
             .all(|pages| pages.len() == 1)
     );
     assert!(node.state_view.get().is_none());
+    assert!(
+        completed
+            .retained_history_pages()
+            .iter()
+            .all(|pages| pages.len() == 1)
+    );
     let snapshot = node.state().unwrap().clone();
     assert!(snapshot.retained_recovery_pages().is_empty());
     assert!(snapshot.retained_set_pages().iter().all(Vec::is_empty));
+    assert!(snapshot.retained_history_pages().iter().all(Vec::is_empty));
+    assert_eq!(snapshot.accepted_outputs().len(), 2);
+    assert_eq!(snapshot.executed().len(), 16);
+    assert_eq!(snapshot.economic_ledger().reward_records.len(), 16);
     assert_eq!(snapshot.recovery().len(), 7);
     assert_eq!(snapshot.manifest(), completed.manifest());
     // Public snapshots remain resident and safely cloneable. Clearing this
@@ -85,13 +95,25 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.manifest(), completed.manifest());
     assert_eq!(node.local_head().unwrap(), pin);
     fs::rename(&recovery_held, &recovery_path).unwrap();
-    for id in completed.retained_set_pages().into_iter().flatten() {
+    for id in completed
+        .retained_set_pages()
+        .into_iter()
+        .flatten()
+        .chain(completed.retained_history_pages().into_iter().flatten())
+    {
         let path = root.join(format!("{}.obj", hex::encode(id)));
         let held = path.with_extension("held");
         fs::rename(&path, &held).unwrap();
         node.state_view.take();
         assert!(matches!(node.state(), Err(Error::Io(_))));
         assert!(node.state_view.get().is_none());
+        if id == completed.retained_history_pages()[2][0] {
+            assert!(matches!(
+                node.core
+                    .reconciliation_generations(&JobBudget::checkpoint().unwrap()),
+                Err(Error::Io(_))
+            ));
+        }
         assert_eq!(node.core.state.manifest(), completed.manifest());
         assert_eq!(node.local_head().unwrap(), pin);
         fs::rename(&held, &path).unwrap();
@@ -130,6 +152,12 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         .execute(batch, &JobBudget::checkpoint().unwrap())
         .unwrap();
     assert_eq!(replayed.state.manifest(), completed.manifest());
+    assert!(
+        prior
+            .retained_history_pages()
+            .iter()
+            .all(|pages| pages.len() == 1)
+    );
     // Scratch rollback uses genuine retained state and receiver parent order;
     // it is not native fork/reorg admission or durable checkpoint publication.
     let complete_order = node.core.order.clone();
@@ -190,6 +218,35 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         assert_eq!(node.core.state.manifest(), completed.manifest());
         assert_eq!(node.local_head().unwrap(), pin);
         fs::rename(&held, &path).unwrap();
+    }
+    for (kind, pages) in prior.retained_history_pages().into_iter().enumerate() {
+        for id in pages {
+            let path = root.join(format!("{}.obj", hex::encode(id)));
+            let held = path.with_extension("held");
+            fs::rename(&path, &held).unwrap();
+            assert!(matches!(
+                prior.execute(batch, &JobBudget::checkpoint().unwrap()),
+                Err(Error::Io(_))
+            ));
+            assert!(matches!(
+                node.core.prepare_step(&JobBudget::checkpoint().unwrap()),
+                Err(Error::Io(_))
+            ));
+            if kind == 2 {
+                assert!(matches!(
+                    completed.delta_checked(
+                        &prior,
+                        &replayed.outcomes,
+                        false,
+                        Some(&JobBudget::checkpoint().unwrap())
+                    ),
+                    Err(Error::Io(_))
+                ));
+            }
+            assert_eq!(node.core.state.manifest(), completed.manifest());
+            assert_eq!(node.local_head().unwrap(), pin);
+            fs::rename(&held, &path).unwrap();
+        }
     }
     node.core.order = complete_order;
     node.core.status = Status::Ready;
@@ -281,6 +338,12 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     )
     .unwrap();
     assert_eq!(parent.manifest(), completed.manifest());
+    assert_eq!(parent.accepted_outputs(), snapshot.accepted_outputs());
+    assert_eq!(
+        parent.economic_ledger().reward_records,
+        snapshot.economic_ledger().reward_records
+    );
+    assert_eq!(parent.executed(), snapshot.executed());
     assert_eq!(parent.checkpoint_bytes(), completed.checkpoint_bytes());
     node.core.state = Arc::new(BranchState::genesis(&node.core.genesis).unwrap());
     node.core.status = Status::NeedsReconcile;
@@ -316,7 +379,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     // reopen must stop, never fall back to PREVIOUS and expose an older ledger.
     let set_path = root.join(format!(
         "{}.obj",
-        hex::encode(completed.retained_set_pages()[0][0])
+        hex::encode(completed.retained_history_pages()[0][0])
     ));
     let set_bytes = fs::read(&set_path).unwrap();
     let mut damaged = set_bytes.clone();
@@ -324,7 +387,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     fs::write(&set_path, damaged).unwrap();
     assert!(matches!(
         Node::open_retained_pinned(&root, &margin, accepted_genesis, &parameters, pin),
-        Err(Error::Unavailable("retained ledger set page damaged"))
+        Err(Error::Unavailable("retained ledger history page damaged"))
     ));
     assert_eq!(
         fs::read(root.join("HEAD")).unwrap(),
@@ -336,7 +399,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_delta_and_scratch_rollback=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
     );
 }
 

@@ -614,9 +614,9 @@ impl Node {
         if self.core.status == Status::Ready {
             return Ok(Status::Ready);
         }
-        self.history_capacity()?
-            .check_generations(self.core.reconciliation_generations()?)?;
         let budget = JobBudget::checkpoint()?;
+        self.history_capacity()?
+            .check_generations(self.core.reconciliation_generations(&budget)?)?;
         let mut marker = Vec::from(b"SNF04CJ1".as_slice());
         marker.extend_from_slice(&self.core.genesis.domain());
         marker.extend_from_slice(&self.local_head()?);
@@ -668,8 +668,9 @@ impl Node {
         self.idle()?;
         // Clock-only publication must not consume the slots needed to finish
         // an already admitted preferred-history transition.
+        let budget = JobBudget::checkpoint()?;
         self.history_capacity()?
-            .check_generations(1 + self.core.reconciliation_generations()?)?;
+            .check_generations(1 + self.core.reconciliation_generations(&budget)?)?;
         self.core.clock.observe(system_wall()?)?;
         self.commit(
             4,

@@ -277,17 +277,19 @@ impl PrefixCache {
         genesis: &Genesis,
         budget: &JobBudget,
     ) -> Result<Arc<BranchState>> {
-        let mut state = self
-            .states
-            .iter()
-            .filter(|s| {
-                s.executed_len() <= ids.len()
-                    && s.eligible_commitment() == js[s.executed_len()]
-                    && s.executed_prefix_matches(ids)
-            })
-            .max_by_key(|s| s.executed_len())
-            .cloned()
-            .unwrap_or_else(|| self.genesis.clone());
+        let mut selected: Option<Arc<BranchState>> = None;
+        for state in &self.states {
+            if state.executed_len() <= ids.len()
+                && state.eligible_commitment() == js[state.executed_len()]
+                && state.executed_prefix_matches_checked(ids, Some(budget))?
+                && selected
+                    .as_ref()
+                    .is_none_or(|selected| state.executed_len() >= selected.executed_len())
+            {
+                selected = Some(state.clone());
+            }
+        }
+        let mut state = selected.unwrap_or_else(|| self.genesis.clone());
         while state.executed_len() < ids.len() {
             budget.replay()?;
             budget.check()?;

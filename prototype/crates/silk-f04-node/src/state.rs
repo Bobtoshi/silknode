@@ -1,5 +1,6 @@
 //! One checkpoint reducer shared by canonical execution and parent-prefix replay.
 //! A cut is a reversible prefix reference, never a finality certificate.
+mod history;
 mod recovery;
 mod sequence;
 mod sets;
@@ -7,9 +8,9 @@ use crate::economics::{
     CREDIT_MATURITY_V1, EconomicCountsV1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1,
 };
 use crate::{Digest, Error, Result, genesis::Genesis, graph::VerifiedVertex, wire::raw_hash};
+use history::LedgerHistory;
 use recovery::RecoveryHistory;
 use sapling_crypto::{CommitmentTree, Node};
-use sequence::PagedSequence;
 use sets::PagedLedgerSet;
 use sha2::{Digest as _, Sha256};
 use silk_pow::randomx_v2_work_key_id;
@@ -107,12 +108,12 @@ pub struct BranchState {
     // Share immutable entries across reversible states; do not copy ciphertext history.
     recovery: RecoveryHistory,
     // Derived only; NEVER added to current hashes, manifests, deltas or wire bytes.
-    accepted_outputs: PagedSequence<Arc<AcceptedOutputs>>,
-    rewards: PagedSequence<[u8; 112]>,
+    accepted_outputs: LedgerHistory<Arc<AcceptedOutputs>>,
+    rewards: LedgerHistory<[u8; 112]>,
     pool: u64,
     burned: u64,
     issued: u128,
-    executed: PagedSequence<VertexId>,
+    executed: LedgerHistory<VertexId>,
     j: Digest,
     tail: VecDeque<[u8; 56]>,
     dc: Digest,
@@ -158,12 +159,12 @@ impl BranchState {
             nullifiers: PagedLedgerSet::new(100_000),
             effects: PagedLedgerSet::new(50_000),
             recovery,
-            accepted_outputs: PagedSequence::new(50_000),
-            rewards: PagedSequence::new(crate::sync::HISTORY_LIMIT_V1),
+            accepted_outputs: LedgerHistory::new(50_000),
+            rewards: LedgerHistory::new(crate::sync::HISTORY_LIMIT_V1),
             pool: g.total(),
             burned: 0,
             issued: 0,
-            executed: PagedSequence::new(crate::sync::HISTORY_LIMIT_V1),
+            executed: LedgerHistory::new(crate::sync::HISTORY_LIMIT_V1),
             j,
             tail: VecDeque::new(),
             dc: [0; 32],
@@ -419,11 +420,12 @@ impl BranchState {
             budget,
         )?;
         check()?;
+        let rewards = self.rewards.materialize(budget)?;
         let pr = hash_stream_checked(
             "SilkNode-F0-public-rewards",
             &self.domain,
             self.rewards.len(),
-            self.rewards.iter().map(|x| x.as_slice()),
+            rewards.iter().map(<[u8; 112]>::as_slice),
             budget,
         )?;
         check()?;
@@ -581,8 +583,10 @@ impl BranchState {
                 b.extend_from_slice(&m);
             }
         } else {
+            let executed = self.executed.materialize(budget)?;
+            let prior_executed = prior.executed.materialize(budget)?;
             if self.executed.len() != prior.executed.len() + 8
-                || !self.executed.starts_with(&prior.executed)
+                || !executed.starts_with(&prior_executed)
             {
                 return Err(Error::Unavailable("delta prefix"));
             }
@@ -611,7 +615,8 @@ impl BranchState {
             for x in added {
                 b.extend_from_slice(x.as_slice());
             }
-            for r in self.rewards.iter_from(prior.rewards.len())? {
+            let rewards = self.rewards.materialize(budget)?;
+            for r in rewards.iter_from(prior.rewards.len())? {
                 b.extend_from_slice(r);
             }
         }
@@ -626,6 +631,9 @@ impl BranchState {
         state.recovery = self.recovery.materialize(budget)?;
         state.nullifiers = self.nullifiers.materialize(budget)?;
         state.effects = self.effects.materialize(budget)?;
+        state.accepted_outputs = self.accepted_outputs.materialize(budget)?;
+        state.rewards = self.rewards.materialize(budget)?;
+        state.executed = self.executed.materialize(budget)?;
         Ok(state)
     }
     pub(crate) fn retain_ledger(
@@ -641,11 +649,22 @@ impl BranchState {
         state.effects = self
             .effects
             .retain(store, self.domain, *b"SNF04EP1", budget)?;
+        state.accepted_outputs = self.accepted_outputs.retain(store, self.domain, budget)?;
+        state.rewards = self.rewards.retain(store, self.domain, budget)?;
+        state.executed = self.executed.retain(store, self.domain, budget)?;
         Ok(state)
     }
     #[cfg(test)]
     pub(crate) fn retained_set_pages(&self) -> [Vec<Digest>; 2] {
         [self.nullifiers.retained_ids(), self.effects.retained_ids()]
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_history_pages(&self) -> [Vec<Digest>; 3] {
+        [
+            self.accepted_outputs.retained_ids(),
+            self.rewards.retained_ids(),
+            self.executed.retained_ids(),
+        ]
     }
     #[cfg(test)]
     pub(crate) fn retained_recovery_pages(&self) -> Vec<Digest> {
@@ -700,15 +719,29 @@ impl BranchState {
     pub(crate) const fn executed_len(&self) -> usize {
         self.executed.len()
     }
+    #[cfg(test)]
     pub(crate) fn common_executed_prefix(&self, ids: &[VertexId]) -> usize {
-        self.executed
-            .iter()
-            .zip(ids)
-            .take_while(|(a, b)| a == b)
-            .count()
+        self.common_executed_prefix_checked(ids, None).unwrap()
     }
+    pub(crate) fn common_executed_prefix_checked(
+        &self,
+        ids: &[VertexId],
+        budget: Option<&crate::budget::JobBudget>,
+    ) -> Result<usize> {
+        let executed = self.executed.materialize(budget)?;
+        Ok(executed.iter().zip(ids).take_while(|(a, b)| a == b).count())
+    }
+    #[cfg(test)]
     pub(crate) fn executed_prefix_matches(&self, ids: &[VertexId]) -> bool {
         self.executed.len() <= ids.len() && self.common_executed_prefix(ids) == self.executed.len()
+    }
+    pub(crate) fn executed_prefix_matches_checked(
+        &self,
+        ids: &[VertexId],
+        budget: Option<&crate::budget::JobBudget>,
+    ) -> Result<bool> {
+        Ok(self.executed.len() <= ids.len()
+            && self.common_executed_prefix_checked(ids, budget)? == self.executed.len())
     }
     /// Public pool and cumulative private burn counters.
     #[must_use]
@@ -1096,6 +1129,96 @@ mod tests {
         state.checkpoint_index = u64::from(count) / 8;
         state.state_digest = state.hash_state();
         (state, ids, rewards)
+    }
+
+    #[test]
+    fn disk_history_state_prefix_hash_delta_and_public_accounting_match_resident_bytes() {
+        // Private ordered-row serializer model, not native work or checkpoints.
+        let (prior, ids, rewards) = ordered_fixture(64);
+        let (next, _, _) = ordered_fixture(72);
+        let expected_hash = prior.hash_state();
+        let expected_delta = next.delta(&prior, &[], false).unwrap();
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic history state serializers")
+            .unwrap();
+        let stored_prior = prior.retain_ledger(&mut store, &budget).unwrap();
+        let stored_next = next.retain_ledger(&mut store, &budget).unwrap();
+        assert_eq!(
+            stored_prior.hash_state_checked(Some(&budget)).unwrap(),
+            expected_hash
+        );
+        assert_eq!(
+            stored_next
+                .delta_checked(&stored_prior, &[], false, Some(&budget))
+                .unwrap(),
+            expected_delta
+        );
+        assert_eq!(
+            stored_prior
+                .common_executed_prefix_checked(&ids, Some(&budget))
+                .unwrap(),
+            64
+        );
+        let mut fork = ids.clone();
+        fork[61] = VertexId::from_bytes([99; 32]);
+        assert_eq!(
+            stored_prior
+                .common_executed_prefix_checked(&fork, Some(&budget))
+                .unwrap(),
+            61
+        );
+        assert!(
+            !stored_prior
+                .executed_prefix_matches_checked(&fork, Some(&budget))
+                .unwrap()
+        );
+        let restored = stored_prior.materialize_ledger(Some(&budget)).unwrap();
+        restored.check_invariants().unwrap();
+        assert_eq!(restored.executed(), ids);
+        assert_eq!(restored.economic_ledger().reward_records, rewards);
+        assert_eq!(
+            restored.public_balance(&[3; 32]),
+            prior.public_balance(&[3; 32])
+        );
+        for (kind, pages) in stored_prior
+            .retained_history_pages()
+            .into_iter()
+            .enumerate()
+        {
+            if kind == 0 {
+                continue;
+            }
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(pages[0])));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(matches!(
+                stored_prior.materialize_ledger(Some(&budget)),
+                Err(Error::Io(_))
+            ));
+            if kind == 1 {
+                assert!(matches!(
+                    stored_prior.hash_state_checked(Some(&budget)),
+                    Err(Error::Io(_))
+                ));
+            } else {
+                assert!(matches!(
+                    stored_prior.common_executed_prefix_checked(&ids, Some(&budget)),
+                    Err(Error::Io(_))
+                ));
+                assert!(matches!(
+                    stored_next.delta_checked(&stored_prior, &[], false, Some(&budget)),
+                    Err(Error::Io(_))
+                ));
+            }
+            std::fs::rename(&held, &path).unwrap();
+        }
+        assert_eq!(store.head(), None);
+        assert_eq!(prior.hash_state(), expected_hash);
     }
 
     #[test]
