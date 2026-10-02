@@ -103,9 +103,9 @@ pub struct BranchState {
     nullifiers: PagedLedgerSet,
     effects: PagedLedgerSet,
     // Share immutable entries across reversible states; do not copy ciphertext history.
-    recovery: Vec<Arc<[u8; RECOVERY_BYTES]>>,
+    recovery: PagedSequence<Arc<[u8; RECOVERY_BYTES]>>,
     // Derived only; NEVER added to current hashes, manifests, deltas or wire bytes.
-    accepted_outputs: Vec<Arc<AcceptedOutputs>>,
+    accepted_outputs: PagedSequence<Arc<AcceptedOutputs>>,
     rewards: PagedSequence<[u8; 112]>,
     pool: u64,
     burned: u64,
@@ -136,6 +136,17 @@ impl BranchState {
         let parameters = g.parameters_id();
         let j = domain_hash("SilkNode-F0-eligible-genesis", &[&domain]);
         let kc = domain_hash("SilkNode-F01-key-carry-genesis", &[&domain, &parameters]);
+        // Same genesis plus two outputs per accepted-effect horizon. No received
+        // page, saved validity or enlarged effect/scanner limit is introduced.
+        let limit = g
+            .recoveries()
+            .len()
+            .checked_add(100_000)
+            .ok_or(Error::Paused("recovery sequence reference horizon"))?;
+        let mut recovery = PagedSequence::new(limit);
+        for entry in g.recoveries() {
+            recovery.push(Arc::new(*entry))?;
+        }
         let mut s = Self {
             domain,
             parameters,
@@ -144,8 +155,8 @@ impl BranchState {
             tree: g.tree().clone(),
             nullifiers: PagedLedgerSet::new(100_000),
             effects: PagedLedgerSet::new(50_000),
-            recovery: g.recoveries().iter().map(|e| Arc::new(*e)).collect(),
-            accepted_outputs: Vec::new(),
+            recovery,
+            accepted_outputs: PagedSequence::new(50_000),
             rewards: PagedSequence::new(crate::sync::HISTORY_LIMIT_V1),
             pool: g.total(),
             burned: 0,
@@ -300,8 +311,10 @@ impl BranchState {
             self.nullifiers.insert(nf)?;
         }
         self.effects.insert(effect)?;
-        self.recovery.extend(entries.into_iter().map(Arc::new));
-        self.accepted_outputs.push(Arc::new(linkage));
+        for entry in entries {
+            self.recovery.push(Arc::new(entry))?;
+        }
+        self.accepted_outputs.push(Arc::new(linkage))?;
         self.pool = next_pool;
         self.burned = next_burned;
         Ok(EffectOutcome::Accepted)
@@ -451,11 +464,13 @@ impl BranchState {
 
     // Conservative cache charge counts shared ciphertexts afresh, so sharing can
     // only reduce actual use; includes collection node/allocator slack.
-    pub(crate) fn cache_charge(&self) -> usize {
+    pub(crate) const fn cache_charge(&self) -> usize {
         8192 + self.recovery.len() * 1024
+            + self.recovery.cache_charge()
             + self.nullifiers.len() * 128
             + self.effects.len() * 128
             + self.accepted_outputs.len() * 192
+            + self.accepted_outputs.cache_charge()
             + self.rewards.cache_charge()
             + self.executed.cache_charge()
             + self.cuts.len() * 256
@@ -566,8 +581,15 @@ impl BranchState {
                     b.extend_from_slice(x);
                 }
             }
-            let added = &self.recovery[prior.recovery.len()..];
-            b.extend_from_slice(&(added.len() as u32).to_le_bytes());
+            let added_len = self
+                .recovery
+                .len()
+                .checked_sub(prior.recovery.len())
+                .ok_or(Error::Unavailable("delta recovery prefix"))?;
+            let added_count =
+                u32::try_from(added_len).map_err(|_| Error::Unavailable("delta recovery count"))?;
+            b.extend_from_slice(&added_count.to_le_bytes());
+            let added = self.recovery.iter_from(prior.recovery.len())?;
             for x in added {
                 b.extend_from_slice(x.as_slice());
             }
@@ -643,15 +665,28 @@ impl BranchState {
         (self.pool, self.burned)
     }
     /// Position-bound ordered recovery history, including genesis.
+    /// Materializes a compatibility view on demand; scanners use ordered reads.
     #[must_use]
     pub fn recovery(&self) -> &[Arc<[u8; RECOVERY_BYTES]>] {
-        &self.recovery
+        self.recovery.as_slice()
+    }
+    pub(crate) const fn recovery_len(&self) -> usize {
+        self.recovery.len()
+    }
+    pub(crate) fn recovery_iter(&self) -> impl Iterator<Item = &Arc<[u8; RECOVERY_BYTES]>> {
+        self.recovery.iter()
+    }
+    pub(crate) fn recovery_entry(&self, position: usize) -> Option<&Arc<[u8; RECOVERY_BYTES]>> {
+        self.recovery.get(position)
     }
     /// Derived accepted-order output linkage. Restored by whole-state rollback and
     /// rebuilt through the reducer on replay, never adopted from received metadata.
     #[must_use]
     pub fn accepted_outputs(&self) -> &[Arc<AcceptedOutputs>] {
-        &self.accepted_outputs
+        self.accepted_outputs.as_slice()
+    }
+    pub(crate) fn accepted_outputs_iter(&self) -> impl Iterator<Item = &Arc<AcceptedOutputs>> {
+        self.accepted_outputs.iter()
     }
     /// Genesis outputs have no retained value commitment for ordinary OVK recovery.
     #[must_use]
@@ -780,6 +815,214 @@ mod tests {
 
     // Synthetic ordered accounting rows, not mined or cryptographically admitted
     // checkpoints. These exercise representation and private core read adapters.
+    // The recovery fixtures below likewise construct private synthetic rows and
+    // accounting only. They are NOT accepted payments, encrypted recovery or a
+    // network/reorganization acceptance experiment.
+    fn append_recovery_rows(state: &mut BranchState, labels: std::ops::RangeInclusive<u16>) {
+        for label in labels {
+            let first_position = state.leaves();
+            for slot in 0..2_u16 {
+                let mut row = [0; RECOVERY_BYTES];
+                row[32..34].copy_from_slice(&label.to_le_bytes());
+                row[34..36].copy_from_slice(&slot.to_le_bytes());
+                let node = Option::<Node>::from(Node::from_bytes([0; 32])).unwrap();
+                state.tree.append(node).unwrap();
+                state.recovery.push(Arc::new(row)).unwrap();
+                state
+                    .nullifiers
+                    .insert(set_key(1000 + label * 2 + slot))
+                    .unwrap();
+            }
+            let effect = set_key(label);
+            state.effects.insert(effect).unwrap();
+            state
+                .accepted_outputs
+                .push(Arc::new(AcceptedOutputs {
+                    effect,
+                    first_position,
+                    commitments: [set_key(label), set_key(label + 100)],
+                }))
+                .unwrap();
+            state.pool -= PRIVATE_BURN_V1;
+            state.burned += PRIVATE_BURN_V1;
+        }
+    }
+    fn recovery_fixture(count: u16) -> BranchState {
+        let (mut state, _, _) = ordered_fixture(64);
+        state.initial_pool = 100;
+        state.pool = 100;
+        append_recovery_rows(&mut state, 1..=count);
+        state.state_digest = state.hash_state();
+        state.check_invariants().unwrap();
+        state
+    }
+
+    #[test]
+    fn paged_recovery_history_views_preserve_positions_and_share_ciphertexts() {
+        let state = recovery_fixture(70);
+        let expected = state.recovery_iter().cloned().collect::<Vec<_>>();
+        let links = state.accepted_outputs_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(expected.len(), 140);
+        assert_eq!(links.len(), 70);
+        for position in [0, 63, 64, 127, 128, 139] {
+            assert!(Arc::ptr_eq(
+                state.recovery_entry(position).unwrap(),
+                &expected[position]
+            ));
+        }
+        assert!(state.recovery_entry(140).is_none());
+        assert!(state.recovery_entry(usize::MAX).is_none());
+        assert!(!state.recovery.is_materialized());
+        assert!(!state.accepted_outputs.is_materialized());
+        let charge = state.cache_charge();
+        assert_eq!(state.recovery(), expected);
+        assert_eq!(state.accepted_outputs(), links);
+        assert_eq!(state.cache_charge(), charge);
+        let cloned = state.clone();
+        cloned.check_invariants().unwrap();
+        assert!(!cloned.recovery.is_materialized());
+        assert!(!cloned.accepted_outputs.is_materialized());
+        assert!(Arc::ptr_eq(
+            cloned.recovery_entry(64).unwrap(),
+            &expected[64]
+        ));
+        assert_eq!(cloned.manifest(), state.manifest());
+    }
+
+    #[test]
+    fn paged_recovery_history_state_hash_and_both_deltas_match_flat_bytes() {
+        let prior = recovery_fixture(64);
+        let original = prior.manifest();
+        let mut next = prior.clone();
+        append_recovery_rows(&mut next, 65..=70);
+        let (_, ids, rewards) = ordered_fixture(72);
+        for (id, reward) in ids[64..].iter().zip(&rewards[64..]) {
+            next.executed.push(*id).unwrap();
+            next.rewards.push(*reward).unwrap();
+        }
+        next.issued = 720;
+        next.checkpoint_index = 9;
+        next.checkpoint_id = [9; 32];
+        next.state_digest = next.hash_state();
+        next.check_invariants().unwrap();
+        let flat = next.recovery_iter().cloned().collect::<Vec<_>>();
+        let nf = hash_stream(
+            "SilkNode-F0-NF",
+            &next.domain,
+            next.nullifiers.len(),
+            next.nullifiers.iter().map(|x| x.as_slice()),
+        );
+        let ef = hash_stream(
+            "SilkNode-F0-EF",
+            &next.domain,
+            next.effects.len(),
+            next.effects.iter().map(|x| x.as_slice()),
+        );
+        let rh = hash_stream(
+            "SilkNode-F0-recovery-history",
+            &next.domain,
+            flat.len(),
+            flat.iter().map(|row| row.as_slice()),
+        );
+        let pr = hash_stream(
+            "SilkNode-F0-public-rewards",
+            &next.domain,
+            rewards.len(),
+            rewards.iter().map(|row| row.as_slice()),
+        );
+        let expected = domain_hash(
+            "SilkNode-F0-state",
+            &[
+                &next.domain,
+                &next.root(),
+                &140_u64.to_le_bytes(),
+                &nf,
+                &ef,
+                &30_u64.to_le_bytes(),
+                &70_u64.to_le_bytes(),
+                &rh,
+                &pr,
+                &720_u128.to_le_bytes(),
+            ],
+        );
+        assert_eq!(next.hash_state(), expected);
+        let mut delta = Vec::from(b"SNF04DL1\0\0\0\0\0\0\0\0".as_slice());
+        delta.extend_from_slice(&prior.checkpoint_id);
+        delta.extend_from_slice(&next.checkpoint_id);
+        delta.extend_from_slice(&0_u32.to_le_bytes());
+        for (new, old) in [
+            (&next.nullifiers, &prior.nullifiers),
+            (&next.effects, &prior.effects),
+        ] {
+            let added = new.difference(old).collect::<Vec<_>>();
+            delta.extend_from_slice(&u32::try_from(added.len()).unwrap().to_le_bytes());
+            for row in added {
+                delta.extend_from_slice(row);
+            }
+        }
+        delta.extend_from_slice(&12_u32.to_le_bytes());
+        for row in &flat[128..] {
+            delta.extend_from_slice(row.as_slice());
+        }
+        for row in &rewards[64..] {
+            delta.extend_from_slice(row);
+        }
+        assert_eq!(next.delta(&prior, &[], false).unwrap(), delta);
+        let mut rollback = Vec::from(b"SNF04DL1\x01\0\0\0\0\0\0\0".as_slice());
+        rollback.extend_from_slice(&next.checkpoint_id);
+        rollback.extend_from_slice(&prior.checkpoint_id);
+        rollback.extend_from_slice(&0_u32.to_le_bytes());
+        for state in [&next, &prior] {
+            let manifest = state.manifest();
+            rollback.extend_from_slice(&u32::try_from(manifest.len()).unwrap().to_le_bytes());
+            rollback.extend_from_slice(&manifest);
+        }
+        assert_eq!(prior.delta(&next, &[], true).unwrap(), rollback);
+        assert!(!next.recovery.is_materialized());
+        assert!(!next.accepted_outputs.is_materialized());
+        assert_eq!(prior.manifest(), original);
+        assert_eq!(prior.recovery_len(), 128);
+        assert_eq!(prior.accepted_outputs_iter().count(), 64);
+    }
+
+    #[test]
+    fn paged_recovery_history_witness_matches_flat_tree_without_materializing() {
+        use sapling_crypto::IncrementalWitness;
+        let mut state = recovery_fixture(70);
+        state.cuts[0] = Cut::new(&state.domain, 0, state.prefix, state.root(), state.leaves());
+        let cut = state.cuts[0].clone();
+        let flat = state.recovery_iter().cloned().collect::<Vec<_>>();
+        for position in [0, 63, 64, 127, 139] {
+            let mut tree = CommitmentTree::empty();
+            let mut witness = None;
+            for (index, row) in flat.iter().enumerate() {
+                let node =
+                    Option::<Node>::from(Node::from_bytes(row[..32].try_into().unwrap())).unwrap();
+                tree.append(node).unwrap();
+                if let Some(w) = witness.as_mut() {
+                    IncrementalWitness::append(w, node).unwrap();
+                }
+                if index == position {
+                    witness = IncrementalWitness::from_tree(tree.clone());
+                }
+            }
+            let actual = crate::scanner::witness_at_cut(&state, &cut, position as u64).unwrap();
+            assert_eq!(actual, witness.unwrap().path().unwrap());
+            assert_eq!(
+                actual
+                    .root(Option::<Node>::from(Node::from_bytes([0; 32])).unwrap())
+                    .to_bytes(),
+                cut.root
+            );
+        }
+        assert!(crate::scanner::witness_at_cut(&state, &cut, 140).is_err());
+        let mut changed = cut.clone();
+        changed.root = [9; 32];
+        assert!(crate::scanner::witness_at_cut(&state, &changed, 0).is_err());
+        assert!(!state.recovery.is_materialized());
+        assert!(!state.accepted_outputs.is_materialized());
+    }
+
     fn ordered_fixture(count: u16) -> (BranchState, Vec<VertexId>, Vec<[u8; 112]>) {
         let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
         let mut state = BranchState::genesis(&genesis).unwrap();

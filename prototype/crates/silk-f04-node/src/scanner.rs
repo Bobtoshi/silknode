@@ -34,8 +34,8 @@ impl CompleteScan {
 }
 
 fn check_range(state: &BranchState) -> Result<()> {
-    if state.recovery().len() > MAX_OUTPUTS
-        || state.recovery().len() as u64 != state.leaves()
+    if state.recovery_len() > MAX_OUTPUTS
+        || state.recovery_len() as u64 != state.leaves()
         || state.genesis_leaves() > state.leaves()
         || state.eligible_cut().leaves > state.leaves()
     {
@@ -137,7 +137,7 @@ pub fn visit_incoming(
 ) -> Result<CompleteScan> {
     check_range(state)?;
     let mut matched = 0;
-    for (position, entry) in state.recovery().iter().enumerate() {
+    for (position, entry) in state.recovery_iter().enumerate() {
         let output = RecoveryOutput::decode(**entry)?;
         if let Some((note, address, memo)) = output.decrypt_ivk(ivk) {
             let position = position as u64;
@@ -187,7 +187,7 @@ pub fn visit_outgoing(
     check_range(state)?;
     let mut position = state.genesis_leaves();
     let mut matched = 0;
-    for row in state.accepted_outputs() {
+    for row in state.accepted_outputs_iter() {
         if row.first_position != position || !state.contains_effect(&row.effect) {
             return Err(Error::Unavailable("complete outgoing linkage order"));
         }
@@ -195,8 +195,7 @@ pub fn visit_outgoing(
             let index = usize::try_from(position)
                 .map_err(|_| Error::Unavailable("outgoing position overflow"))?;
             let entry = state
-                .recovery()
-                .get(index)
+                .recovery_entry(index)
                 .ok_or(Error::Unavailable("incomplete outgoing recovery range"))?;
             let output = RecoveryOutput::decode(**entry)?;
             if let Some((note, address, memo)) = output.recover_outgoing(ovk, commitment)? {
@@ -246,7 +245,7 @@ pub fn visit(
     let ivk = PreparedIncomingViewingKey::new(&fvk.vk.ivk());
     let mut matched = 0;
     let cut = state.eligible_cut();
-    for (position, entry) in state.recovery().iter().enumerate() {
+    for (position, entry) in state.recovery_iter().enumerate() {
         let output = RecoveryOutput::decode(**entry)?;
         if let Some((note, address, memo)) = output.decrypt_ivk(&ivk) {
             let position = position as u64;
@@ -290,12 +289,9 @@ pub fn witness_at_cut(state: &BranchState, cut: &Cut, position: u64) -> Result<M
     }
     let mut tree = CommitmentTree::empty();
     let mut witness: Option<IncrementalWitness> = None;
-    for (i, entry) in state
-        .recovery()
-        .iter()
-        .take(cut.leaves as usize)
-        .enumerate()
-    {
+    let leaves =
+        usize::try_from(cut.leaves).map_err(|_| Error::Unavailable("witness range overflow"))?;
+    for (i, entry) in state.recovery_iter().take(leaves).enumerate() {
         let node = Option::<Node>::from(Node::from_bytes(
             entry[..32].try_into().expect("fixed recovery"),
         ))

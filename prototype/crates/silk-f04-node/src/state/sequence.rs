@@ -44,6 +44,15 @@ impl<T: Clone> PagedSequence<T> {
     pub(super) const fn len(&self) -> usize {
         self.len
     }
+    pub(super) fn get(&self, index: usize) -> Option<&T> {
+        self.pages
+            .get(index / PAGE_ITEMS)?
+            .items
+            .get(index % PAGE_ITEMS)
+    }
+    pub(super) fn last(&self) -> Option<&T> {
+        self.pages.last()?.items.last()
+    }
     pub(super) fn push(&mut self, value: T) -> Result<()> {
         if self.len >= self.limit {
             return Err(Error::Paused("paged ledger sequence reference horizon"));
@@ -108,6 +117,31 @@ impl<T: Clone> PagedSequence<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_recovery_history_indexed_reads_and_last_never_flatten() {
+        let mut sequence = PagedSequence::new(130);
+        assert!(sequence.get(0).is_none());
+        assert!(sequence.last().is_none());
+        let expected = (0..130_u16).map(Arc::new).collect::<Vec<_>>();
+        for value in &expected {
+            sequence.push(value.clone()).unwrap();
+        }
+        for position in [0, 1, 63, 64, 65, 127, 128, 129] {
+            assert!(Arc::ptr_eq(
+                sequence.get(position).unwrap(),
+                &expected[position]
+            ));
+        }
+        assert!(sequence.get(130).is_none());
+        assert!(sequence.get(usize::MAX).is_none());
+        assert!(Arc::ptr_eq(sequence.last().unwrap(), &expected[129]));
+        assert!(!sequence.is_materialized());
+        let cloned = sequence.clone();
+        assert!(Arc::ptr_eq(&sequence.pages[0], &cloned.pages[0]));
+        assert!(Arc::ptr_eq(&sequence.pages[1], &cloned.pages[1]));
+        assert!(!cloned.is_materialized());
+    }
 
     #[test]
     fn paged_ledger_sequence_order_suffix_and_compatibility_match_vec() {
