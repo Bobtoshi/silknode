@@ -44,6 +44,9 @@ impl<T: Clone> PagedSequence<T> {
     pub(super) const fn len(&self) -> usize {
         self.len
     }
+    pub(super) const fn limit(&self) -> usize {
+        self.limit
+    }
     pub(super) fn get(&self, index: usize) -> Option<&T> {
         self.pages
             .get(index / PAGE_ITEMS)?

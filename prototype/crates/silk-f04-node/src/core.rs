@@ -76,6 +76,10 @@ pub(crate) struct Step {
 }
 
 impl Core {
+    #[cfg(test)]
+    pub(crate) fn retained_history_for_test(&self) -> impl Iterator<Item = &Arc<BranchState>> {
+        self.history.iter()
+    }
     pub fn new(genesis: Arc<Genesis>, clock: LocalClock) -> Result<Self> {
         let graph = Graph::default();
         let state = Arc::new(BranchState::genesis(&genesis)?);
@@ -250,6 +254,9 @@ impl Core {
                 .max_by_key(|s| s.executed_len())
                 .cloned()
                 .unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
+            // A cached reversible snapshot is not permission to publish a
+            // rollback whose original recovery pages are now unreadable.
+            let state = Arc::new(state.materialize_recovery(Some(budget))?);
             let status = if status_for(&state, ids) == Status::Ready {
                 Status::Ready
             } else if self.status == Status::ArchiveReplay {

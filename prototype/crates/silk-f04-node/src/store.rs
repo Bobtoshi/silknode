@@ -1,6 +1,9 @@
 //! Task-owned, append-only content store and atomic single-head publication.
 //! Unreachable files are retained/accounted, never promoted or garbage-collected.
-use crate::{Digest, Error, Result, wire::raw_hash};
+use crate::{
+    Digest, Error, Result,
+    wire::{raw_hash, u32le},
+};
 use rand_core::{OsRng, RngCore};
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
@@ -281,6 +284,64 @@ impl Store {
             // Never classify a failed new auxiliary write as old HEAD damage.
             Err(_) => Err(Error::Unavailable(
                 "retained ancestry page publication failed",
+            )),
+        }
+    }
+    /// Derived encrypted recovery rows ONLY inside a fenced verified transition.
+    /// No head/pointer changes or persistent validity constructor are installed.
+    pub(crate) fn retain_recovery_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        const HEADER: usize = 52;
+        let rows = if bytes.len() >= HEADER {
+            u32le(bytes, 48)? as usize
+        } else {
+            0
+        };
+        if !(1..=64).contains(&rows)
+            || bytes.get(..8) != Some(b"SNF04RP1")
+            || bytes.len() != HEADER + rows * silk_sapling_f04::codec::RECOVERY_BYTES
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "recovery page requires active verified transition",
+            ));
+        }
+        let was_poisoned = self.poisoned;
+        if was_poisoned && self.active_replay()?.is_none() {
+            return Err(Error::Unavailable("recovery page writer stopped"));
+        }
+        let id = raw_hash(bytes);
+        match self.object(id) {
+            Ok(existing) if existing == bytes => return Ok(id),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                self.poisoned = true;
+                return Err(Error::Unavailable("retained recovery page damaged"));
+            }
+        }
+        self.poisoned = false;
+        let charged = charge(bytes.len() as u64) + 2 * 4096;
+        let reserved = self.reserve(charged);
+        self.poisoned = was_poisoned;
+        reserved?;
+        self.used += charged;
+        self.poisoned = true;
+        let result = (|| {
+            let id = self.put(bytes)?;
+            self.directory.sync_all()?;
+            if fs2::available_space(&self.margin)? < MARGIN {
+                return Err(Error::Paused("post-recovery-page host margin"));
+            }
+            Ok(id)
+        })();
+        match result {
+            Ok(id) => {
+                self.poisoned = was_poisoned;
+                Ok(id)
+            }
+            // Uncertain auxiliary writes must never trigger previous-head
+            // fallback in this attempt. Original complete lineage stays intact.
+            Err(_) => Err(Error::Unavailable(
+                "retained recovery page publication failed",
             )),
         }
     }

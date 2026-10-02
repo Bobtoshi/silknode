@@ -1,11 +1,13 @@
 //! One checkpoint reducer shared by canonical execution and parent-prefix replay.
 //! A cut is a reversible prefix reference, never a finality certificate.
+mod recovery;
 mod sequence;
 mod sets;
 use crate::economics::{
     CREDIT_MATURITY_V1, EconomicCountsV1, EconomicLedgerV1, PRIVATE_BURN_V1, PUBLIC_CREDIT_V1,
 };
 use crate::{Digest, Error, Result, genesis::Genesis, graph::VerifiedVertex, wire::raw_hash};
+use recovery::RecoveryHistory;
 use sapling_crypto::{CommitmentTree, Node};
 use sequence::PagedSequence;
 use sets::PagedLedgerSet;
@@ -103,7 +105,7 @@ pub struct BranchState {
     nullifiers: PagedLedgerSet,
     effects: PagedLedgerSet,
     // Share immutable entries across reversible states; do not copy ciphertext history.
-    recovery: PagedSequence<Arc<[u8; RECOVERY_BYTES]>>,
+    recovery: RecoveryHistory,
     // Derived only; NEVER added to current hashes, manifests, deltas or wire bytes.
     accepted_outputs: PagedSequence<Arc<AcceptedOutputs>>,
     rewards: PagedSequence<[u8; 112]>,
@@ -143,7 +145,7 @@ impl BranchState {
             .len()
             .checked_add(100_000)
             .ok_or(Error::Paused("recovery sequence reference horizon"))?;
-        let mut recovery = PagedSequence::new(limit);
+        let mut recovery = RecoveryHistory::new(limit);
         for entry in g.recoveries() {
             recovery.push(Arc::new(*entry))?;
         }
@@ -196,7 +198,7 @@ impl BranchState {
         budget: &crate::budget::JobBudget,
     ) -> Result<CheckpointTransition> {
         budget.check()?;
-        let mut next = self.clone();
+        let mut next = self.materialize_recovery(Some(budget))?;
         let j = self
             .checkpoint_index
             .checked_add(1)
@@ -406,11 +408,12 @@ impl BranchState {
             budget,
         )?;
         check()?;
+        let recovery = self.recovery.materialize(budget)?;
         let rh = hash_stream_checked(
             "SilkNode-F0-recovery-history",
             &self.domain,
             self.recovery.len(),
-            self.recovery.iter().map(|x| x.as_slice()),
+            recovery.iter().map(|x| x.as_slice()),
             budget,
         )?;
         check()?;
@@ -589,7 +592,8 @@ impl BranchState {
             let added_count =
                 u32::try_from(added_len).map_err(|_| Error::Unavailable("delta recovery count"))?;
             b.extend_from_slice(&added_count.to_le_bytes());
-            let added = self.recovery.iter_from(prior.recovery.len())?;
+            let recovery = self.recovery.materialize(None)?;
+            let added = recovery.resident().iter_from(prior.recovery.len())?;
             for x in added {
                 b.extend_from_slice(x.as_slice());
             }
@@ -600,6 +604,27 @@ impl BranchState {
         Ok(b)
     }
 
+    pub(crate) fn materialize_recovery(
+        &self,
+        budget: Option<&crate::budget::JobBudget>,
+    ) -> Result<Self> {
+        let mut state = self.clone();
+        state.recovery = self.recovery.materialize(budget)?;
+        Ok(state)
+    }
+    pub(crate) fn retain_recovery(
+        &self,
+        store: &mut crate::store::Store,
+        budget: &crate::budget::JobBudget,
+    ) -> Result<Self> {
+        let mut state = self.clone();
+        state.recovery = self.recovery.retain(store, self.domain, budget)?;
+        Ok(state)
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_recovery_pages(&self) -> Vec<Digest> {
+        self.recovery.retained_ids()
+    }
     /// Canonical next-checkpoint maturity (not finality).
     #[must_use]
     pub fn eligible_cut(&self) -> &Cut {

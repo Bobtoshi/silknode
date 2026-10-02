@@ -56,7 +56,94 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.private_counters(), (58, 2));
     assert_eq!(node.core.state.leaves(), 7);
     let completed = node.core.state.clone();
+    assert_eq!(completed.retained_recovery_pages().len(), 1);
+    assert!(node.state_view.get().is_none());
+    let snapshot = node.state().unwrap().clone();
+    assert!(snapshot.retained_recovery_pages().is_empty());
+    assert_eq!(snapshot.recovery().len(), 7);
+    assert_eq!(snapshot.manifest(), completed.manifest());
+    // Public snapshots remain resident and safely cloneable. Clearing this
+    // test-only view simulates a first snapshot request, which must report I/O
+    // rather than mint a fallback. Existing immutable snapshots remain valid.
+    let recovery_path = root.join(format!(
+        "{}.obj",
+        hex::encode(completed.retained_recovery_pages()[0])
+    ));
+    let recovery_held = recovery_path.with_extension("held");
+    fs::rename(&recovery_path, &recovery_held).unwrap();
+    node.state_view.take();
+    assert!(matches!(node.state(), Err(Error::Io(_))));
+    assert!(node.state_view.get().is_none());
+    assert_eq!(snapshot.recovery().len(), 7);
+    assert_eq!(node.core.state.manifest(), completed.manifest());
+    assert_eq!(node.local_head().unwrap(), pin);
+    fs::rename(&recovery_held, &recovery_path).unwrap();
     let ids = node.core.order.eligible_order().to_vec();
+    let prior = node
+        .core
+        .retained_history_for_test()
+        .find(|state| state.checkpoint_index() == 1)
+        .unwrap()
+        .clone();
+    assert_eq!(prior.retained_recovery_pages().len(), 1);
+    let second_bodies = ids[8..16]
+        .iter()
+        .map(|id| {
+            node.core
+                .graph
+                .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let batch: [&crate::graph::VerifiedVertex; 8] = second_bodies
+        .iter()
+        .map(Arc::as_ref)
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()
+        .unwrap();
+    let replayed = prior
+        .execute(batch, &JobBudget::checkpoint().unwrap())
+        .unwrap();
+    assert_eq!(replayed.state.manifest(), completed.manifest());
+    // Scratch rollback uses genuine retained state and receiver parent order;
+    // it is not native fork/reorg admission or durable checkpoint publication.
+    let complete_order = node.core.order.clone();
+    node.core.order = node
+        .core
+        .graph
+        .parent_order(
+            &Sg0ParentSetV1::vertices(vec![ids[7]]).unwrap(),
+            &JobBudget::checkpoint().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(node.core.order.eligible_order().len(), 8);
+    node.core.status = Status::NeedsReconcile;
+    let rollback = node
+        .core
+        .prepare_step(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    assert!(rollback.rollback);
+    assert_eq!(rollback.state.manifest(), prior.manifest());
+    let prior_page = root.join(format!(
+        "{}.obj",
+        hex::encode(prior.retained_recovery_pages()[0])
+    ));
+    let prior_held = prior_page.with_extension("held");
+    fs::rename(&prior_page, &prior_held).unwrap();
+    assert!(matches!(
+        prior.execute(batch, &JobBudget::checkpoint().unwrap()),
+        Err(Error::Io(_))
+    ));
+    assert!(matches!(
+        node.core.prepare_step(&JobBudget::checkpoint().unwrap()),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(node.core.state.manifest(), completed.manifest());
+    assert_eq!(node.local_head().unwrap(), pin);
+    fs::rename(&prior_held, &prior_page).unwrap();
+    node.core.order = complete_order;
+    node.core.status = Status::Ready;
     let exports = node.export_range(0, 32).unwrap();
     assert_eq!(exports.len(), 16);
     let mut representations = 0;
@@ -164,12 +251,29 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.local_head().unwrap(), pin);
     fs::rename(&held, &path).unwrap();
     assert_eq!(node.export_range(0, 32).unwrap(), exports);
+    let accepted_genesis = node.core.genesis.as_ref().clone();
     drop(node);
+    // A damaged auxiliary page is NOT damaged original HEAD lineage. A fresh
+    // reopen must stop, never fall back to PREVIOUS and expose an older ledger.
+    let recovery_bytes = fs::read(&recovery_path).unwrap();
+    let mut damaged = recovery_bytes.clone();
+    *damaged.last_mut().unwrap() ^= 1;
+    fs::write(&recovery_path, damaged).unwrap();
+    assert!(matches!(
+        Node::open_retained_pinned(&root, &margin, accepted_genesis, &parameters, pin),
+        Err(Error::Unavailable("retained recovery page damaged"))
+    ));
+    assert_eq!(
+        fs::read(root.join("HEAD")).unwrap(),
+        hex::encode(pin).as_bytes()
+    );
+    assert!(root.join("ACTIVE_REPLAY").exists());
+    fs::write(&recovery_path, recovery_bytes).unwrap();
     for (name, hash) in original {
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; recovery_history_disk_backed=true; public_snapshot_resident=true; missing_recovery_refuses_first_snapshot_execution_and_scratch_rollback=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
     );
 }
 

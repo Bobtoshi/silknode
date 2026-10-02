@@ -23,7 +23,7 @@ use silk_sapling_f04::parameters::SaplingParameters;
 use silk_types::VertexId;
 use std::{
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +48,9 @@ pub struct Node {
     faulted: bool,
     recovered_previous: bool,
     pending: Option<PendingAdmission>,
+    // Successful explicitly requested public snapshot ONLY. Core/caches keep
+    // disk-backed recovery directories; an I/O failure is never cached as state.
+    state_view: OnceLock<(Digest, BranchState)>,
 }
 // Field order joins the worker before native timers are disarmed on every exit.
 struct PendingAdmission {
@@ -79,6 +82,7 @@ impl Node {
             faulted: false,
             recovered_previous: false,
             pending: None,
+            state_view: OnceLock::new(),
         };
         let data = genesis_material(&node.core.genesis);
         node.commit(
@@ -256,6 +260,7 @@ impl Node {
             faulted: false,
             recovered_previous,
             pending: None,
+            state_view: OnceLock::new(),
         })
     }
 
@@ -318,12 +323,13 @@ impl Node {
                     core.publish(a)?
                 }
                 2 | 3 if index > 0 => {
-                    let s = core.prepare_step(&budget)?;
+                    let mut s = core.prepare_step(&budget)?;
                     if (r.kind == 3) != s.rollback
                         || s.state.delta(&core.state, &s.outcomes, s.rollback)? != data
                     {
                         return Err(Error::Unavailable("retained reversible delta mismatch"));
                     }
+                    s.state = Arc::new(s.state.retain_recovery(store, &budget)?);
                     core.publish_step(s)?;
                     budget
                 }
@@ -369,13 +375,30 @@ impl Node {
         Ok(self.core.status)
     }
     /// Only a complete reconciled ledger is exposed as current.
+    /// Recovery rows are checked and materialized once per checkpoint for this
+    /// immutable compatibility view. Repeated borrows reuse that snapshot;
+    /// execution and rollback independently load their retained recovery pages.
     pub fn state(&self) -> Result<&BranchState> {
         self.healthy()?;
         self.idle()?;
         if self.core.status != Status::Ready {
             return Err(Error::Paused("state reconciliation incomplete"));
         }
-        Ok(&self.core.state)
+        let checkpoint = self.core.state.checkpoint_id();
+        if self.state_view.get().is_none() {
+            let budget = JobBudget::checkpoint()?;
+            let state = self.core.state.materialize_recovery(Some(&budget))?;
+            budget.check()?;
+            let _ = self.state_view.set((checkpoint, state));
+        }
+        let (view_checkpoint, state) = self
+            .state_view
+            .get()
+            .ok_or(Error::Unavailable("materialized state view absent"))?;
+        if *view_checkpoint != checkpoint {
+            return Err(Error::Unavailable("stale materialized state view"));
+        }
+        Ok(state)
     }
     /// Exact public genesis context, never spending/viewing material.
     #[must_use]
@@ -601,7 +624,7 @@ impl Node {
         let job_id = self.begin_foreground_job(&marker)?;
         let result = (|| {
             let mut guard = NativeGuard::arm(&budget)?;
-            let step = self.core.prepare_step(&budget)?;
+            let mut step = self.core.prepare_step(&budget)?;
             let data = step
                 .state
                 .delta(&self.core.state, &step.outcomes, step.rollback)?;
@@ -614,6 +637,8 @@ impl Node {
                 self.core.graph.len() as u64,
                 step.status,
             )?;
+            step.state = Arc::new(step.state.retain_recovery(&mut self.store, &budget)?);
+            self.state_view.take();
             self.core.publish_step(step)?;
             budget.check()?;
             // Final cooperative decision precedes terminal closure. A completed
