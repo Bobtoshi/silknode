@@ -191,7 +191,7 @@ impl PrefixCache {
             let end = s * 8;
             // A source MUST be reconstructed, including its full own ledger/cuts,
             // before any claim that it is unusable; a cache miss never skips it.
-            let derived = self.reconstruct(graph, &e[..end], &js[..=end], budget)?;
+            let derived = self.reconstruct(graph, &e[..end], &js[..=end], g, budget)?;
             let mut frontier = Vec::with_capacity(4);
             for id in e[..end].iter().rev() {
                 budget.probe()?;
@@ -274,6 +274,7 @@ impl PrefixCache {
         graph: &Graph,
         ids: &[VertexId],
         js: &[Digest],
+        genesis: &Genesis,
         budget: &JobBudget,
     ) -> Result<Arc<BranchState>> {
         let mut state = self
@@ -293,12 +294,15 @@ impl PrefixCache {
             let start = state.executed_len();
             let batch = ids[start..start + 8]
                 .iter()
-                .map(|id| graph.get_for_execution(*id, budget))
+                .map(|id| graph.load_for_execution(*id, genesis, budget))
                 .collect::<Result<Vec<_>>>()?;
             state = Arc::new(
                 state
                     .execute(
                         batch
+                            .iter()
+                            .map(Arc::as_ref)
+                            .collect::<Vec<_>>()
                             .try_into()
                             .map_err(|_| Error::Unavailable("source replay batch"))?,
                         budget,
@@ -329,7 +333,7 @@ pub(crate) fn replay_source_for_test(
             id.into_bytes(),
         ));
     }
-    cache.reconstruct(graph, ids, &js, budget)
+    cache.reconstruct(graph, ids, &js, genesis, budget)
 }
 
 fn mtp(graph: &Graph, e: &[VertexId], i: usize) -> Result<u64> {

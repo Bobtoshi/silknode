@@ -110,6 +110,23 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
     assert_eq!(node.core.graph.len(), 8);
     let completed = node.core.state.clone();
     let ids = node.core.order.eligible_order().to_vec();
+    for id in &ids {
+        let loaded = node
+            .core
+            .graph
+            .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
+            .unwrap();
+        let resident = node.core.graph.get(*id).unwrap();
+        assert!(!std::ptr::eq(loaded.as_ref(), resident));
+        assert_eq!(
+            loaded.retained_record().unwrap(),
+            resident.retained_record().unwrap()
+        );
+        assert_eq!(loaded.envelopes().len(), resident.envelopes().len());
+        for (a, b) in loaded.envelopes().iter().zip(resident.envelopes()) {
+            assert_eq!(a.envelope().bytes(), b.envelope().bytes());
+        }
+    }
     // Scratch reconstruction exercises the real reducers over genuine records;
     // it is not a new live transition, native reorg, mined history or cap evidence.
     node.core.state = Arc::new(BranchState::genesis(&node.core.genesis).unwrap());
@@ -165,6 +182,6 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=8; full_replay=true; checkpoint_and_parent_scratch_exact=true; missing_source_refuses_both=true; resident_fallback=false; no_publication=true; native_reorg=false; source_bytes_unchanged=true; mined=0"
+        "retained_vertices=8; full_replay=true; owned_disk_bodies=true; checkpoint_and_parent_scratch_exact=true; missing_source_refuses_both=true; resident_fallback=false; no_publication=true; native_reorg=false; source_bytes_unchanged=true; mined=0"
     );
 }

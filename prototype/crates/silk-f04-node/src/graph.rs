@@ -34,6 +34,7 @@ pub struct VerifiedVertex {
     retained_source: Option<RetainedSource>,
 }
 /// Live receiver-derived source binding, never serialized or imported as validity.
+#[derive(Clone)]
 struct RetainedSource {
     id: Digest,
     record_len: usize,
@@ -231,28 +232,62 @@ impl Graph {
             .map(|i| self.vertices[*i].as_ref())
             .ok_or(Error::Unavailable("missing admitted vertex"))
     }
-    /// Internal reducer dependency read. A durable node must still possess the
-    /// exact original source, even while its verified body remains resident.
-    /// Default standalone graphs retain their existing borrowed resident API.
-    pub(crate) fn get_for_execution(
+    /// Owned execution body loaded from exact durable bytes. This is NOT new
+    /// admission: the complete candidate must equal this live receiver's already
+    /// verified candidate before its existing typed crypto capabilities are used.
+    /// Cold reopen still performs the original complete fresh verification.
+    pub(crate) fn load_for_execution(
         &self,
         id: VertexId,
+        genesis: &Genesis,
         budget: &JobBudget,
-    ) -> Result<&VerifiedVertex> {
+    ) -> Result<Arc<VerifiedVertex>> {
         budget.check()?;
-        let vertex = self.get(id)?;
-        if let Some(reader) = &self.ancestry_reader {
-            let source = vertex
-                .retained_source
-                .as_ref()
-                .ok_or(Error::Unavailable("verified durable source binding absent"))?;
-            budget.source()?;
-            // The live binding was established from the complete exact record.
-            // No saved page/flag or decoded peer record constructs a capability.
-            reader.objects().object(source.id, source.record_len)?;
-            budget.check()?;
+        let index = *self
+            .index
+            .get(&id)
+            .ok_or(Error::Unavailable("missing admitted vertex"))?;
+        let vertex = &self.vertices[index];
+        let Some(reader) = &self.ancestry_reader else {
+            return Ok(vertex.clone());
+        };
+        let source = vertex
+            .retained_source
+            .as_ref()
+            .ok_or(Error::Unavailable("verified durable source binding absent"))?;
+        budget.source()?;
+        let bytes = reader.objects().object(source.id, source.record_len)?;
+        let end = 12_usize
+            .checked_add(source.candidate_len)
+            .ok_or(Error::Unavailable("retained execution length"))?;
+        if bytes.len() != source.record_len
+            || bytes.get(..8) != Some(b"SNF04VR1")
+            || u32le(&bytes, 8)? as usize != source.candidate_len
+        {
+            return Err(Error::Unavailable("retained execution framing"));
         }
-        Ok(vertex)
+        let candidate = Candidate::decode(
+            bytes
+                .get(12..end)
+                .ok_or(Error::Unavailable("retained execution candidate"))?,
+            genesis,
+        )?;
+        // Exact bytes, not just decoded IDs or saved verification metadata. The
+        // typed proof capabilities remain bound to the same ordered envelopes.
+        if candidate.encode() != vertex.candidate.encode() {
+            return Err(Error::Unavailable(
+                "live verified execution source mismatch",
+            ));
+        }
+        budget.check()?;
+        Ok(Arc::new(VerifiedVertex {
+            candidate,
+            envelopes: vertex.envelopes.clone(),
+            facts: vertex.facts.clone(),
+            metadata: vertex.metadata.clone(),
+            ancestors: vertex.ancestors.clone(),
+            retained_source: vertex.retained_source.clone(),
+        }))
     }
     pub(crate) fn order(&self, budget: &JobBudget) -> Result<Sg0OrderSnapshotV1> {
         Ok(derive_virtual_order_chain_fast_v1(&View {
@@ -679,18 +714,11 @@ mod tests {
         assert_eq!(graph.export_retained_range(0, 3).unwrap(), expected);
     }
     #[test]
-    fn disk_execution_resident_body_never_substitutes_missing_durable_source() {
+    fn disk_owned_execution_missing_source_is_io_and_resident_adapter_stays_borrowable() {
         let (temp, mut store) = crate::store::ancestry_test_store();
         let budget = JobBudget::checkpoint().unwrap();
         let graph = source_graph(&mut store, &budget);
-        assert_eq!(
-            graph
-                .get_for_execution(id(3), &budget)
-                .unwrap()
-                .candidate()
-                .id,
-            id(3).into_bytes()
-        );
+        let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
         let source = graph
             .vertices
             .last()
@@ -704,13 +732,23 @@ mod tests {
             .join(format!("{}.obj", hex::encode(source.id)));
         let held = path.with_extension("held");
         std::fs::rename(&path, &held).unwrap();
-        assert!(graph.get_for_execution(id(3), &budget).is_err());
+        assert!(matches!(
+            graph.load_for_execution(id(3), &genesis, &budget),
+            Err(Error::Io(_))
+        ));
         assert!(graph.get(id(3)).is_ok());
         assert_eq!(graph.len(), 3);
         std::fs::rename(&held, &path).unwrap();
-        assert!(graph.get_for_execution(id(3), &budget).is_ok());
         let resident = diamond(&budget);
-        assert!(resident.get_for_execution(id(4), &budget).is_ok());
+        let loaded = resident
+            .load_for_execution(id(4), &genesis, &budget)
+            .unwrap();
+        assert!(std::ptr::eq(loaded.as_ref(), resident.get(id(4)).unwrap()));
+        assert!(
+            resident
+                .load_for_execution(id(9), &genesis, &budget)
+                .is_err()
+        );
     }
     fn disk_diamond(store: &mut crate::store::Store, budget: &JobBudget) -> Graph {
         let mut graph = Graph::default();

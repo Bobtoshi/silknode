@@ -272,10 +272,13 @@ impl Core {
             .ok_or(Error::Unavailable("incomplete replay interval"))?;
         let verified = batch
             .iter()
-            .map(|id| self.graph.get_for_execution(*id, budget))
+            .map(|id| self.graph.load_for_execution(*id, &self.genesis, budget))
             .collect::<Result<Vec<_>>>()?;
         let t = self.state.execute(
             verified
+                .iter()
+                .map(Arc::as_ref)
+                .collect::<Vec<_>>()
                 .try_into()
                 .map_err(|_| Error::Unavailable("checkpoint shape"))?,
             budget,
