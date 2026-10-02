@@ -36,9 +36,86 @@ pub struct GraphInfo {
     id: Digest,
     header: Header,
     facts: ParentFacts,
-    metadata: Option<Sg0VertexDataV1>,
+    metadata: Option<Metadata>,
     ancestors: PagedAncestry,
     retained_source: Option<RetainedSource>,
+}
+// Only fresh receiver sealing creates Resident. Retained is a live binding to
+// that same exact original record, never an imported saved-validity flag.
+#[derive(Clone)]
+enum Metadata {
+    Resident(Arc<Sg0VertexDataV1>),
+    Retained { len: usize },
+}
+impl GraphInfo {
+    fn bound_metadata(&self, bytes: &[u8]) -> Result<Sg0VertexDataV1> {
+        let Some(Metadata::Retained { len }) = self.metadata else {
+            return Err(Error::Unavailable("unbound retained SG0 metadata"));
+        };
+        let source = self
+            .retained_source
+            .as_ref()
+            .ok_or(Error::Unavailable("retained SG0 source absent"))?;
+        let length_at = 12_usize
+            .checked_add(source.candidate_len)
+            .and_then(|end| end.checked_add(184))
+            .ok_or(Error::Unavailable("retained SG0 framing"))?;
+        let start = length_at
+            .checked_add(4)
+            .ok_or(Error::Unavailable("retained SG0 framing"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::Unavailable("retained SG0 framing"))?;
+        if bytes.len() != source.record_len
+            || raw_hash(bytes) != source.id
+            || bytes.get(..8) != Some(b"SNF04VR1")
+            || u32le(bytes, 8)? as usize != source.candidate_len
+            || u32le(bytes, length_at)? as usize != len
+            || end != bytes.len()
+        {
+            return Err(Error::Unavailable("retained SG0 original binding mismatch"));
+        }
+        let encoded = bytes
+            .get(start..end)
+            .ok_or(Error::Unavailable("retained SG0 framing"))?;
+        // Structural decoding grants no authority: the live source binding was
+        // created only after complete fresh derivation and full record equality.
+        let metadata = Sg0VertexDataV1::decode_cache_untrusted_v1(encoded)?;
+        if metadata.canonical_cache_bytes_v1()? != encoded {
+            return Err(Error::Unavailable("retained SG0 canonical mismatch"));
+        }
+        Ok(metadata)
+    }
+    fn execution_info(&self, bytes: &[u8]) -> Result<Self> {
+        let mut info = self.clone();
+        if matches!(self.metadata, Some(Metadata::Retained { .. })) {
+            info.metadata = Some(Metadata::Resident(Arc::new(self.bound_metadata(bytes)?)));
+        }
+        Ok(info)
+    }
+    fn load_metadata(
+        &self,
+        reader: Option<&Arc<RetainedContext>>,
+        budget: &JobBudget,
+    ) -> Result<Option<Sg0VertexDataV1>> {
+        match &self.metadata {
+            None => Ok(None),
+            Some(Metadata::Resident(metadata)) => Ok(Some(metadata.as_ref().clone())),
+            Some(Metadata::Retained { .. }) => {
+                budget.check()?;
+                budget.source()?;
+                let source = self
+                    .retained_source
+                    .as_ref()
+                    .ok_or(Error::Unavailable("retained SG0 source absent"))?;
+                let reader = reader.ok_or(Error::Unavailable("retained SG0 reader absent"))?;
+                let bytes = reader.objects().object(source.id, source.record_len)?;
+                let metadata = self.bound_metadata(&bytes)?;
+                budget.check()?;
+                Ok(Some(metadata))
+            }
+        }
+    }
 }
 mod sealed {
     pub trait Sealed {}
@@ -83,7 +160,7 @@ pub(crate) trait RetainEntry: GraphEntry + Sized {
         reader: Option<&Arc<RetainedContext>>,
     ) -> Result<Arc<Self>>;
     fn resident(vertex: &Arc<Self>) -> Option<Arc<VerifiedVertex>>;
-    fn restore(&self, candidate: Candidate) -> Result<VerifiedVertex>;
+    fn restore(&self, candidate: Candidate, record: &[u8]) -> Result<VerifiedVertex>;
 }
 impl RetainEntry for VerifiedVertex {
     fn retain(vertex: Arc<VerifiedVertex>, _: Option<&Arc<RetainedContext>>) -> Result<Arc<Self>> {
@@ -92,7 +169,7 @@ impl RetainEntry for VerifiedVertex {
     fn resident(vertex: &Arc<Self>) -> Option<Arc<VerifiedVertex>> {
         Some(vertex.clone())
     }
-    fn restore(&self, candidate: Candidate) -> Result<VerifiedVertex> {
+    fn restore(&self, candidate: Candidate, record: &[u8]) -> Result<VerifiedVertex> {
         if candidate.encode() != self.candidate.encode() {
             return Err(Error::Unavailable(
                 "live verified execution source mismatch",
@@ -101,7 +178,7 @@ impl RetainEntry for VerifiedVertex {
         Ok(Self {
             candidate,
             envelopes: self.envelopes.clone(),
-            info: self.info.clone(),
+            info: self.info.execution_info(record)?,
         })
     }
 }
@@ -120,21 +197,24 @@ impl RetainEntry for RetainedVertex {
         }
         let vertex = Arc::try_unwrap(vertex)
             .map_err(|_| Error::Unavailable("shared durable vertex body publication"))?;
+        let Some(Metadata::Resident(metadata)) = &vertex.info.metadata else {
+            return Err(Error::Unavailable("unsealed durable SG0 metadata"));
+        };
+        let metadata_len = metadata.canonical_cache_bytes_v1()?.len();
         let bindings = vertex
             .envelopes
             .iter()
             .map(VerifiedEnvelope::live_representation_binding)
             .collect();
-        // Candidate and full envelope bytes are dropped here, before graph credit.
-        Ok(Arc::new(Self {
-            info: vertex.info,
-            bindings,
-        }))
+        let mut info = vertex.info;
+        info.metadata = Some(Metadata::Retained { len: metadata_len });
+        // Candidate, full envelopes AND sealed SG0 data drop before graph credit.
+        Ok(Arc::new(Self { info, bindings }))
     }
     fn resident(_: &Arc<Self>) -> Option<Arc<VerifiedVertex>> {
         None
     }
-    fn restore(&self, candidate: Candidate) -> Result<VerifiedVertex> {
+    fn restore(&self, candidate: Candidate, record: &[u8]) -> Result<VerifiedVertex> {
         if candidate.id != self.info.id
             || candidate.header.bytes != self.info.header.bytes
             || candidate.body.representations().len() != self.bindings.len()
@@ -160,7 +240,7 @@ impl RetainEntry for RetainedVertex {
         Ok(VerifiedVertex {
             candidate,
             envelopes,
-            info: self.info.clone(),
+            info: self.info.execution_info(record)?,
         })
     }
 }
@@ -189,12 +269,10 @@ impl VerifiedVertex {
     }
     pub(crate) fn retained_record(&self) -> Result<Vec<u8>> {
         let bytes = self.candidate.encode();
-        let metadata = self
-            .info
-            .metadata
-            .as_ref()
-            .ok_or(Error::Unavailable("unsealed vertex metadata"))?
-            .canonical_cache_bytes_v1()?;
+        let Some(Metadata::Resident(metadata)) = &self.info.metadata else {
+            return Err(Error::Unavailable("unsealed vertex metadata"));
+        };
+        let metadata = metadata.canonical_cache_bytes_v1()?;
         let mut b = Vec::new();
         b.extend_from_slice(b"SNF04VR1");
         b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -458,7 +536,7 @@ impl<V: GraphEntry> GraphData<V> {
                 .ok_or(Error::Unavailable("retained execution candidate"))?,
             genesis,
         )?;
-        let restored = vertex.restore(candidate)?;
+        let restored = vertex.restore(candidate, &bytes)?;
         budget.check()?;
         Ok(Arc::new(restored))
     }
@@ -601,7 +679,7 @@ impl<V: GraphEntry> GraphData<V> {
         budget: &JobBudget,
     ) -> Result<PreparedVertex> {
         let id = VertexId::from_bytes(vertex.candidate.id);
-        vertex.info.metadata = Some(
+        vertex.info.metadata = Some(Metadata::Resident(Arc::new(
             derive_append_vertex_data_v1(
                 &View {
                     graph: self,
@@ -617,7 +695,7 @@ impl<V: GraphEntry> GraphData<V> {
                 }
                 other => Error::Order(other),
             })?,
-        );
+        )));
         budget.check()?;
         Ok(PreparedVertex {
             vertex: Arc::new(vertex),
@@ -701,7 +779,13 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         Ok(Uint256::from_u64(self.lookup(id)?.header.work).to_be_bytes())
     }
     fn vertex_data(&self, id: VertexId) -> std::result::Result<Option<Sg0VertexDataV1>, Sg0Error> {
-        Ok(self.lookup(id)?.metadata.clone())
+        self.lookup(id)?
+            .load_metadata(self.graph.ancestry_reader.as_ref(), self.budget)
+            .map_err(|error| match error {
+                Error::Order(error) => error,
+                Error::Paused(_) => Sg0Error::ResourceBudget,
+                _ => Sg0Error::Invariant,
+            })
     }
     fn visit_strict_past_ids(
         &self,
@@ -856,8 +940,13 @@ mod tests {
                 .unwrap();
             prepared.bind_retained_source(&record).unwrap();
             let weak_body = Arc::downgrade(&prepared.vertex);
+            let weak_metadata = match &prepared.vertex.info.metadata {
+                Some(Metadata::Resident(metadata)) => Arc::downgrade(metadata),
+                _ => panic!("fresh sealing must own receiver-derived metadata"),
+            };
             durable.publish(prepared).unwrap();
             assert!(weak_body.upgrade().is_none());
+            assert!(weak_metadata.upgrade().is_none());
         }
         assert_eq!(
             durable.order(&budget).unwrap(),
@@ -874,8 +963,98 @@ mod tests {
             resident.is_ancestor(id(1), id(4)).unwrap()
         );
         assert!(durable.vertices().all(|v| v.bindings.is_empty()));
+        assert!(
+            durable
+                .vertices()
+                .all(|v| matches!(v.info.metadata, Some(Metadata::Retained { .. })))
+        );
+        let retained_view = View {
+            graph: &durable,
+            added: None,
+            members: None,
+            budget: &budget,
+        };
+        let resident_view = View {
+            graph: &resident,
+            added: None,
+            members: None,
+            budget: &budget,
+        };
+        for label in 1..=4 {
+            assert_eq!(
+                retained_view.vertex_data(id(label)).unwrap(),
+                resident_view.vertex_data(id(label)).unwrap()
+            );
+        }
         drop(store);
         assert_eq!(durable.export_retained_range(0, 32).unwrap(), originals);
+    }
+    #[test]
+    fn disk_metadata_missing_or_tampered_source_refuses_order_and_staging_without_credit() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic disk metadata fixture")
+            .unwrap();
+        for (label, parents) in [(1, &[][..]), (2, &[1][..]), (3, &[1][..]), (4, &[2, 3][..])] {
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, parents), &budget)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            store
+                .commit(&[&record], b"synthetic full receiver-derived source")
+                .unwrap();
+            prepared
+                .retain_ancestry(&graph, &mut store, &budget)
+                .unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            graph.publish(prepared).unwrap();
+        }
+        let order = graph.order(&budget).unwrap();
+        let head = store.head();
+        let source = graph.get(id(4)).unwrap().source_id().unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(source)));
+        let held = path.with_extension("held");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::rename(&path, &held).unwrap();
+        let view = View {
+            graph: &graph,
+            added: None,
+            members: None,
+            budget: &budget,
+        };
+        assert!(matches!(view.vertex_data(id(4)), Err(Sg0Error::Invariant)));
+        assert!(graph.order(&budget).is_err());
+        assert!(
+            graph
+                .seal(synthetic_vertex(&graph, 5, &[4]), &budget)
+                .is_err()
+        );
+        assert_eq!(graph.len(), 4);
+        assert!(graph.get(id(5)).is_err());
+        assert_eq!(store.head(), head);
+        std::fs::rename(&held, &path).unwrap();
+        let mut changed = original.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert!(matches!(view.vertex_data(id(4)), Err(Sg0Error::Invariant)));
+        assert!(graph.order(&budget).is_err());
+        assert!(
+            graph
+                .seal(synthetic_vertex(&graph, 5, &[4]), &budget)
+                .is_err()
+        );
+        assert_eq!(graph.len(), 4);
+        assert_eq!(store.head(), head);
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(graph.order(&budget).unwrap(), order);
     }
     #[test]
     fn disk_detach_graph_unbound_or_shared_body_publication_refuses_without_partial_credit() {
