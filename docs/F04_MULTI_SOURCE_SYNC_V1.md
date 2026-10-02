@@ -59,15 +59,24 @@ unsupported schemas and excessive source counts refuse before opening the node.
   ordinary ingress rejection (`Invalid`, Sapling `Encoding` or `Crypto`) may
   abandon that source after the receiver remains READY with exactly the same
   local head, graph count and state digest, and the independent retained pin
-  still matches. Other error variants remain local STOPs. Settlement failures
+  still matches. Apart from the scoped missing-parent case below, other error
+  variants remain local STOPs. Settlement failures
   are never peer failures. Original single-source ingress failure behavior is
   unchanged.
-- A rejected carrier's SHA-256 is retained for this invocation. The same bytes
+- A definitely rejected carrier's SHA-256 is retained for this invocation. The same bytes
   from another source abandon that source before another admission attempt;
   no rejected job receives renewed work/proof time. At most eight rejection
   hashes are retained, one per attempted source. The rest of a rejected batch
   is not ingested. Different valid data from another explicitly pinned source
   can continue from the already accepted local prefix.
+- A source that supplies a child before its locally missing parent may also be
+  abandoned in explicit multi-source mode. The ordinary receiver must report
+  exactly `Unavailable("missing admitted vertex")` and pass the same healthy,
+  idle, READY, unchanged head/count/digest and independent-pin checks. This is
+  unavailable dependency data, not a verdict that the child's protocol is invalid.
+  No admission marker/native work may have started. These bytes are NOT added to
+  the invalid-carrier cache: another source can supply parent then child through
+  ordinary ingress. Uncertain jobs and all other history errors still STOP.
 - Completed, locally accepted prefixes remain retained after source loss or
   exhaustion. There is no rollback, store replacement, automatic retry of an
   uncertain job, or adoption of a remotely supplied local-head pin.
@@ -165,6 +174,17 @@ checks passed. Scoped Clippy passed with the same pre-existing `collapsible_if`
 allowance documented above; formatting and diff checks passed.
 
 ## Still unproven
+
+The missing-parent increment adds two focused checks: source switching retains
+the single deadline, does not ingest the refused batch's suffix, and does not
+blacklist a child once another source supplies its parent; an actual fresh node
+refuses the second unverified public carrier before any job and preserves READY
+state, head, count, digest, accounting and its independent pin. The first check
+uses a synthetic receiver; the second does not verify work or admit the child.
+Neither is an independently operated withheld-body/partition journey.
+Both new checks and the affected existing uncertain-error/stale-pin check passed.
+Scoped Clippy retained the previously documented style allowance; no native
+work, proofs or earlier completed catch-up/restart journey was repeated.
 
 The original eleven checks are macOS components with genuine loopback TLS.
 The small Linux receiver loss/restart check below adds actual local admission

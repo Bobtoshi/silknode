@@ -9,7 +9,7 @@ use crate::{
     deadline::NativeGuard,
     genesis::Genesis,
     state::BranchState,
-    store::Store,
+    store::{JobStartError, Store},
     wire::{field, raw_hash, u32le, u64le},
 };
 use rand_core::{OsRng, RngCore};
@@ -473,13 +473,7 @@ impl Node {
         marker.extend_from_slice(&nonce);
         marker.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         marker.extend_from_slice(bytes);
-        let job_id = match self.store.begin_job(&marker) {
-            Ok(id) => id,
-            Err(e) => {
-                self.faulted = true;
-                return Err(e);
-            }
-        };
+        let job_id = self.begin_foreground_job(&marker)?;
         let guard = match NativeGuard::arm(&budget) {
             Ok(guard) => guard,
             Err(e) => return self.job_failed(job_id, e),
@@ -588,8 +582,8 @@ impl Node {
             .try_fill_bytes(&mut nonce)
             .map_err(|_| Error::Unavailable("checkpoint attempt entropy"))?;
         marker.extend_from_slice(&nonce);
+        let job_id = self.begin_foreground_job(&marker)?;
         let result = (|| {
-            let job_id = self.store.begin_job(&marker)?;
             let mut guard = NativeGuard::arm(&budget)?;
             let step = self.core.prepare_step(&budget)?;
             let data = step
@@ -699,13 +693,7 @@ impl Node {
             .map_err(|_| Error::Unavailable("mining attempt entropy"))?;
         marker.extend_from_slice(&attempt);
         marker.extend_from_slice(body.bytes());
-        let job_id = match self.store.begin_job(&marker) {
-            Ok(id) => id,
-            Err(e) => {
-                self.faulted = true;
-                return Err(e);
-            }
-        };
+        let job_id = self.begin_foreground_job(&marker)?;
         let mut guard = match NativeGuard::arm(&budget) {
             Ok(guard) => guard,
             Err(e) => return self.job_failed(job_id, e),
@@ -754,6 +742,16 @@ impl Node {
             ))
         } else {
             Ok(())
+        }
+    }
+    fn begin_foreground_job(&mut self, marker: &[u8]) -> Result<Digest> {
+        match self.store.begin_job(marker) {
+            Ok(id) => Ok(id),
+            Err(JobStartError::Refused(error)) => Err(error),
+            Err(JobStartError::Uncertain(error)) => {
+                self.faulted = true;
+                Err(error)
+            }
         }
     }
     fn idle(&self) -> Result<()> {

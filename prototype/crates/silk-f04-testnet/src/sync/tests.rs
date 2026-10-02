@@ -37,6 +37,7 @@ struct MemoryReceiver {
     calls: usize,
     fail_local: bool,
     reject_peer: Option<&'static [u8]>,
+    dependency: Option<(&'static [u8], &'static [u8])>,
 }
 impl Receiver for MemoryReceiver {
     fn ingest(&mut self, bytes: &[u8]) -> std::result::Result<(), Failure> {
@@ -48,6 +49,13 @@ impl Receiver for MemoryReceiver {
         }
         if self.reject_peer == Some(bytes) {
             return Err(Failure::Peer("synthetic definite carrier rejection".into()));
+        }
+        if let Some((child, parent)) = self.dependency {
+            if bytes == child && !self.values.contains(parent) {
+                return Err(Failure::Dependency(
+                    "synthetic missing parent before job".into(),
+                ));
+            }
         }
         self.values.insert(bytes.to_vec());
         Ok(())
@@ -77,6 +85,69 @@ fn sources() -> Vec<Config> {
         fixture_config("127.0.0.1:10001".parse().unwrap()),
         fixture_config("127.0.0.1:10002".parse().unwrap()),
     ]
+}
+
+#[test]
+fn dependency_gap_switches_source_without_blacklisting_child_or_renewing_deadline() {
+    let sources = sources();
+    let mut receiver = MemoryReceiver {
+        dependency: Some((b"child", b"parent")),
+        ..MemoryReceiver::default()
+    };
+    let until = Some(Instant::now() + Duration::from_secs(10));
+    let target = run_until(
+        &mut receiver,
+        &sources,
+        |peer, request, actual| {
+            assert_eq!(actual, until);
+            if request == [0] {
+                return Ok(serde_json::to_vec(&status(peer, 2))?);
+            }
+            assert_eq!(offset(request), 0);
+            if peer.seed == sources[0].seed {
+                Ok(frame(&[b"child", b"must-not-ingest"]))
+            } else {
+                Ok(frame(&[b"parent", b"child"]))
+            }
+        },
+        until,
+    )
+    .unwrap();
+    assert_eq!(target.seed, sources[1].seed.to_string());
+    assert_eq!(receiver.calls, 3);
+    assert_eq!(
+        receiver.values,
+        BTreeSet::from([b"parent".to_vec(), b"child".to_vec()])
+    );
+}
+
+#[test]
+fn dependency_gap_actual_receiver_stays_ready_with_no_job_or_pin_changes() {
+    let (mut node, operator) = rejection_node();
+    let encoded: String = include_str!("../../../../checks/peer-sync-v1/public-zero-eight.hex")
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let bytes = hex::decode(encoded).unwrap();
+    let batch = RangeBatchV1::decode(&bytes, 0, 8).unwrap();
+    // The second full, UNVERIFIED carrier has a parent absent from this new node.
+    let child = batch.carriers()[1];
+    let head = node.local_head().unwrap();
+    let state = node.state().unwrap().digest();
+    let accounted = node.accounted_bytes();
+    assert!(matches!(
+        ingest_peer(&mut node, &operator, |node| node.begin_ingest(child)),
+        Err(Failure::Dependency(_))
+    ));
+    assert_eq!(
+        node.status().unwrap(),
+        silk_f04_node::node::NodeStatus::Ready
+    );
+    assert_eq!(node.local_head().unwrap(), head);
+    assert_eq!(operator.load_pin().unwrap(), head);
+    assert_eq!(node.state().unwrap().digest(), state);
+    assert_eq!(node.accounted_bytes(), accounted);
+    assert!(!operator.store.join("ACTIVE_JOB").try_exists().unwrap());
 }
 
 #[test]

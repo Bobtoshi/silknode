@@ -26,6 +26,9 @@ fn check_deadline(until: Option<Instant>) -> Result<()> {
 #[derive(Debug)]
 enum Failure {
     Peer(Box<dyn std::error::Error>),
+    // Missing local parent before any attempt. Not protocol invalidity; these
+    // bytes may become admissible after a later source provides their parents.
+    Dependency(Box<dyn std::error::Error>),
     Local(Box<dyn std::error::Error>),
 }
 
@@ -63,7 +66,7 @@ impl Receiver for LiveReceiver<'_> {
     }
 }
 
-// A definite rejection may abandon a source ONLY after the ordinary receiver
+// A definite rejection or pre-job missing parent may abandon a source ONLY after the ordinary receiver
 // has closed its attempt and preserved READY state and the independent local pin.
 // Settlement failures are always local, even if their error resembles invalidity.
 fn ingest_peer(
@@ -90,11 +93,19 @@ fn ingest_peer(
                         silk_sapling_f04::Error::Encoding(_) | silk_sapling_f04::Error::Crypto(_)
                     )
             );
-            if definite {
+            let missing_parent = matches!(
+                &error,
+                silk_f04_node::Error::Unavailable("missing admitted vertex")
+            );
+            if definite || missing_parent {
                 let after = continuity(node).map_err(Failure::Local)?;
                 let pin = operator.load_pin().map_err(Failure::Local)?;
                 if after == before && pin == before.0 {
-                    return Err(Failure::Peer(error.into()));
+                    return Err(if missing_parent {
+                        Failure::Dependency(error.into())
+                    } else {
+                        Failure::Peer(error.into())
+                    });
                 }
             }
             Err(Failure::Local(error.into()))
@@ -142,6 +153,11 @@ fn attempt(
                     rejected.insert(identity);
                     return Err(Failure::Peer(error));
                 }
+                Err(Failure::Dependency(error)) => {
+                    // No marker/work was started. Do not cache this as invalid:
+                    // another source can supply the missing parent then child.
+                    return Err(Failure::Peer(error));
+                }
                 Err(error @ Failure::Local(_)) => return Err(error),
             }
         }
@@ -178,7 +194,7 @@ fn run_until(
         check_deadline(until)?;
         match attempt(receiver, source, &mut request, until, &mut rejected) {
             Ok(target) => return Ok(target),
-            Err(Failure::Local(error)) => return Err(error),
+            Err(Failure::Local(error) | Failure::Dependency(error)) => return Err(error),
             Err(Failure::Peer(_error)) => {
                 // Do not print arbitrary peer-controlled error text. Each
                 // explicitly pinned source is tried once, without auto-enrollment.

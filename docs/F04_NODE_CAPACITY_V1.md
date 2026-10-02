@@ -45,3 +45,28 @@ read-only/clock-publication check. Only the affected reconciliation and ordinary
 node checks were rerun after exposing the shared arithmetic helper. The focused
 external test target also passed strict Clippy; this is not whole-node lint
 acceptance. No proof, maturity, mining or sustained-operation fixture was run.
+
+## Storage refusal before an attempt
+
+Foreground job creation now distinguishes a definite quota/free-space refusal
+before reservation charging or any write from an uncertain start. Admission,
+checkpoint and mining-entry preflight leave the node healthy on that definite
+local pause. Restoring capacity does not require reopening a healthy writer or
+renewing an unfinished job allowance: no attempt was started.
+
+An existing unfinished attempt, a poisoned store, uncertain reads, and every
+write-stage or post-marker failure retain the original STOP behavior. Charges,
+job/replay pointer encoding, quotas, host margin, consensus and resource caps
+are unchanged. This is not a disk reservation or native-runtime qualification.
+
+Only the new storage checks can be selected with `--test range_component
+storage_preflight_ -- --test-threads=1` in the command above. They use a controlled
+fixture margin mapping, a permission-denied write, and a synthetic retained
+attempt. The first unverified public carrier is used for preflight framing only;
+no native work, proof verification/generation or valuable operation is performed.
+
+All three focused macOS storage checks passed, as did strict linting of the
+external component target and formatting/diff checks. An initial fixture decoder
+refused the line-wrapped hex before any admission; whitespace normalization
+corrected that test-only failure. No previous capacity or native-work checks
+were repeated for this storage increment.

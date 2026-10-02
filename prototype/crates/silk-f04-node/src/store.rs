@@ -14,6 +14,14 @@ const MAX_GROUP: u64 = 16 * 1024 * 1024;
 const PAUSE_BYTES: u64 = 14 * 1024 * 1024 * 1024;
 const MARGIN: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Only a definite capacity refusal before any attempt write is resumable.
+/// Existing attempts, read uncertainty and every write-stage failure stay STOPs.
+#[derive(Debug)]
+pub(crate) enum JobStartError {
+    Refused(Error),
+    Uncertain(Error),
+}
+
 pub(crate) struct Store {
     root: PathBuf,
     margin: PathBuf,
@@ -319,8 +327,23 @@ impl Store {
             .map(|id| Ok((id, self.object(id)?)))
             .transpose()
     }
-    pub fn begin_job(&mut self, bytes: &[u8]) -> Result<Digest> {
-        self.begin_marker("ACTIVE_JOB", bytes)
+    pub fn begin_job(&mut self, bytes: &[u8]) -> std::result::Result<Digest, JobStartError> {
+        let charged = self
+            .preflight_marker("ACTIVE_JOB", bytes)
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    Error::Paused(
+                        "persistent quota reservation" | "host free margin" | "store free capacity"
+                    )
+                ) {
+                    JobStartError::Refused(error)
+                } else {
+                    JobStartError::Uncertain(error)
+                }
+            })?;
+        self.write_marker("ACTIVE_JOB", bytes, charged)
+            .map_err(JobStartError::Uncertain)
     }
     pub fn begin_replay(&mut self, bytes: &[u8]) -> Result<Digest> {
         // A freshly opened malformed HEAD can only be repaired after a bounded
@@ -333,6 +356,10 @@ impl Store {
         result
     }
     fn begin_marker(&mut self, name: &str, bytes: &[u8]) -> Result<Digest> {
+        let charged = self.preflight_marker(name, bytes)?;
+        self.write_marker(name, bytes, charged)
+    }
+    fn preflight_marker(&self, name: &str, bytes: &[u8]) -> Result<u64> {
         if self.active_marker(name)?.is_some() {
             return Err(Error::Paused(
                 "incomplete local job requires explicit bounded authority",
@@ -340,6 +367,9 @@ impl Store {
         }
         let charged = charge(bytes.len() as u64) + 4 * 4096;
         self.reserve(charged)?;
+        Ok(charged)
+    }
+    fn write_marker(&mut self, name: &str, bytes: &[u8], charged: u64) -> Result<Digest> {
         self.used += charged;
         self.poisoned = true;
         let id = self.put(bytes)?;
@@ -468,7 +498,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.begin_job(b"new attempt"),
-            Err(Error::Paused(_))
+            Err(JobStartError::Uncertain(Error::Paused(_)))
         ));
         drop(store);
         let mut store = Store::open(&root, dir.path()).unwrap();

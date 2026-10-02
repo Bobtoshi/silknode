@@ -64,6 +64,136 @@ mod sync {
 }
 
 #[cfg(test)]
+mod storage {
+    use silk_f04_node::{
+        Error,
+        carriage::Body,
+        genesis::public_testnet_v1,
+        node::{Node, NodeStatus},
+        sync::RangeBatchV1,
+    };
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+        path::{Path, PathBuf},
+    };
+
+    fn fixture() -> (Node, PathBuf, PathBuf) {
+        let nonce = rand_core::RngCore::next_u64(&mut rand_core::OsRng);
+        let root =
+            std::env::temp_dir().join(format!("silknode-storage-{}-{nonce}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let margin = root.join("margin");
+        fs::DirBuilder::new().mode(0o700).create(&margin).unwrap();
+        let node = Node::create(
+            &root.join("node"),
+            &margin,
+            public_testnet_v1::genesis().unwrap(),
+        )
+        .unwrap();
+        (node, root, margin)
+    }
+
+    fn candidate() -> Vec<u8> {
+        let hex: String = include_str!("public-zero-eight.hex")
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let bytes = hex::decode(hex).unwrap();
+        // Use only unverified framing of the first anchor carrier. Neither this
+        // helper nor the refusal checks run RandomX or Sapling verification.
+        RangeBatchV1::decode(&bytes, 0, 8).unwrap().carriers()[0].to_vec()
+    }
+
+    fn inventory(root: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn storage_preflight_capacity_refusal_preserves_ready_node_and_all_store_bytes() {
+        let (mut node, root, margin) = fixture();
+        let store = root.join("node");
+        let before = inventory(&store);
+        let accounted = node.accounted_bytes();
+        let head = node.local_head().unwrap();
+        let digest = node.state().unwrap().digest();
+        // Redirect only this fixture's margin mapping. Existing cross-filesystem
+        // quota/host-margin checks refuse; no real disk is filled or limit relaxed.
+        let retained = root.join("margin-retained");
+        fs::rename(&margin, &retained).unwrap();
+        symlink("/dev", &margin).unwrap();
+        assert!(matches!(
+            node.begin_ingest(&candidate()),
+            Err(Error::Paused(_))
+        ));
+        // Mining-entry preflight only: the same refusal precedes all native work.
+        assert!(matches!(
+            node.mine_current(
+                Body::new(&node.genesis().domain(), &[]).unwrap(),
+                [2; 32],
+                [3; 32],
+                None
+            ),
+            Err(Error::Paused(_))
+        ));
+        assert_eq!(node.status().unwrap(), NodeStatus::Ready);
+        assert_eq!(node.local_head().unwrap(), head);
+        assert_eq!(node.state().unwrap().digest(), digest);
+        assert_eq!(node.accounted_bytes(), accounted);
+        assert_eq!(inventory(&store), before);
+        fs::remove_file(&margin).unwrap(); // This exact fixture-owned symlink only.
+        fs::rename(retained, &margin).unwrap();
+        node.flush_clock().unwrap(); // No reopening or retrying an unfinished job.
+        assert_eq!(node.status().unwrap(), NodeStatus::Ready);
+        assert_eq!(node.state().unwrap().digest(), digest);
+    }
+
+    #[test]
+    fn storage_preflight_write_failure_still_faults_writer_and_keeps_complete_head() {
+        let (mut node, root, _) = fixture();
+        let store = root.join("node");
+        let before = inventory(&store);
+        let accounted = node.accounted_bytes();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o500)).unwrap();
+        let error = node.begin_ingest(&candidate()).unwrap_err();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(error, Error::Io(_)));
+        assert!(node.status().is_err());
+        assert!(node.flush_clock().is_err());
+        assert!(node.accounted_bytes() > accounted); // Attempt reservation stays charged.
+        assert_eq!(inventory(&store), before);
+    }
+
+    #[test]
+    fn storage_preflight_existing_attempt_is_not_a_resumable_capacity_refusal() {
+        use sha2::{Digest as _, Sha256};
+        let (mut node, root, _) = fixture();
+        let store = root.join("node");
+        let marker = b"synthetic unfinished attempt, not received validity";
+        let id = hex::encode(Sha256::digest(marker));
+        fs::write(store.join(format!("{id}.obj")), marker).unwrap();
+        fs::write(store.join("ACTIVE_JOB"), id).unwrap();
+        let before = inventory(&store);
+        assert!(matches!(
+            node.begin_ingest(&candidate()),
+            Err(Error::Paused(
+                "incomplete local job requires explicit bounded authority"
+            ))
+        ));
+        assert!(node.status().is_err());
+        assert!(node.begin_ingest(&candidate()).is_err());
+        assert_eq!(inventory(&store), before);
+    }
+}
+
+#[cfg(test)]
 mod capacity {
     use silk_f04_node::{
         Error,
