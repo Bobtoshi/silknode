@@ -22,7 +22,9 @@ enum Leaf {
     Resident([u64; WORDS_PER_PAGE]),
     Retained(Digest),
 }
-pub(super) struct RetainedContext {
+// Shared with the crate-private entry adapter through its trait signature.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct RetainedContext {
     objects: Arc<ObjectReader>,
     domain: Digest,
 }

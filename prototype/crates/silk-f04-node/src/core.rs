@@ -5,7 +5,7 @@ use crate::{
     capacity::HistoryCapacityV1,
     carriage::{Body, Candidate, Header, ParentFacts, WorkEngine},
     genesis::Genesis,
-    graph::{CryptoCache, Graph, PreparedVertex},
+    graph::{CryptoCache, DurableGraph as Graph, PreparedVertex},
     parent::PrefixCache,
     quantum::{Job, Progress},
     state::{BranchState, EffectOutcome},

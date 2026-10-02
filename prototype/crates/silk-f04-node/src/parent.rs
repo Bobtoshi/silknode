@@ -4,7 +4,7 @@ use crate::{
     budget::JobBudget,
     carriage::{ParentFacts, encode_parents},
     genesis::Genesis,
-    graph::Graph,
+    graph::DurableGraph as Graph,
     state::{BranchState, fold_j},
 };
 use silk_order::sg0_v1::Sg0ParentSetV1;
@@ -88,18 +88,18 @@ impl PrefixCache {
         pv.push(q as u8);
         pv.extend_from_slice(&[0; 7]);
         for (t, id) in e.iter().enumerate().skip(m - q) {
-            let h = &graph.get(*id)?.candidate().header;
+            let header = graph.header(*id)?;
             pv.extend_from_slice(&(t as u64).to_le_bytes());
             pv.extend_from_slice(&id.into_bytes());
-            pv.extend_from_slice(&h.timestamp.to_le_bytes());
-            pv.extend_from_slice(&h.work.to_le_bytes());
+            pv.extend_from_slice(&header.timestamp.to_le_bytes());
+            pv.extend_from_slice(&header.work.to_le_bytes());
         }
         debug_assert_eq!(pv.len(), 257 + 56 * q);
         let pvid = domain_hash("SilkNode-F01-parent-view", &[&pv]);
         let tparent = parents
             .ordinary_parents()
             .iter()
-            .map(|id| graph.get(*id).map(|v| v.candidate().header.timestamp))
+            .map(|id| graph.header(*id).map(|h| h.timestamp))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .max()
@@ -111,7 +111,7 @@ impl PrefixCache {
         };
         let wref = order
             .selected_tip()
-            .map(|id| graph.get(id).map(|v| v.candidate().header.work))
+            .map(|id| graph.header(id).map(|h| h.work))
             .transpose()?
             .unwrap_or(1);
         let epoch = 1 + m as u64 / 8;
@@ -122,7 +122,7 @@ impl PrefixCache {
             let n = last.min(32);
             let start = last - n;
             let observed = e[start + 1..=last].iter().try_fold(0_u128, |sum, id| {
-                Ok::<_, Error>(sum + u128::from(graph.get(*id)?.candidate().header.work))
+                Ok::<_, Error>(sum + u128::from(graph.header(*id)?.work))
             })?;
             Sample::derive(
                 start as u64,
@@ -143,7 +143,7 @@ impl PrefixCache {
         dx.extend_from_slice(&[0; 7]);
         for id in parents.ordinary_parents() {
             dx.extend_from_slice(&id.into_bytes());
-            dx.extend_from_slice(&graph.get(*id)?.candidate().header.timestamp.to_le_bytes());
+            dx.extend_from_slice(&graph.header(*id)?.timestamp.to_le_bytes());
         }
         for v in [m as u64, epoch, tmtp, tparent, wref] {
             dx.extend_from_slice(&v.to_le_bytes());
@@ -339,7 +339,7 @@ pub(crate) fn replay_source_for_test(
 fn mtp(graph: &Graph, e: &[VertexId], i: usize) -> Result<u64> {
     let mut times = e[(i + 1).saturating_sub(11)..=i]
         .iter()
-        .map(|id| graph.get(*id).map(|v| v.candidate().header.timestamp))
+        .map(|id| graph.header(*id).map(|h| h.timestamp))
         .collect::<Result<Vec<_>>>()?;
     times.sort_unstable();
     Ok(times[(times.len() - 1) / 2])

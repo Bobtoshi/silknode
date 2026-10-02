@@ -217,9 +217,14 @@ impl Node {
                             .graph
                             .get(VertexId::from_bytes(candidate.id))
                             .is_ok_and(|v| {
-                                v.candidate().encode() == bytes[100..]
-                                    && v.retained_record()
-                                        .is_ok_and(|record| raw_hash(&record) == terminal.data)
+                                v.source_id().is_ok_and(|source| source == terminal.data)
+                                    && core
+                                        .graph
+                                        .retained_candidate_matches(
+                                            VertexId::from_bytes(candidate.id),
+                                            &bytes[100..],
+                                        )
+                                        .is_ok_and(|same| same)
                             })
                 }
                 b"SNF04CJ1" => {
@@ -438,7 +443,11 @@ impl Node {
         self.core.clock.observe(system_wall()?)?;
         let c = Candidate::decode(bytes, &self.core.genesis)?;
         if let Ok(v) = self.core.graph.get(VertexId::from_bytes(c.id)) {
-            if v.candidate().encode() == bytes {
+            if self
+                .core
+                .graph
+                .retained_candidate_matches(VertexId::from_bytes(v.id()), bytes)?
+            {
                 return Ok(Ingress::AlreadyKnown);
             }
             return Err(Error::Invalid(

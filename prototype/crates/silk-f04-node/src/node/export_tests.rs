@@ -42,7 +42,18 @@ fn disk_source_native_fresh_replay_exports_exact_originals_and_missing_last_refu
         .core
         .graph
         .vertices()
-        .map(|v| v.candidate().encode())
+        .map(|v| {
+            node.core
+                .graph
+                .load_for_execution(
+                    VertexId::from_bytes(v.id()),
+                    &node.core.genesis,
+                    &JobBudget::checkpoint().unwrap(),
+                )
+                .unwrap()
+                .candidate()
+                .encode()
+        })
         .collect();
     assert_eq!(node.export_range(0, 32).unwrap(), expected);
     assert_eq!(node.export_range(3, 2).unwrap(), expected[3..5]);
@@ -54,7 +65,8 @@ fn disk_source_native_fresh_replay_exports_exact_originals_and_missing_last_refu
         .vertices()
         .last()
         .unwrap()
-        .retained_record()
+        .source_id()
+        .and_then(|id| fs::read(root.join(format!("{}.obj", hex::encode(id)))).map_err(Error::from))
         .unwrap();
     let path = root.join(format!("{}.obj", hex::encode(raw_hash(&record))));
     let held = path.with_extension("held");
@@ -108,6 +120,12 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
     )
     .unwrap();
     assert_eq!(node.core.graph.len(), 8);
+    let repeated = node.export_range(7, 1).unwrap().pop().unwrap();
+    assert_eq!(
+        node.ingest(&repeated, &parameters).unwrap(),
+        Ingress::AlreadyKnown
+    );
+    assert_eq!(node.local_head().unwrap(), pin);
     let completed = node.core.state.clone();
     let ids = node.core.order.eligible_order().to_vec();
     for id in &ids {
@@ -117,15 +135,22 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
             .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
             .unwrap();
         let resident = node.core.graph.get(*id).unwrap();
-        assert!(!std::ptr::eq(loaded.as_ref(), resident));
+        assert!(!std::ptr::eq(
+            crate::graph::GraphEntry::graph_info(loaded.as_ref()),
+            crate::graph::GraphEntry::graph_info(resident)
+        ));
         assert_eq!(
             loaded.retained_record().unwrap(),
-            resident.retained_record().unwrap()
+            fs::read(root.join(format!(
+                "{}.obj",
+                hex::encode(resident.source_id().unwrap())
+            )))
+            .unwrap()
         );
-        assert_eq!(loaded.envelopes().len(), resident.envelopes().len());
-        for (a, b) in loaded.envelopes().iter().zip(resident.envelopes()) {
-            assert_eq!(a.envelope().bytes(), b.envelope().bytes());
-        }
+        assert_eq!(
+            loaded.envelopes().len(),
+            loaded.candidate().body.representations().len()
+        );
     }
     // Scratch reconstruction exercises the real reducers over genuine records;
     // it is not a new live transition, native reorg, mined history or cap evidence.
@@ -153,11 +178,13 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
         .vertices()
         .last()
         .unwrap()
-        .retained_record()
+        .source_id()
+        .and_then(|id| fs::read(root.join(format!("{}.obj", hex::encode(id)))).map_err(Error::from))
         .unwrap();
     let path = root.join(format!("{}.obj", hex::encode(raw_hash(&record))));
     let held = path.with_extension("held");
     fs::rename(&path, &held).unwrap();
+    assert!(matches!(node.begin_ingest(&repeated), Err(Error::Io(_))));
     assert!(
         node.core
             .prepare_step(&JobBudget::checkpoint().unwrap())
@@ -182,6 +209,6 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=8; full_replay=true; owned_disk_bodies=true; checkpoint_and_parent_scratch_exact=true; missing_source_refuses_both=true; resident_fallback=false; no_publication=true; native_reorg=false; source_bytes_unchanged=true; mined=0"
+        "retained_vertices=8; full_replay=true; graph_entries_compact=true; owned_disk_bodies=true; exact_repeat_already_known=true; missing_source_known_repeat_is_io=true; checkpoint_and_parent_scratch_exact=true; missing_source_refuses_both=true; resident_fallback=false; no_publication=true; native_reorg=false; source_bytes_unchanged=true; mined=0"
     );
 }

@@ -3,7 +3,7 @@ mod ancestry;
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
-    carriage::{Candidate, ParentFacts, WorkEngine},
+    carriage::{Candidate, Header, ParentFacts, WorkEngine},
     genesis::Genesis,
     wire::{raw_hash, u32le},
 };
@@ -15,7 +15,7 @@ use silk_order::sg0_v1::{
 use silk_pow::Uint256;
 use silk_sapling_f04::{
     codec::Envelope,
-    crypto::{VerifiedEnvelope, verify_many},
+    crypto::{LiveRepresentationBinding, VerifiedEnvelope, verify_many},
     parameters::SaplingParameters,
 };
 use silk_types::VertexId;
@@ -28,10 +28,141 @@ use std::{
 pub struct VerifiedVertex {
     candidate: Candidate,
     envelopes: Vec<VerifiedEnvelope>,
+    info: GraphInfo,
+}
+/// Immutable receiver-owned graph metadata. No public constructor or mutable fields.
+#[derive(Clone)]
+pub struct GraphInfo {
+    id: Digest,
+    header: Header,
     facts: ParentFacts,
     metadata: Option<Sg0VertexDataV1>,
     ancestors: PagedAncestry,
     retained_source: Option<RetainedSource>,
+}
+mod sealed {
+    pub trait Sealed {}
+}
+/// Sealed metadata view: decoding peer bytes cannot implement receiver authority.
+pub trait GraphEntry: sealed::Sealed {
+    /// Read-only metadata belonging to this already receiver-verified entry.
+    fn graph_info(&self) -> &GraphInfo;
+}
+impl sealed::Sealed for VerifiedVertex {}
+impl GraphEntry for VerifiedVertex {
+    fn graph_info(&self) -> &GraphInfo {
+        &self.info
+    }
+}
+/// Internal node entry retains NO `Candidate`, `Body` or `VerifiedEnvelope` bytes.
+pub(crate) struct RetainedVertex {
+    info: GraphInfo,
+    bindings: Vec<LiveRepresentationBinding>,
+}
+impl sealed::Sealed for RetainedVertex {}
+impl GraphEntry for RetainedVertex {
+    fn graph_info(&self) -> &GraphInfo {
+        &self.info
+    }
+}
+impl RetainedVertex {
+    pub(crate) const fn id(&self) -> Digest {
+        self.info.id
+    }
+    pub(crate) fn source_id(&self) -> Result<Digest> {
+        self.info
+            .retained_source
+            .as_ref()
+            .map(|s| s.id)
+            .ok_or(Error::Unavailable("durable vertex source absent"))
+    }
+}
+pub(crate) trait RetainEntry: GraphEntry + Sized {
+    fn retain(
+        vertex: Arc<VerifiedVertex>,
+        reader: Option<&Arc<RetainedContext>>,
+    ) -> Result<Arc<Self>>;
+    fn resident(vertex: &Arc<Self>) -> Option<Arc<VerifiedVertex>>;
+    fn restore(&self, candidate: Candidate) -> Result<VerifiedVertex>;
+}
+impl RetainEntry for VerifiedVertex {
+    fn retain(vertex: Arc<VerifiedVertex>, _: Option<&Arc<RetainedContext>>) -> Result<Arc<Self>> {
+        Ok(vertex)
+    }
+    fn resident(vertex: &Arc<Self>) -> Option<Arc<VerifiedVertex>> {
+        Some(vertex.clone())
+    }
+    fn restore(&self, candidate: Candidate) -> Result<VerifiedVertex> {
+        if candidate.encode() != self.candidate.encode() {
+            return Err(Error::Unavailable(
+                "live verified execution source mismatch",
+            ));
+        }
+        Ok(Self {
+            candidate,
+            envelopes: self.envelopes.clone(),
+            info: self.info.clone(),
+        })
+    }
+}
+impl RetainEntry for RetainedVertex {
+    fn retain(
+        vertex: Arc<VerifiedVertex>,
+        reader: Option<&Arc<RetainedContext>>,
+    ) -> Result<Arc<Self>> {
+        if reader.is_none()
+            || vertex.info.retained_source.is_none()
+            || vertex.info.metadata.is_none()
+        {
+            return Err(Error::Unavailable(
+                "durable vertex requires complete live source binding",
+            ));
+        }
+        let vertex = Arc::try_unwrap(vertex)
+            .map_err(|_| Error::Unavailable("shared durable vertex body publication"))?;
+        let bindings = vertex
+            .envelopes
+            .iter()
+            .map(VerifiedEnvelope::live_representation_binding)
+            .collect();
+        // Candidate and full envelope bytes are dropped here, before graph credit.
+        Ok(Arc::new(Self {
+            info: vertex.info,
+            bindings,
+        }))
+    }
+    fn resident(_: &Arc<Self>) -> Option<Arc<VerifiedVertex>> {
+        None
+    }
+    fn restore(&self, candidate: Candidate) -> Result<VerifiedVertex> {
+        if candidate.id != self.info.id
+            || candidate.header.bytes != self.info.header.bytes
+            || candidate.body.representations().len() != self.bindings.len()
+        {
+            return Err(Error::Unavailable("durable execution metadata mismatch"));
+        }
+        let envelopes = candidate
+            .body
+            .representations()
+            .iter()
+            .zip(&self.bindings)
+            .map(|(bytes, binding)| {
+                binding
+                    .reattach(Envelope::decode(
+                        bytes,
+                        &self.info.header.bytes[560..]
+                            .try_into()
+                            .map_err(|_| Error::Unavailable("durable vertex domain"))?,
+                    )?)
+                    .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(VerifiedVertex {
+            candidate,
+            envelopes,
+            info: self.info.clone(),
+        })
+    }
 }
 /// Live receiver-derived source binding, never serialized or imported as validity.
 #[derive(Clone)]
@@ -54,11 +185,12 @@ impl VerifiedVertex {
     /// Parent-local facts, not the current canonical branch's source by index.
     #[must_use]
     pub const fn facts(&self) -> &ParentFacts {
-        &self.facts
+        &self.info.facts
     }
     pub(crate) fn retained_record(&self) -> Result<Vec<u8>> {
         let bytes = self.candidate.encode();
         let metadata = self
+            .info
             .metadata
             .as_ref()
             .ok_or(Error::Unavailable("unsealed vertex metadata"))?
@@ -67,7 +199,7 @@ impl VerifiedVertex {
         b.extend_from_slice(b"SNF04VR1");
         b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         b.extend_from_slice(&bytes);
-        b.extend_from_slice(&self.facts.source_record);
+        b.extend_from_slice(&self.info.facts.source_record);
         b.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
         b.extend_from_slice(&metadata);
         Ok(b)
@@ -75,11 +207,31 @@ impl VerifiedVertex {
 }
 
 /// Append-only admitted red/blue evidence, within the explicit 4,096-vertex horizon.
-#[derive(Clone, Default)]
-pub struct Graph {
-    vertices: Vec<Arc<VerifiedVertex>>,
+pub type Graph = GraphData<VerifiedVertex>;
+pub(crate) type DurableGraph = GraphData<RetainedVertex>;
+/// Shared graph/order machinery; the public Graph alias preserves resident borrows.
+pub struct GraphData<V> {
+    vertices: Vec<Arc<V>>,
     index: BTreeMap<VertexId, usize>,
     ancestry_reader: Option<Arc<RetainedContext>>,
+}
+impl<V> Default for GraphData<V> {
+    fn default() -> Self {
+        Self {
+            vertices: Vec::new(),
+            index: BTreeMap::new(),
+            ancestry_reader: None,
+        }
+    }
+}
+impl<V> Clone for GraphData<V> {
+    fn clone(&self) -> Self {
+        Self {
+            vertices: self.vertices.clone(),
+            index: self.index.clone(),
+            ancestry_reader: self.ancestry_reader.clone(),
+        }
+    }
 }
 
 /// Prepared atomic graph insertion, not visible until durable publication succeeds.
@@ -96,19 +248,19 @@ impl PreparedVertex {
     pub(crate) fn bind_retained_source(&mut self, bytes: &[u8]) -> Result<()> {
         let vertex = Arc::get_mut(&mut self.vertex)
             .ok_or(Error::Unavailable("shared prepared source binding"))?;
-        if vertex.retained_source.is_some() || vertex.retained_record()? != bytes {
+        if vertex.info.retained_source.is_some() || vertex.retained_record()? != bytes {
             return Err(Error::Unavailable("retained source binding mismatch"));
         }
-        vertex.retained_source = Some(RetainedSource {
+        vertex.info.retained_source = Some(RetainedSource {
             id: raw_hash(bytes),
             record_len: bytes.len(),
             candidate_len: u32le(bytes, 8)? as usize,
         });
         Ok(())
     }
-    pub(crate) fn retain_ancestry(
+    pub(crate) fn retain_ancestry<V: GraphEntry>(
         &mut self,
-        graph: &Graph,
+        graph: &GraphData<V>,
         store: &mut crate::store::Store,
         budget: &JobBudget,
     ) -> Result<()> {
@@ -119,6 +271,7 @@ impl PreparedVertex {
             .clone();
         Arc::get_mut(&mut self.vertex)
             .ok_or(Error::Unavailable("shared prepared ancestry publication"))?
+            .info
             .ancestors
             .retain(store, reader, budget)
     }
@@ -154,12 +307,12 @@ impl CryptoCache {
     }
 }
 
-impl Graph {
+impl<V: GraphEntry> GraphData<V> {
     #[cfg(test)]
     pub(crate) fn retained_ancestry_pages(&self) -> usize {
         self.vertices
             .iter()
-            .map(|v| v.ancestors.retained_ids().len())
+            .map(|v| v.graph_info().ancestors.retained_ids().len())
             .sum()
     }
     pub(crate) fn attach_ancestry_reader(
@@ -186,7 +339,7 @@ impl Graph {
         self.vertices.is_empty()
     }
     /// Complete admitted evidence in topological admission order, for full-range sync.
-    pub fn vertices(&self) -> impl Iterator<Item = &VerifiedVertex> {
+    pub fn vertices(&self) -> impl Iterator<Item = &V> {
         self.vertices.iter().map(AsRef::as_ref)
     }
     /// Disk-backed full evidence export, not a validity constructor. Missing or
@@ -205,6 +358,7 @@ impl Graph {
             .take(count)
             .map(|vertex| {
                 let source = vertex
+                    .graph_info()
                     .retained_source
                     .as_ref()
                     .ok_or(Error::Unavailable("verified durable source binding absent"))?;
@@ -226,11 +380,39 @@ impl Graph {
             .collect()
     }
     /// Indexed receiver-verified evidence lookup.
-    pub fn get(&self, id: VertexId) -> Result<&VerifiedVertex> {
+    /// # Errors
+    /// Refuses an identifier absent from this receiver's admitted graph.
+    pub fn get(&self, id: VertexId) -> Result<&V> {
         self.index
             .get(&id)
             .map(|i| self.vertices[*i].as_ref())
             .ok_or(Error::Unavailable("missing admitted vertex"))
+    }
+    pub(crate) fn header(&self, id: VertexId) -> Result<&Header> {
+        Ok(&self.get(id)?.graph_info().header)
+    }
+    pub(crate) fn retained_candidate_matches(&self, id: VertexId, expected: &[u8]) -> Result<bool> {
+        let index = *self
+            .index
+            .get(&id)
+            .ok_or(Error::Unavailable("missing admitted vertex"))?;
+        let info = self.vertices[index].graph_info();
+        let source = info
+            .retained_source
+            .as_ref()
+            .ok_or(Error::Unavailable("durable vertex source absent"))?;
+        let reader = self
+            .ancestry_reader
+            .as_ref()
+            .ok_or(Error::Unavailable("durable vertex reader absent"))?;
+        let bytes = reader.objects().object(source.id, source.record_len)?;
+        let end = 12_usize
+            .checked_add(source.candidate_len)
+            .ok_or(Error::Unavailable("durable candidate length"))?;
+        Ok(bytes
+            .get(12..end)
+            .ok_or(Error::Unavailable("durable candidate framing"))?
+            == expected)
     }
     /// Owned execution body loaded from exact durable bytes. This is NOT new
     /// admission: the complete candidate must equal this live receiver's already
@@ -241,7 +423,10 @@ impl Graph {
         id: VertexId,
         genesis: &Genesis,
         budget: &JobBudget,
-    ) -> Result<Arc<VerifiedVertex>> {
+    ) -> Result<Arc<VerifiedVertex>>
+    where
+        V: RetainEntry,
+    {
         budget.check()?;
         let index = *self
             .index
@@ -249,9 +434,10 @@ impl Graph {
             .ok_or(Error::Unavailable("missing admitted vertex"))?;
         let vertex = &self.vertices[index];
         let Some(reader) = &self.ancestry_reader else {
-            return Ok(vertex.clone());
+            return V::resident(vertex).ok_or(Error::Unavailable("durable vertex reader absent"));
         };
         let source = vertex
+            .graph_info()
             .retained_source
             .as_ref()
             .ok_or(Error::Unavailable("verified durable source binding absent"))?;
@@ -272,22 +458,9 @@ impl Graph {
                 .ok_or(Error::Unavailable("retained execution candidate"))?,
             genesis,
         )?;
-        // Exact bytes, not just decoded IDs or saved verification metadata. The
-        // typed proof capabilities remain bound to the same ordered envelopes.
-        if candidate.encode() != vertex.candidate.encode() {
-            return Err(Error::Unavailable(
-                "live verified execution source mismatch",
-            ));
-        }
+        let restored = vertex.restore(candidate)?;
         budget.check()?;
-        Ok(Arc::new(VerifiedVertex {
-            candidate,
-            envelopes: vertex.envelopes.clone(),
-            facts: vertex.facts.clone(),
-            metadata: vertex.metadata.clone(),
-            ancestors: vertex.ancestors.clone(),
-            retained_source: vertex.retained_source.clone(),
-        }))
+        Ok(Arc::new(restored))
     }
     pub(crate) fn order(&self, budget: &JobBudget) -> Result<Sg0OrderSnapshotV1> {
         Ok(derive_virtual_order_chain_fast_v1(&View {
@@ -307,7 +480,7 @@ impl Graph {
         }
         Ok(derive_virtual_order_chain_fast_v1(&View {
             graph: self,
-            added: Some(&prepared.vertex),
+            added: Some(&prepared.vertex.info),
             members: None,
             budget,
         })?)
@@ -335,7 +508,7 @@ impl Graph {
                 .index
                 .get(p)
                 .ok_or(Error::Unavailable("candidate parent dependency"))?;
-            let v = &self.vertices[i];
+            let v = self.vertices[i].graph_info();
             bits.union(&v.ancestors)?;
             bits.insert(i)?;
         }
@@ -351,7 +524,7 @@ impl Graph {
             .index
             .get(&a)
             .ok_or(Error::Unavailable("missing ancestor"))?;
-        Ok(self.get(b)?.ancestors.contains(ai)?)
+        Ok(self.get(b)?.graph_info().ancestors.contains(ai)?)
     }
 
     /// Only freshly decoded canonical bytes enter the validity pipeline.
@@ -407,15 +580,19 @@ impl Graph {
             envelopes[i] = Some(v);
         }
         Ok(VerifiedVertex {
-            ancestors: self.parent_closure(&candidate.header.parents)?,
+            info: GraphInfo {
+                id: candidate.id,
+                header: candidate.header.clone(),
+                facts,
+                ancestors: self.parent_closure(&candidate.header.parents)?,
+                metadata: None,
+                retained_source: None,
+            },
             candidate,
-            facts,
             envelopes: envelopes
                 .into_iter()
                 .map(|v| v.expect("complete exact verification"))
                 .collect(),
-            metadata: None,
-            retained_source: None,
         })
     }
     pub(crate) fn seal(
@@ -424,11 +601,11 @@ impl Graph {
         budget: &JobBudget,
     ) -> Result<PreparedVertex> {
         let id = VertexId::from_bytes(vertex.candidate.id);
-        vertex.metadata = Some(
+        vertex.info.metadata = Some(
             derive_append_vertex_data_v1(
                 &View {
                     graph: self,
-                    added: Some(&vertex),
+                    added: Some(&vertex.info),
                     members: None,
                     budget,
                 },
@@ -447,7 +624,10 @@ impl Graph {
             revision: self.len(),
         })
     }
-    pub(crate) fn publish(&mut self, prepared: PreparedVertex) -> Result<()> {
+    pub(crate) fn publish(&mut self, prepared: PreparedVertex) -> Result<()>
+    where
+        V: RetainEntry,
+    {
         if prepared.revision != self.len()
             || self
                 .index
@@ -455,27 +635,26 @@ impl Graph {
         {
             return Err(Error::Unavailable("stale graph publication"));
         }
-        self.index.insert(
-            VertexId::from_bytes(prepared.vertex.candidate.id),
-            self.len(),
-        );
-        self.vertices.push(prepared.vertex);
+        let id = VertexId::from_bytes(prepared.vertex.candidate.id);
+        let entry = V::retain(prepared.vertex, self.ancestry_reader.as_ref())?;
+        self.index.insert(id, self.len());
+        self.vertices.push(entry);
         Ok(())
     }
 }
 
 // Each view exposes ONLY admitted evidence plus, privately, one already fully
 // verified candidate. Ancestry is derived on insert from immutable parent closure.
-struct View<'a> {
-    graph: &'a Graph,
-    added: Option<&'a VerifiedVertex>,
+struct View<'a, V> {
+    graph: &'a GraphData<V>,
+    added: Option<&'a GraphInfo>,
     members: Option<&'a PagedAncestry>,
     budget: &'a JobBudget,
 }
-impl View<'_> {
-    fn lookup(&self, id: VertexId) -> std::result::Result<&VerifiedVertex, Sg0Error> {
+impl<V: GraphEntry> View<'_, V> {
+    fn lookup(&self, id: VertexId) -> std::result::Result<&GraphInfo, Sg0Error> {
         self.budget.graph_read()?;
-        if let Some(v) = self.added.filter(|v| v.candidate.id == id.into_bytes()) {
+        if let Some(v) = self.added.filter(|v| v.id == id.into_bytes()) {
             return Ok(v);
         }
         let i = *self.graph.index.get(&id).ok_or(Sg0Error::MissingVertex)?;
@@ -484,10 +663,10 @@ impl View<'_> {
         {
             return Err(Sg0Error::MissingVertex);
         }
-        Ok(&self.graph.vertices[i])
+        Ok(self.graph.vertices[i].graph_info())
     }
 }
-impl ReceiverVerifiedSg0Graph for View<'_> {
+impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
     fn visit_vertex_ids(
         &self,
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
@@ -504,7 +683,7 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
             }
         }
         if let Some(v) = self.added {
-            visitor(VertexId::from_bytes(v.candidate.id))?;
+            visitor(VertexId::from_bytes(v.id))?;
         }
         Ok(())
     }
@@ -516,10 +695,10 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
         }
     }
     fn parent_set(&self, id: VertexId) -> std::result::Result<Sg0ParentSetV1, Sg0Error> {
-        Ok(self.lookup(id)?.candidate.header.parents.clone())
+        Ok(self.lookup(id)?.header.parents.clone())
     }
     fn receiver_verified_work_be(&self, id: VertexId) -> std::result::Result<Digest, Sg0Error> {
-        Ok(Uint256::from_u64(self.lookup(id)?.candidate.header.work).to_be_bytes())
+        Ok(Uint256::from_u64(self.lookup(id)?.header.work).to_be_bytes())
     }
     fn vertex_data(&self, id: VertexId) -> std::result::Result<Option<Sg0VertexDataV1>, Sg0Error> {
         Ok(self.lookup(id)?.metadata.clone())
@@ -533,7 +712,7 @@ impl ReceiverVerifiedSg0Graph for View<'_> {
         for (i, v) in self.graph.vertices.iter().enumerate() {
             self.budget.graph_read()?;
             if bits.contains(i)? {
-                visitor(VertexId::from_bytes(v.candidate.id))?;
+                visitor(VertexId::from_bytes(v.graph_info().id))?;
             }
         }
         Ok(())
@@ -563,7 +742,11 @@ mod tests {
 
     // Synthetic receiver-view fixture ONLY. No work, proof or live admission
     // acceptance follows from these private test-only vertex constructions.
-    fn synthetic_vertex(graph: &Graph, label: u8, labels: &[u8]) -> VerifiedVertex {
+    fn synthetic_vertex<V: GraphEntry>(
+        graph: &GraphData<V>,
+        label: u8,
+        labels: &[u8],
+    ) -> VerifiedVertex {
         let parents = if labels.is_empty() {
             Sg0ParentSetV1::Anchor
         } else {
@@ -581,31 +764,37 @@ mod tests {
             seed: [0; 32],
             key_material: [0; 32],
         };
-        VerifiedVertex {
-            ancestors: graph.parent_closure(&parents).unwrap(),
-            candidate: Candidate {
-                id: id(label).into_bytes(),
-                body: Body::new(&[9; 32], &[]).unwrap(),
-                proof: [0; 52],
-                header: Header {
-                    bytes: [0; 592],
-                    parents,
-                    timestamp: u64::from(label),
-                    epoch: 0,
-                    daa: [0; 32],
-                    work: 1,
-                    source_index: 0,
-                    source_checkpoint: [0; 32],
-                    source_j: [0; 32],
-                    seed: [0; 32],
-                    owner: [0; 32],
-                    reward_nonce: [0; 32],
-                },
+        let ancestors = graph.parent_closure(&parents).unwrap();
+        let candidate = Candidate {
+            id: id(label).into_bytes(),
+            body: Body::new(&[9; 32], &[]).unwrap(),
+            proof: [0; 52],
+            header: Header {
+                bytes: [0; 592],
+                parents,
+                timestamp: u64::from(label),
+                epoch: 0,
+                daa: [0; 32],
+                work: 1,
+                source_index: 0,
+                source_checkpoint: [0; 32],
+                source_j: [0; 32],
+                seed: [0; 32],
+                owner: [0; 32],
+                reward_nonce: [0; 32],
             },
+        };
+        VerifiedVertex {
+            info: GraphInfo {
+                id: candidate.id,
+                header: candidate.header.clone(),
+                facts,
+                ancestors,
+                metadata: None,
+                retained_source: None,
+            },
+            candidate,
             envelopes: Vec::new(),
-            facts,
-            metadata: None,
-            retained_source: None,
         }
     }
 
@@ -641,6 +830,88 @@ mod tests {
         graph
     }
     #[test]
+    fn disk_detach_graph_drops_published_carriers_and_preserves_exact_metadata_order_and_sources() {
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let resident = diamond(&budget);
+        let mut durable = DurableGraph::default();
+        durable
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic compact graph fixture")
+            .unwrap();
+        let mut originals = Vec::new();
+        for (label, parents) in [(1, &[][..]), (2, &[1][..]), (3, &[1][..]), (4, &[2, 3][..])] {
+            let mut prepared = durable
+                .seal(synthetic_vertex(&durable, label, parents), &budget)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            originals.push(prepared.vertex().candidate().encode());
+            store
+                .commit(&[&record], b"synthetic complete original source")
+                .unwrap();
+            prepared
+                .retain_ancestry(&durable, &mut store, &budget)
+                .unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            let weak_body = Arc::downgrade(&prepared.vertex);
+            durable.publish(prepared).unwrap();
+            assert!(weak_body.upgrade().is_none());
+        }
+        assert_eq!(
+            durable.order(&budget).unwrap(),
+            resident.order(&budget).unwrap()
+        );
+        let parents = Sg0ParentSetV1::vertices(vec![id(2), id(3)]).unwrap();
+        assert_eq!(
+            durable.parent_order(&parents, &budget).unwrap(),
+            resident.parent_order(&parents, &budget).unwrap()
+        );
+        assert_eq!(durable.export_retained_range(0, 32).unwrap(), originals);
+        assert_eq!(
+            durable.is_ancestor(id(1), id(4)).unwrap(),
+            resident.is_ancestor(id(1), id(4)).unwrap()
+        );
+        assert!(durable.vertices().all(|v| v.bindings.is_empty()));
+        drop(store);
+        assert_eq!(durable.export_retained_range(0, 32).unwrap(), originals);
+    }
+    #[test]
+    fn disk_detach_graph_unbound_or_shared_body_publication_refuses_without_partial_credit() {
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut durable = DurableGraph::default();
+        durable
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        let prepared = durable
+            .seal(synthetic_vertex(&durable, 1, &[]), &budget)
+            .unwrap();
+        assert!(durable.publish(prepared).is_err());
+        assert!(durable.is_empty());
+        assert!(durable.get(id(1)).is_err());
+        store
+            .begin_replay(b"synthetic shared compact publication")
+            .unwrap();
+        let mut prepared = durable
+            .seal(synthetic_vertex(&durable, 1, &[]), &budget)
+            .unwrap();
+        let record = prepared.vertex().retained_record().unwrap();
+        store
+            .commit(&[&record], b"synthetic complete original source")
+            .unwrap();
+        prepared
+            .retain_ancestry(&durable, &mut store, &budget)
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        let held = prepared.vertex.clone();
+        assert!(durable.publish(prepared).is_err());
+        assert!(durable.is_empty());
+        assert!(durable.get(id(1)).is_err());
+        assert_eq!(held.candidate().id, id(1).into_bytes());
+    }
+    #[test]
     fn disk_source_export_exact_order_bounds_and_held_directory() {
         let (_temp, mut store) = crate::store::ancestry_test_store();
         let graph = source_graph(&mut store, &JobBudget::checkpoint().unwrap());
@@ -665,7 +936,7 @@ mod tests {
         let mut wrong = bytes.clone();
         *wrong.last_mut().unwrap() ^= 1;
         assert!(prepared.bind_retained_source(&wrong).is_err());
-        assert!(prepared.vertex.retained_source.is_none());
+        assert!(prepared.vertex.info.retained_source.is_none());
         prepared.bind_retained_source(&bytes).unwrap();
         assert!(prepared.bind_retained_source(&bytes).is_err());
         graph.publish(prepared).unwrap();
@@ -690,6 +961,7 @@ mod tests {
             .vertices
             .last()
             .unwrap()
+            .info
             .retained_source
             .as_ref()
             .unwrap();
@@ -723,6 +995,7 @@ mod tests {
             .vertices
             .last()
             .unwrap()
+            .info
             .retained_source
             .as_ref()
             .unwrap();
@@ -789,7 +1062,16 @@ mod tests {
                 .map(|v| v.retained_record().unwrap())
                 .collect::<Vec<_>>()
         );
-        assert_eq!(graph.get(id(4)).unwrap().ancestors.retained_ids().len(), 1);
+        assert_eq!(
+            graph
+                .get(id(4))
+                .unwrap()
+                .info
+                .ancestors
+                .retained_ids()
+                .len(),
+            1
+        );
         store.finish_replay(fence).unwrap();
         drop(graph);
         drop(store);
@@ -813,7 +1095,7 @@ mod tests {
             .begin_job(b"synthetic already-verified graph")
             .unwrap();
         let graph = disk_diamond(&mut store, &budget);
-        let page = graph.get(id(3)).unwrap().ancestors.retained_ids()[0];
+        let page = graph.get(id(3)).unwrap().info.ancestors.retained_ids()[0];
         std::fs::remove_file(
             temp.path()
                 .join("store")
@@ -922,7 +1204,7 @@ mod tests {
             .unwrap();
         let view = View {
             graph: &branch,
-            added: Some(prepared.vertex()),
+            added: Some(&prepared.vertex().info),
             members: None,
             budget: &budget,
         };
