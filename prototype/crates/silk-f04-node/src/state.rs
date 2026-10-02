@@ -198,7 +198,7 @@ impl BranchState {
         budget: &crate::budget::JobBudget,
     ) -> Result<CheckpointTransition> {
         budget.check()?;
-        let mut next = self.materialize_recovery(Some(budget))?;
+        let mut next = self.materialize_ledger(Some(budget))?;
         let j = self
             .checkpoint_index
             .checked_add(1)
@@ -392,19 +392,21 @@ impl BranchState {
     fn hash_state_checked(&self, budget: Option<&crate::budget::JobBudget>) -> Result<Digest> {
         let check = || budget.map_or(Ok(()), crate::budget::JobBudget::check);
         check()?;
+        let nullifiers = self.nullifiers.materialize(budget)?;
         let nf = hash_stream_checked(
             "SilkNode-F0-NF",
             &self.domain,
             self.nullifiers.len(),
-            self.nullifiers.iter().map(|x| x.as_slice()),
+            nullifiers.iter().map(Digest::as_slice),
             budget,
         )?;
         check()?;
+        let effects = self.effects.materialize(budget)?;
         let ef = hash_stream_checked(
             "SilkNode-F0-EF",
             &self.domain,
             self.effects.len(),
-            self.effects.iter().map(|x| x.as_slice()),
+            effects.iter().map(Digest::as_slice),
             budget,
         )?;
         check()?;
@@ -538,11 +540,21 @@ impl BranchState {
         b
     }
 
+    #[cfg(test)]
     pub(crate) fn delta(
         &self,
         prior: &Self,
         outcomes: &[EffectOutcome],
         rollback: bool,
+    ) -> Result<Vec<u8>> {
+        self.delta_checked(prior, outcomes, rollback, None)
+    }
+    pub(crate) fn delta_checked(
+        &self,
+        prior: &Self,
+        outcomes: &[EffectOutcome],
+        rollback: bool,
+        budget: Option<&crate::budget::JobBudget>,
     ) -> Result<Vec<u8>> {
         let mut b = Vec::new();
         b.extend_from_slice(b"SNF04DL1");
@@ -578,7 +590,9 @@ impl BranchState {
                 .into_iter()
                 .zip([&prior.nullifiers, &prior.effects])
             {
-                let added: Vec<_> = set.0.difference(set.1).collect();
+                let current = set.0.materialize(budget)?;
+                let previous = set.1.materialize(budget)?;
+                let added: Vec<_> = current.difference(&previous).collect();
                 b.extend_from_slice(&(added.len() as u32).to_le_bytes());
                 for x in added {
                     b.extend_from_slice(x);
@@ -592,7 +606,7 @@ impl BranchState {
             let added_count =
                 u32::try_from(added_len).map_err(|_| Error::Unavailable("delta recovery count"))?;
             b.extend_from_slice(&added_count.to_le_bytes());
-            let recovery = self.recovery.materialize(None)?;
+            let recovery = self.recovery.materialize(budget)?;
             let added = recovery.resident().iter_from(prior.recovery.len())?;
             for x in added {
                 b.extend_from_slice(x.as_slice());
@@ -604,22 +618,34 @@ impl BranchState {
         Ok(b)
     }
 
-    pub(crate) fn materialize_recovery(
+    pub(crate) fn materialize_ledger(
         &self,
         budget: Option<&crate::budget::JobBudget>,
     ) -> Result<Self> {
         let mut state = self.clone();
         state.recovery = self.recovery.materialize(budget)?;
+        state.nullifiers = self.nullifiers.materialize(budget)?;
+        state.effects = self.effects.materialize(budget)?;
         Ok(state)
     }
-    pub(crate) fn retain_recovery(
+    pub(crate) fn retain_ledger(
         &self,
         store: &mut crate::store::Store,
         budget: &crate::budget::JobBudget,
     ) -> Result<Self> {
         let mut state = self.clone();
         state.recovery = self.recovery.retain(store, self.domain, budget)?;
+        state.nullifiers = self
+            .nullifiers
+            .retain(store, self.domain, *b"SNF04NP1", budget)?;
+        state.effects = self
+            .effects
+            .retain(store, self.domain, *b"SNF04EP1", budget)?;
         Ok(state)
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_set_pages(&self) -> [Vec<Digest>; 2] {
+        [self.nullifiers.retained_ids(), self.effects.retained_ids()]
     }
     #[cfg(test)]
     pub(crate) fn retained_recovery_pages(&self) -> Vec<Digest> {
@@ -1228,6 +1254,24 @@ mod tests {
             ],
         );
         assert_eq!(state.hash_state(), expected);
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic set hash serializer")
+            .unwrap();
+        let retained = state.retain_ledger(&mut store, &budget).unwrap();
+        assert!(
+            retained
+                .retained_set_pages()
+                .iter()
+                .all(|pages| pages.len() > 1)
+        );
+        assert_eq!(
+            retained.hash_state_checked(Some(&budget)).unwrap(),
+            expected
+        );
+        let restored = retained.materialize_ledger(Some(&budget)).unwrap();
+        assert!(restored.retained_set_pages().iter().all(Vec::is_empty));
         for i in 0..132_u16 {
             assert_eq!(
                 state.contains_nullifier(&set_key(i)),
@@ -1235,6 +1279,14 @@ mod tests {
             );
             assert_eq!(
                 state.contains_effect(&set_key(i)),
+                effects.contains(&set_key(i))
+            );
+            assert_eq!(
+                restored.contains_nullifier(&set_key(i)),
+                nullifiers.contains(&set_key(i))
+            );
+            assert_eq!(
+                restored.contains_effect(&set_key(i)),
                 effects.contains(&set_key(i))
             );
         }
@@ -1302,6 +1354,26 @@ mod tests {
         }
         assert_eq!(prior.delta(&next, &[], true).unwrap(), rollback);
         assert_eq!(prior.manifest(), before);
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic set delta serializer")
+            .unwrap();
+        let stored_prior = prior.retain_ledger(&mut store, &budget).unwrap();
+        let stored_next = next.retain_ledger(&mut store, &budget).unwrap();
+        assert_eq!(
+            stored_next
+                .delta_checked(&stored_prior, &outcomes, false, Some(&budget))
+                .unwrap(),
+            literal
+        );
+        assert_eq!(
+            stored_prior
+                .delta_checked(&stored_next, &[], true, Some(&budget))
+                .unwrap(),
+            rollback
+        );
+        assert_eq!(stored_prior.manifest(), before);
         let restored = prior.clone();
         assert_eq!(restored.manifest(), before);
         assert_eq!(restored.hash_state(), prior.hash_state());

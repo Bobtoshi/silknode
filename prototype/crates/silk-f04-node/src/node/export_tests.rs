@@ -57,9 +57,16 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.leaves(), 7);
     let completed = node.core.state.clone();
     assert_eq!(completed.retained_recovery_pages().len(), 1);
+    assert!(
+        completed
+            .retained_set_pages()
+            .iter()
+            .all(|pages| pages.len() == 1)
+    );
     assert!(node.state_view.get().is_none());
     let snapshot = node.state().unwrap().clone();
     assert!(snapshot.retained_recovery_pages().is_empty());
+    assert!(snapshot.retained_set_pages().iter().all(Vec::is_empty));
     assert_eq!(snapshot.recovery().len(), 7);
     assert_eq!(snapshot.manifest(), completed.manifest());
     // Public snapshots remain resident and safely cloneable. Clearing this
@@ -78,6 +85,17 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.manifest(), completed.manifest());
     assert_eq!(node.local_head().unwrap(), pin);
     fs::rename(&recovery_held, &recovery_path).unwrap();
+    for id in completed.retained_set_pages().into_iter().flatten() {
+        let path = root.join(format!("{}.obj", hex::encode(id)));
+        let held = path.with_extension("held");
+        fs::rename(&path, &held).unwrap();
+        node.state_view.take();
+        assert!(matches!(node.state(), Err(Error::Io(_))));
+        assert!(node.state_view.get().is_none());
+        assert_eq!(node.core.state.manifest(), completed.manifest());
+        assert_eq!(node.local_head().unwrap(), pin);
+        fs::rename(&held, &path).unwrap();
+    }
     let ids = node.core.order.eligible_order().to_vec();
     let prior = node
         .core
@@ -86,6 +104,12 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         .unwrap()
         .clone();
     assert_eq!(prior.retained_recovery_pages().len(), 1);
+    assert!(
+        prior
+            .retained_set_pages()
+            .iter()
+            .all(|pages| pages.len() == 1)
+    );
     let second_bodies = ids[8..16]
         .iter()
         .map(|id| {
@@ -142,11 +166,37 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.manifest(), completed.manifest());
     assert_eq!(node.local_head().unwrap(), pin);
     fs::rename(&prior_held, &prior_page).unwrap();
+    for id in prior.retained_set_pages().into_iter().flatten() {
+        let path = root.join(format!("{}.obj", hex::encode(id)));
+        let held = path.with_extension("held");
+        fs::rename(&path, &held).unwrap();
+        assert!(matches!(
+            prior.execute(batch, &JobBudget::checkpoint().unwrap()),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            node.core.prepare_step(&JobBudget::checkpoint().unwrap()),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            completed.delta_checked(
+                &prior,
+                &replayed.outcomes,
+                false,
+                Some(&JobBudget::checkpoint().unwrap())
+            ),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(node.core.state.manifest(), completed.manifest());
+        assert_eq!(node.local_head().unwrap(), pin);
+        fs::rename(&held, &path).unwrap();
+    }
     node.core.order = complete_order;
     node.core.status = Status::Ready;
     let exports = node.export_range(0, 32).unwrap();
     assert_eq!(exports.len(), 16);
     let mut representations = 0;
+    let mut accepted_effects = std::collections::BTreeSet::new();
     let mut first_nonempty = None;
     for (position, id) in ids.iter().enumerate() {
         let loaded = node
@@ -173,6 +223,14 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
             .iter()
             .zip(loaded.candidate().body.representations())
         {
+            let envelope = verified.envelope();
+            let effect = envelope.effect_id();
+            if snapshot.contains_effect(&effect) {
+                accepted_effects.insert(effect);
+                for nf in envelope.nullifiers() {
+                    assert!(snapshot.contains_nullifier(&nf));
+                }
+            }
             assert_eq!(
                 verified.envelope().bytes().as_slice(),
                 original_bytes.as_slice()
@@ -185,6 +243,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         // No full loaded carrier survives this iteration in the retained graph.
     }
     assert!(representations >= 3);
+    assert_eq!(accepted_effects.len(), 2);
     let (position, source, repeated) = first_nonempty.unwrap();
     assert!(
         position < 8,
@@ -255,25 +314,29 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     drop(node);
     // A damaged auxiliary page is NOT damaged original HEAD lineage. A fresh
     // reopen must stop, never fall back to PREVIOUS and expose an older ledger.
-    let recovery_bytes = fs::read(&recovery_path).unwrap();
-    let mut damaged = recovery_bytes.clone();
+    let set_path = root.join(format!(
+        "{}.obj",
+        hex::encode(completed.retained_set_pages()[0][0])
+    ));
+    let set_bytes = fs::read(&set_path).unwrap();
+    let mut damaged = set_bytes.clone();
     *damaged.last_mut().unwrap() ^= 1;
-    fs::write(&recovery_path, damaged).unwrap();
+    fs::write(&set_path, damaged).unwrap();
     assert!(matches!(
         Node::open_retained_pinned(&root, &margin, accepted_genesis, &parameters, pin),
-        Err(Error::Unavailable("retained recovery page damaged"))
+        Err(Error::Unavailable("retained ledger set page damaged"))
     ));
     assert_eq!(
         fs::read(root.join("HEAD")).unwrap(),
         hex::encode(pin).as_bytes()
     );
     assert!(root.join("ACTIVE_REPLAY").exists());
-    fs::write(&recovery_path, recovery_bytes).unwrap();
+    fs::write(&set_path, set_bytes).unwrap();
     for (name, hash) in original {
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; recovery_history_disk_backed=true; public_snapshot_resident=true; missing_recovery_refuses_first_snapshot_execution_and_scratch_rollback=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_delta_and_scratch_rollback=true; damaged_auxiliary_cold_replay_stops_without_previous_fallback=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
     );
 }
 

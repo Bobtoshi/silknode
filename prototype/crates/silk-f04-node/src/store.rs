@@ -305,9 +305,50 @@ impl Store {
                 "recovery page requires active verified transition",
             ));
         }
+        self.retain_ledger_page(
+            bytes,
+            "recovery page writer stopped",
+            "retained recovery page damaged",
+            "post-recovery-page host margin",
+            "retained recovery page publication failed",
+        )
+    }
+    /// Receiver-derived ordered keys only; no saved set or head authority.
+    pub(crate) fn retain_ledger_set_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        const HEADER: usize = 52;
+        let keys = if bytes.len() >= HEADER {
+            u32le(bytes, 48)? as usize
+        } else {
+            0
+        };
+        if !(1..=64).contains(&keys)
+            || !matches!(bytes.get(..8), Some(b"SNF04NP1" | b"SNF04EP1"))
+            || bytes.len() != HEADER + keys * 32
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "ledger set page requires active verified transition",
+            ));
+        }
+        self.retain_ledger_page(
+            bytes,
+            "ledger set page writer stopped",
+            "retained ledger set page damaged",
+            "post-ledger-set-page host margin",
+            "retained ledger set page publication failed",
+        )
+    }
+    fn retain_ledger_page(
+        &mut self,
+        bytes: &[u8],
+        stopped: &'static str,
+        damaged: &'static str,
+        margin: &'static str,
+        failed: &'static str,
+    ) -> Result<Digest> {
         let was_poisoned = self.poisoned;
         if was_poisoned && self.active_replay()?.is_none() {
-            return Err(Error::Unavailable("recovery page writer stopped"));
+            return Err(Error::Unavailable(stopped));
         }
         let id = raw_hash(bytes);
         match self.object(id) {
@@ -315,7 +356,7 @@ impl Store {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => {
                 self.poisoned = true;
-                return Err(Error::Unavailable("retained recovery page damaged"));
+                return Err(Error::Unavailable(damaged));
             }
         }
         self.poisoned = false;
@@ -329,7 +370,7 @@ impl Store {
             let id = self.put(bytes)?;
             self.directory.sync_all()?;
             if fs2::available_space(&self.margin)? < MARGIN {
-                return Err(Error::Paused("post-recovery-page host margin"));
+                return Err(Error::Paused(margin));
             }
             Ok(id)
         })();
@@ -340,9 +381,7 @@ impl Store {
             }
             // Uncertain auxiliary writes must never trigger previous-head
             // fallback in this attempt. Original complete lineage stays intact.
-            Err(_) => Err(Error::Unavailable(
-                "retained recovery page publication failed",
-            )),
+            Err(_) => Err(Error::Unavailable(failed)),
         }
     }
     /// Retain a bounded traversal page ONLY inside an already fenced cold replay.

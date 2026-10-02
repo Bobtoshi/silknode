@@ -255,8 +255,8 @@ impl Core {
                 .cloned()
                 .unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
             // A cached reversible snapshot is not permission to publish a
-            // rollback whose original recovery pages are now unreadable.
-            let state = Arc::new(state.materialize_recovery(Some(budget))?);
+            // rollback whose original ledger pages are now unreadable.
+            let state = Arc::new(state.materialize_ledger(Some(budget))?);
             let status = if status_for(&state, ids) == Status::Ready {
                 Status::Ready
             } else if self.status == Status::ArchiveReplay {

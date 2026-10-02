@@ -49,7 +49,7 @@ pub struct Node {
     recovered_previous: bool,
     pending: Option<PendingAdmission>,
     // Successful explicitly requested public snapshot ONLY. Core/caches keep
-    // disk-backed recovery directories; an I/O failure is never cached as state.
+    // disk-backed ledger directories; an I/O failure is never cached as state.
     state_view: OnceLock<(Digest, BranchState)>,
 }
 // Field order joins the worker before native timers are disarmed on every exit.
@@ -325,11 +325,16 @@ impl Node {
                 2 | 3 if index > 0 => {
                     let mut s = core.prepare_step(&budget)?;
                     if (r.kind == 3) != s.rollback
-                        || s.state.delta(&core.state, &s.outcomes, s.rollback)? != data
+                        || s.state.delta_checked(
+                            &core.state,
+                            &s.outcomes,
+                            s.rollback,
+                            Some(&budget),
+                        )? != data
                     {
                         return Err(Error::Unavailable("retained reversible delta mismatch"));
                     }
-                    s.state = Arc::new(s.state.retain_recovery(store, &budget)?);
+                    s.state = Arc::new(s.state.retain_ledger(store, &budget)?);
                     core.publish_step(s)?;
                     budget
                 }
@@ -375,9 +380,9 @@ impl Node {
         Ok(self.core.status)
     }
     /// Only a complete reconciled ledger is exposed as current.
-    /// Recovery rows are checked and materialized once per checkpoint for this
+    /// Ledger payloads are checked and materialized once per checkpoint for this
     /// immutable compatibility view. Repeated borrows reuse that snapshot;
-    /// execution and rollback independently load their retained recovery pages.
+    /// execution and rollback independently load their retained ledger pages.
     pub fn state(&self) -> Result<&BranchState> {
         self.healthy()?;
         self.idle()?;
@@ -387,7 +392,7 @@ impl Node {
         let checkpoint = self.core.state.checkpoint_id();
         if self.state_view.get().is_none() {
             let budget = JobBudget::checkpoint()?;
-            let state = self.core.state.materialize_recovery(Some(&budget))?;
+            let state = self.core.state.materialize_ledger(Some(&budget))?;
             budget.check()?;
             let _ = self.state_view.set((checkpoint, state));
         }
@@ -625,9 +630,12 @@ impl Node {
         let result = (|| {
             let mut guard = NativeGuard::arm(&budget)?;
             let mut step = self.core.prepare_step(&budget)?;
-            let data = step
-                .state
-                .delta(&self.core.state, &step.outcomes, step.rollback)?;
+            let data = step.state.delta_checked(
+                &self.core.state,
+                &step.outcomes,
+                step.rollback,
+                Some(&budget),
+            )?;
             budget.check()?;
             self.commit(
                 if step.rollback { 3 } else { 2 },
@@ -637,7 +645,7 @@ impl Node {
                 self.core.graph.len() as u64,
                 step.status,
             )?;
-            step.state = Arc::new(step.state.retain_recovery(&mut self.store, &budget)?);
+            step.state = Arc::new(step.state.retain_ledger(&mut self.store, &budget)?);
             self.state_view.take();
             self.core.publish_step(step)?;
             budget.check()?;
