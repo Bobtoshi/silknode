@@ -1240,13 +1240,27 @@ fn merge_order_for(
     if parents.is_empty() {
         return Ok(Vec::new());
     }
-    let past = closure_for_tips(graph, parents)?;
+    let mut past = BTreeSet::new();
+    let mut selected_closure = None;
+    for parent in parents {
+        ensure_vertex_exists(graph, *parent)?;
+        let mut closure = collect_past(graph, *parent)?;
+        closure.insert(*parent);
+        past.extend(closure.iter().copied());
+        if selected_parent == Sg0SelectedParentV1::Vertex(*parent) {
+            selected_closure = Some(closure);
+        }
+    }
     let selected_closure = match selected_parent {
         Sg0SelectedParentV1::Anchor => BTreeSet::new(),
         Sg0SelectedParentV1::Vertex(selected) => {
-            let mut closure = collect_past(graph, selected)?;
-            closure.insert(selected);
-            closure
+            if let Some(closure) = selected_closure {
+                closure
+            } else {
+                let mut closure = collect_past(graph, selected)?;
+                closure.insert(selected);
+                closure
+            }
         }
     };
     let merge: BTreeSet<_> = past.difference(&selected_closure).copied().collect();
@@ -1694,6 +1708,27 @@ mod tests {
     }
 
     // Exact pre-change algorithms, frozen as local test-only byte/result oracles.
+    fn reference_merge_walk(
+        graph: &impl ReceiverVerifiedSg0Graph,
+        parents: &[VertexId],
+        selected_parent: Sg0SelectedParentV1,
+    ) -> Result<Vec<VertexId>, Sg0Error> {
+        if parents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let past = closure_for_tips(graph, parents)?;
+        let selected_closure = match selected_parent {
+            Sg0SelectedParentV1::Anchor => BTreeSet::new(),
+            Sg0SelectedParentV1::Vertex(selected) => {
+                let mut closure = collect_past(graph, selected)?;
+                closure.insert(selected);
+                closure
+            }
+        };
+        let merge: BTreeSet<_> = past.difference(&selected_closure).copied().collect();
+        kahn_merge_order(graph, &merge)
+    }
+
     fn reference_selected_walk(
         graph: &impl ReceiverVerifiedSg0Graph,
         tip: VertexId,
@@ -1717,7 +1752,7 @@ mod tests {
         for vertex in selected_chain {
             let parents = validated_parents(graph, vertex)?;
             let selected_parent = metadata(graph, vertex)?.selected_parent();
-            for merge_vertex in merge_order_for(graph, &parents, selected_parent)? {
+            for merge_vertex in reference_merge_walk(graph, &parents, selected_parent)? {
                 if !emitted.insert(merge_vertex) {
                     return Err(Sg0Error::Invariant);
                 }
@@ -1759,7 +1794,7 @@ mod tests {
             .0;
 
         let selected_parent = Sg0SelectedParentV1::Vertex(selected);
-        let merge_order = merge_order_for(graph, tips, selected_parent)?;
+        let merge_order = reference_merge_walk(graph, tips, selected_parent)?;
         let mut blue = blue_closure(graph, selected)?;
         let mut virtual_colors = BTreeMap::new();
         for candidate in &merge_order {
@@ -1856,11 +1891,15 @@ mod tests {
         for tips in [vec![1], vec![2], vec![2, 3], vec![6, 7], vec![8]] {
             let tips: Vec<_> = tips.into_iter().map(TestGraph::id).collect();
             graph.metadata_reads.set(0);
+            graph.past_visits.set(0);
             let reference = reference_selected_tips(&graph, &tips).unwrap();
             let prior_reads = graph.metadata_reads.get();
+            let prior_walks = graph.past_visits.get();
             graph.metadata_reads.set(0);
+            graph.past_visits.set(0);
             let actual = derive_for_tips(&graph, &tips).unwrap();
             let actual_reads = graph.metadata_reads.get();
+            let actual_walks = graph.past_visits.get();
             assert_eq!(actual, reference); // every snapshot field and commitment
             let mut chain_len = 0;
             let mut cursor = reference.selected_tip;
@@ -1872,7 +1911,79 @@ mod tests {
                 };
             }
             assert_eq!(prior_reads - actual_reads, tips.len() + chain_len);
+            assert_eq!(prior_walks - actual_walks, chain_len);
         }
+    }
+
+    #[test]
+    fn selected_merge_closure_reuses_only_an_already_read_parent_past() {
+        let mut graph = TestGraph::default();
+        graph.push(1, Sg0ParentSetV1::anchor(), 1);
+        for value in 2..=4 {
+            graph.push(
+                value,
+                Sg0ParentSetV1::vertices(vec![TestGraph::id(1)]).unwrap(),
+                u64::from(value),
+            );
+        }
+        for (parents, selected, saved_walks) in [
+            (vec![2], Sg0SelectedParentV1::Vertex(TestGraph::id(2)), 1),
+            (vec![2, 3], Sg0SelectedParentV1::Vertex(TestGraph::id(2)), 1),
+            (vec![2, 3], Sg0SelectedParentV1::Vertex(TestGraph::id(3)), 1),
+            (vec![2, 3], Sg0SelectedParentV1::Vertex(TestGraph::id(4)), 0),
+            (vec![2, 3], Sg0SelectedParentV1::Anchor, 0),
+            (vec![], Sg0SelectedParentV1::Vertex(TestGraph::id(99)), 0),
+        ] {
+            let parents: Vec<_> = parents.into_iter().map(TestGraph::id).collect();
+            graph.past_visits.set(0);
+            let reference = reference_merge_walk(&graph, &parents, selected).unwrap();
+            let prior_walks = graph.past_visits.get();
+            graph.past_visits.set(0);
+            assert_eq!(
+                merge_order_for(&graph, &parents, selected).unwrap(),
+                reference
+            );
+            assert_eq!(prior_walks - graph.past_visits.get(), saved_walks);
+        }
+    }
+
+    #[test]
+    fn selected_merge_closure_still_reads_every_parent_and_refuses_bad_ancestry() {
+        let mut graph = TestGraph::default();
+        graph.push(1, Sg0ParentSetV1::anchor(), 1);
+        graph.push(2, Sg0ParentSetV1::anchor(), 1);
+        graph.push(
+            3,
+            Sg0ParentSetV1::vertices(vec![TestGraph::id(2)]).unwrap(),
+            1,
+        );
+        let parents = [TestGraph::id(1), TestGraph::id(3)];
+        let selected = Sg0SelectedParentV1::Vertex(parents[0]);
+        graph.vertices.remove(&TestGraph::id(2));
+        assert_eq!(
+            merge_order_for(&graph, &parents, selected),
+            reference_merge_walk(&graph, &parents, selected)
+        );
+        assert_eq!(
+            merge_order_for(&graph, &parents, selected),
+            Err(Sg0Error::MissingVertex)
+        );
+        graph.vertices.get_mut(&parents[1]).unwrap().parents =
+            Sg0ParentSetV1::vertices(vec![parents[1]]).unwrap();
+        assert_eq!(
+            merge_order_for(&graph, &parents, selected),
+            reference_merge_walk(&graph, &parents, selected)
+        );
+        assert!(merge_order_for(&graph, &parents, selected).is_err());
+        let missing_selected = Sg0SelectedParentV1::Vertex(TestGraph::id(99));
+        assert_eq!(
+            merge_order_for(&graph, &[parents[0]], missing_selected),
+            reference_merge_walk(&graph, &[parents[0]], missing_selected)
+        );
+        assert_eq!(
+            merge_order_for(&graph, &[parents[0]], missing_selected),
+            Err(Sg0Error::MissingVertex)
+        );
     }
 
     #[test]
