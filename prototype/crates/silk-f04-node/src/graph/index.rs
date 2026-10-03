@@ -214,6 +214,50 @@ impl VertexIndex {
         }
         Ok(result)
     }
+    /// Complete owned ordinal vectors without constructing a second whole index.
+    pub(super) fn inventory(&self, budget: &JobBudget) -> Result<super::OrdinalInventory> {
+        budget.check()?;
+        let len = match self {
+            Self::Resident(rows) => rows.len(),
+            Self::Retained(rows) => rows.len,
+        };
+        if len > HISTORY_LIMIT_V1 {
+            return Err(Error::Unavailable("retained vertex index horizon"));
+        }
+        let mut ids = vec![VertexId::from_bytes([0; 32]); len];
+        let mut sorted = Vec::with_capacity(len);
+        let mut seen = vec![false; len];
+        let mut last = None;
+        let mut accept = |id: VertexId, position: usize| -> Result<()> {
+            if position >= len || last.is_some_and(|last| last >= id) || seen[position] {
+                return Err(Error::Unavailable("retained vertex index directory order"));
+            }
+            seen[position] = true;
+            ids[position] = id;
+            sorted.push(position);
+            last = Some(id);
+            Ok(())
+        };
+        match self {
+            Self::Resident(rows) => {
+                for (id, position) in rows.iter() {
+                    accept(*id, *position)?;
+                }
+            }
+            Self::Retained(rows) => {
+                for ordinal in 0..rows.pages.len() {
+                    for (id, position) in Self::page(rows, ordinal, Some(budget))? {
+                        accept(id, position)?;
+                    }
+                }
+            }
+        }
+        if sorted.len() != len || seen.iter().any(|seen| !seen) {
+            return Err(Error::Unavailable("retained vertex index directory length"));
+        }
+        budget.check()?;
+        Ok(super::OrdinalInventory { ids, sorted })
+    }
     pub(super) fn retain(
         rows: &BTreeMap<VertexId, usize>,
         store: &mut Store,
@@ -291,6 +335,104 @@ mod tests {
         (0..count)
             .map(|position| (key(position * 2), count - 1 - position))
             .collect()
+    }
+    #[test]
+    fn inventory_vectors_match_complete_index_at_page_and_horizon_boundaries() {
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        store.begin_replay(b"synthetic ordinal vectors").unwrap();
+        for count in [0, 1, 63, 64, 65, 129, HISTORY_LIMIT_V1] {
+            let source = rows(count);
+            let resident = VertexIndex::Resident(Arc::new(source.clone()));
+            let retained = VertexIndex::retain(&source, &mut store, [21; 32], &budget).unwrap();
+            for index in [&resident, &retained] {
+                let inventory = index.inventory(&budget).unwrap();
+                assert_eq!(inventory.ids.len(), count);
+                assert_eq!(
+                    inventory.sorted,
+                    source.values().copied().collect::<Vec<_>>()
+                );
+                for (id, position) in &source {
+                    assert_eq!(inventory.ids[*position], *id);
+                }
+                assert_eq!(index.materialize(Some(&budget)).unwrap(), source);
+            }
+        }
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(matches!(
+            VertexIndex::default().inventory(&expired),
+            Err(Error::Paused(_))
+        ));
+        let oversize = VertexIndex::Resident(Arc::new(rows(HISTORY_LIMIT_V1 + 1)));
+        assert!(oversize.inventory(&budget).is_err());
+    }
+    #[test]
+    fn inventory_vectors_refuse_partial_corrupt_or_invalid_permutations() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic ordinal vector refusal")
+            .unwrap();
+        let source = rows(129);
+        let retained = VertexIndex::retain(&source, &mut store, [21; 32], &budget).unwrap();
+        let pages = retained.retained_ids();
+        let last = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(pages[2])));
+        let held = last.with_extension("held");
+        let original = fs::read(&last).unwrap();
+        fs::rename(&last, &held).unwrap();
+        assert!(retained.inventory(&budget).is_err());
+        fs::rename(&held, &last).unwrap();
+        let mut damaged = original.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&last, damaged).unwrap();
+        assert!(retained.inventory(&budget).is_err());
+        fs::write(&last, &original).unwrap();
+        fs::hard_link(&last, &held).unwrap();
+        assert!(retained.inventory(&budget).is_err());
+        fs::remove_file(&held).unwrap();
+        assert_eq!(
+            retained.inventory(&budget).unwrap().sorted.len(),
+            source.len()
+        );
+        for mutation in 0..4 {
+            let mut wrong = retained.clone();
+            if let VertexIndex::Retained(rows) = &mut wrong {
+                match mutation {
+                    0 => rows.domain = [22; 32],
+                    1 => Arc::make_mut(&mut rows.pages).swap(0, 1),
+                    2 => rows.len -= 1,
+                    _ => Arc::make_mut(&mut rows.pages)[0].first = key(1),
+                }
+            }
+            assert!(wrong.inventory(&budget).is_err());
+            assert!(wrong.materialize(Some(&budget)).is_err());
+        }
+        // A correctly retained/hash-bound leaf can still carry a bad permutation.
+        let first = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(pages[0])));
+        let mut bytes = fs::read(first).unwrap();
+        bytes[HEADER + 32..HEADER + 40].copy_from_slice(&0_u64.to_le_bytes());
+        let bad_id = store.retain_vertex_index_page(&bytes).unwrap();
+        let mut wrong = retained.clone();
+        if let VertexIndex::Retained(rows) = &mut wrong {
+            Arc::make_mut(&mut rows.pages)[0].id = bad_id;
+        }
+        assert!(wrong.inventory(&budget).is_err());
+        assert!(wrong.materialize(Some(&budget)).is_err());
+        for position in [1, 129] {
+            let mut wrong = source.clone();
+            wrong.insert(key(0), position);
+            assert!(
+                VertexIndex::Resident(Arc::new(wrong))
+                    .inventory(&budget)
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn operation_index_leaf_is_exact_bounded_and_does_not_hide_failed_target_reads() {
