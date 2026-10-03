@@ -13,6 +13,7 @@ mod deadline;
 pub mod economics;
 pub mod genesis;
 pub mod graph;
+pub mod history;
 pub mod node;
 pub mod offer;
 mod parent;

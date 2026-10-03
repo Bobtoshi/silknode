@@ -7,6 +7,8 @@ mod export_tests;
 #[cfg(test)]
 mod fork_tests;
 #[cfg(test)]
+mod historical_tests;
+#[cfg(test)]
 mod order_tests;
 mod replay;
 use crate::core::order::{CoreOrder, snapshot_bytes as order_bytes};
