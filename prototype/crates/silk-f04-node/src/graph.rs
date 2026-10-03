@@ -632,19 +632,20 @@ impl PreparedVertex {
                 return Err(Error::Unavailable("duplicate staged vertex index"));
             }
             self.index = Some(VertexIndex::retain(&rows, store, reader.domain(), budget)?);
-            let mut entries = graph.vertices.materialize(Some(budget))?;
-            entries.push(V::stage_directory(&self.vertex, &reader, budget)?);
+            let entry = V::stage_directory(&self.vertex, &reader, budget)?;
             self.directory = Some(
-                VertexDirectory::retain(
-                    &entries,
-                    store,
-                    reader,
-                    budget,
-                    V::directory_slot,
-                    V::directory_bindings,
-                    V::from_directory,
-                )?
-                .into_retained()?,
+                graph
+                    .vertices
+                    .append(
+                        entry,
+                        store,
+                        reader,
+                        budget,
+                        V::directory_slot,
+                        V::directory_bindings,
+                        V::from_directory,
+                    )?
+                    .into_retained()?,
             );
         }
         Ok(())
@@ -1142,6 +1143,7 @@ impl<V: GraphEntry> GraphData<V> {
         }
         let id = VertexId::from_bytes(prepared.vertex.candidate.id);
         // Finish every fallible page read before publishing any graph credit.
+        let current_entries = self.vertices.materialize(Some(budget))?;
         let next_index = if V::DURABLE_INDEX {
             let next = prepared
                 .index
@@ -1150,7 +1152,7 @@ impl<V: GraphEntry> GraphData<V> {
             if rows.len() != self.len() + 1 || rows.get(&id) != Some(&self.len()) {
                 return Err(Error::Unavailable("staged vertex index length"));
             }
-            for (position, vertex) in self.vertices.materialize(Some(budget))?.iter().enumerate() {
+            for (position, vertex) in current_entries.iter().enumerate() {
                 budget.graph_read()?;
                 if rows.get(&VertexId::from_bytes(vertex.graph_info().id)) != Some(&position) {
                     return Err(Error::Unavailable("staged vertex index identity"));
@@ -1181,12 +1183,7 @@ impl<V: GraphEntry> GraphData<V> {
             {
                 return Err(Error::Unavailable("staged vertex directory identity"));
             }
-            for (old, new) in self
-                .vertices
-                .materialize(Some(budget))?
-                .iter()
-                .zip(&entries)
-            {
+            for (old, new) in current_entries.iter().zip(&entries) {
                 budget.graph_read()?;
                 if old.directory_slot()? != new.directory_slot()? {
                     return Err(Error::Unavailable("staged vertex directory prefix"));
@@ -1364,6 +1361,83 @@ mod tests {
     use super::*;
     use crate::carriage::{Body, Header};
 
+    #[test]
+    fn incremental_directory_new_page_staging_cannot_credit_a_missing_immutable_prefix() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic directory append boundary")
+            .unwrap();
+        for label in 1..=64_u8 {
+            let parents = if label == 1 {
+                Vec::new()
+            } else {
+                vec![label - 1]
+            };
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, &parents), &budget)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            store
+                .commit(&[&record], b"synthetic append prefix source")
+                .unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            prepared
+                .retain_ancestry(&graph, &mut store, &budget)
+                .unwrap();
+            graph.publish_checked(prepared, &budget).unwrap();
+        }
+        let old_directory = graph.retained_directory_pages();
+        let old_index = graph.retained_index_pages();
+        let fork = graph.clone();
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 65, &[64]), &budget)
+            .unwrap();
+        let record = prepared.vertex().retained_record().unwrap();
+        store
+            .commit(&[&record], b"synthetic append boundary source")
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        let head = store.head();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(old_directory[0])));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        // An append at the page boundary stages only its new page. This is not
+        // graph credit or a whole-prefix integrity assertion.
+        prepared
+            .retain_ancestry(&graph, &mut store, &budget)
+            .unwrap();
+        assert!(matches!(
+            graph.publish_checked(prepared, &budget),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(graph.len(), 64);
+        assert_eq!(graph.retained_directory_pages(), old_directory);
+        assert_eq!(graph.retained_index_pages(), old_index);
+        assert_eq!(store.head(), head);
+        std::fs::rename(&held, &path).unwrap();
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 65, &[64]), &budget)
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        prepared
+            .retain_ancestry(&graph, &mut store, &budget)
+            .unwrap();
+        graph.publish_checked(prepared, &budget).unwrap();
+        assert_eq!(graph.len(), 65);
+        assert_eq!(graph.retained_directory_pages().len(), 2);
+        assert_eq!(graph.retained_directory_pages()[0], old_directory[0]);
+        assert_eq!(fork.len(), 64);
+        assert_eq!(fork.retained_directory_pages(), old_directory);
+        assert_eq!(graph.order(&budget).unwrap().eligible_order().len(), 65);
+    }
     #[test]
     fn disk_directory_graph_drops_entries_and_refuses_missing_current_or_staged_pages() {
         let (temp, mut store) = crate::store::ancestry_test_store();

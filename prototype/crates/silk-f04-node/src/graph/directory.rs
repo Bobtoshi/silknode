@@ -43,6 +43,120 @@ mod tests {
         Ok(Arc::new(u64le(bytes, 0)?))
     }
     #[test]
+    fn incremental_directory_tail_append_matches_full_bytes_and_preserves_immutable_prefix() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let reader = RetainedContext::new(store.object_reader().unwrap(), [7; 32]);
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic incremental directory append")
+            .unwrap();
+        let mut directory = VertexDirectory::default();
+        let mut rows = Vec::new();
+        let mut first_page = None;
+        for ordinal in 0..66_u64 {
+            let old = directory.clone();
+            let row = Arc::new(ordinal);
+            rows.push(row.clone());
+            directory = directory
+                .append(
+                    row,
+                    &mut store,
+                    reader.clone(),
+                    &budget,
+                    encode,
+                    capabilities,
+                    decode,
+                )
+                .unwrap();
+            let full = VertexDirectory::retain(
+                &rows,
+                &mut store,
+                reader.clone(),
+                &budget,
+                encode,
+                capabilities,
+                decode,
+            )
+            .unwrap();
+            assert_eq!(directory.retained_ids(), full.retained_ids());
+            assert_eq!(directory.materialize(Some(&budget)).unwrap(), rows);
+            assert_eq!(
+                old.materialize(Some(&budget)).unwrap(),
+                rows[..rows.len() - 1]
+            );
+            if ordinal == 63 {
+                first_page = Some(directory.retained_ids()[0]);
+            }
+            if ordinal >= 64 {
+                assert_eq!(Some(directory.retained_ids()[0]), first_page);
+            }
+        }
+        let old_ids = directory.retained_ids();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(old_ids[1])));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        let used = store.accounted_bytes();
+        assert!(matches!(
+            directory.append(
+                Arc::new(66),
+                &mut store,
+                reader.clone(),
+                &budget,
+                encode,
+                capabilities,
+                decode
+            ),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(directory.retained_ids(), old_ids);
+        assert_eq!(directory.len(), 66);
+        assert_eq!(store.accounted_bytes(), used);
+        std::fs::rename(&held, &path).unwrap();
+        let wrong = RetainedContext::new(store.object_reader().unwrap(), [7; 32]);
+        assert!(
+            directory
+                .append(
+                    Arc::new(66),
+                    &mut store,
+                    wrong,
+                    &budget,
+                    encode,
+                    capabilities,
+                    decode
+                )
+                .is_err()
+        );
+        assert_eq!(store.accounted_bytes(), used);
+        let max: Vec<_> = (0..HISTORY_LIMIT_V1).map(|n| Arc::new(n as u64)).collect();
+        let max_directory = VertexDirectory::retain(
+            &max,
+            &mut store,
+            reader.clone(),
+            &budget,
+            encode,
+            capabilities,
+            decode,
+        )
+        .unwrap();
+        let used = store.accounted_bytes();
+        assert!(matches!(
+            max_directory.append(
+                Arc::new(HISTORY_LIMIT_V1 as u64),
+                &mut store,
+                reader,
+                &budget,
+                encode,
+                capabilities,
+                decode
+            ),
+            Err(Error::Paused(_))
+        ));
+        assert_eq!(store.accounted_bytes(), used);
+    }
+    #[test]
     fn disk_directory_pages_boundaries_horizon_and_live_shape_are_exact() {
         let (_temp, mut store) = crate::store::ancestry_test_store();
         let reader = RetainedContext::new(store.object_reader().unwrap(), [7; 32]);
@@ -335,6 +449,81 @@ impl<V> VertexDirectory<V> {
         }
     }
     /// Called only with fully receiver-derived typed rows under the original fence.
+    // Keep the closed private codec callbacks out of the public GraphEntry API.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn append(
+        &self,
+        row: Arc<V>,
+        store: &mut Store,
+        reader: Arc<RetainedContext>,
+        budget: &JobBudget,
+        encode: Encoder<V>,
+        capabilities: Capabilities<V>,
+        decode: Decoder<V>,
+    ) -> Result<Self> {
+        budget.check()?;
+        if self.len() >= HISTORY_LIMIT_V1 {
+            return Err(Error::Paused("vertex directory reference horizon"));
+        }
+        let Self::Retained(old, _) = self else {
+            if !self.is_empty() {
+                return Err(Error::Unavailable("nonempty resident directory append"));
+            }
+            return Self::retain(&[row], store, reader, budget, encode, capabilities, decode);
+        };
+        if !Arc::ptr_eq(&old.reader, &reader)
+            || old.bindings.len() != old.len
+            || old.pages.len() != old.len.div_ceil(ITEMS)
+        {
+            return Err(Error::Unavailable("directory append live context or shape"));
+        }
+        let ordinal = old.len / ITEMS;
+        let count = old.len % ITEMS;
+        let mut bytes = Vec::with_capacity(HEADER + (count + 1) * SLOT);
+        bytes.extend_from_slice(b"SNF04DP1");
+        bytes.extend_from_slice(&reader.domain());
+        bytes.extend_from_slice(&(ordinal as u64).to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(count + 1)
+                .map_err(|_| Error::Unavailable("directory append count"))?
+                .to_le_bytes(),
+        );
+        if count != 0 {
+            let tail = Self::page(old, ordinal, Some(budget))?;
+            // Own and hash-check the complete tail once. The prefix is copied
+            // byte-for-byte, never re-encoded from a new validity assertion.
+            bytes.extend_from_slice(&tail[HEADER..]);
+        }
+        let slot = encode(&row)?;
+        if slot.len() != SLOT {
+            return Err(Error::Unavailable("directory append slot length"));
+        }
+        bytes.extend_from_slice(&slot);
+        budget.source()?;
+        let page = Page {
+            id: store.retain_vertex_directory_page(&bytes)?,
+            count: count + 1,
+        };
+        let mut pages = old.pages.as_ref().clone();
+        if count == 0 {
+            pages.push(page);
+        } else {
+            pages[ordinal] = page;
+        }
+        let mut bindings = old.bindings.as_ref().clone();
+        bindings.push(capabilities(&row));
+        budget.check()?;
+        Ok(Self::Retained(
+            RetainedDirectory {
+                pages: Arc::new(pages),
+                len: old.len + 1,
+                bindings: Arc::new(bindings),
+                reader,
+            },
+            decode,
+        ))
+    }
+    /// Full receiver-derived construction used for initial publication and codec checks.
     pub(super) fn retain(
         rows: &[Arc<V>],
         store: &mut Store,
