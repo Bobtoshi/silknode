@@ -368,6 +368,31 @@ impl Store {
             "retained ledger history page publication failed",
         )
     }
+    /// Auxiliary ID/ordinal pages freshly derived by the live receiver only.
+    pub(crate) fn retain_vertex_index_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        const HEADER: usize = 52;
+        let count = if bytes.len() >= HEADER {
+            u32le(bytes, 48)? as usize
+        } else {
+            0
+        };
+        if bytes.get(..8) != Some(b"SNF04IP1")
+            || !(1..=64).contains(&count)
+            || bytes.len() != HEADER + count * 40
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "vertex index page requires active verified transition",
+            ));
+        }
+        self.retain_ledger_page(
+            bytes,
+            "vertex index page writer stopped",
+            "retained vertex index page damaged",
+            "post-vertex-index-page host margin",
+            "retained vertex index page publication failed",
+        )
+    }
     fn retain_ledger_page(
         &mut self,
         bytes: &[u8],

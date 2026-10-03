@@ -199,7 +199,7 @@ impl PrefixCache {
                 let mut dominated = false;
                 for tip in &frontier {
                     budget.probe()?;
-                    if graph.is_ancestor(*id, *tip)? {
+                    if graph.is_ancestor_checked(*id, *tip, Some(budget))? {
                         dominated = true;
                         break;
                     }
@@ -221,7 +221,7 @@ impl PrefixCache {
             for f in &frontier {
                 for p in parents.ordinary_parents() {
                     budget.probe()?;
-                    if f != p && !graph.is_ancestor(*f, *p)? {
+                    if f != p && !graph.is_ancestor_checked(*f, *p, Some(budget))? {
                         common = false;
                     }
                 }

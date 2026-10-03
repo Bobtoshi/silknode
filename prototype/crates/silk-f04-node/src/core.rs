@@ -143,6 +143,7 @@ impl Core {
             bytes,
             &self.genesis,
             if retained { None } else { Some(&self.clock) },
+            &budget,
         )?;
         let worker = self.start_parent(candidate.header.parents.clone(), budget)?;
         self.active_admission = true;
@@ -232,7 +233,7 @@ impl Core {
     }
     pub fn publish(&mut self, a: Admission) -> Result<JobBudget> {
         a.budget.check()?;
-        self.graph.publish(a.vertex)?;
+        self.graph.publish_checked(a.vertex, &a.budget)?;
         self.order = a.order;
         self.status = a.status;
         Ok(a.budget)

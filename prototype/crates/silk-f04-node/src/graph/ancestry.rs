@@ -29,6 +29,9 @@ pub(crate) struct RetainedContext {
     domain: Digest,
 }
 impl RetainedContext {
+    pub(super) const fn domain(&self) -> Digest {
+        self.domain
+    }
     pub(super) fn objects(&self) -> &ObjectReader {
         &self.objects
     }

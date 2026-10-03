@@ -1,5 +1,6 @@
 //! Receiver-owned full-data graph. No decoded peer object can construct validity.
 mod ancestry;
+mod index;
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
@@ -8,6 +9,7 @@ use crate::{
     wire::{raw_hash, u32le},
 };
 use ancestry::{PagedAncestry, RetainedContext};
+use index::VertexIndex;
 use silk_order::sg0_v1::{
     ReceiverVerifiedSg0Graph, Sg0Error, Sg0OrderSnapshotV1, Sg0ParentSetV1, Sg0VertexDataV1,
     budgeted::{derive_append_vertex_data_v1, derive_virtual_order_chain_fast_v1},
@@ -212,6 +214,7 @@ impl RetainedVertex {
     }
 }
 pub(crate) trait RetainEntry: GraphEntry + Sized {
+    const DURABLE_INDEX: bool;
     fn retain(
         vertex: Arc<VerifiedVertex>,
         reader: Option<&Arc<RetainedContext>>,
@@ -220,6 +223,7 @@ pub(crate) trait RetainEntry: GraphEntry + Sized {
     fn restore(&self, candidate: Candidate, record: &[u8]) -> Result<VerifiedVertex>;
 }
 impl RetainEntry for VerifiedVertex {
+    const DURABLE_INDEX: bool = false;
     fn retain(vertex: Arc<VerifiedVertex>, _: Option<&Arc<RetainedContext>>) -> Result<Arc<Self>> {
         Ok(vertex)
     }
@@ -241,6 +245,7 @@ impl RetainEntry for VerifiedVertex {
     }
 }
 impl RetainEntry for RetainedVertex {
+    const DURABLE_INDEX: bool = true;
     fn retain(
         vertex: Arc<VerifiedVertex>,
         reader: Option<&Arc<RetainedContext>>,
@@ -350,14 +355,14 @@ pub(crate) type DurableGraph = GraphData<RetainedVertex>;
 /// Shared graph/order machinery; the public Graph alias preserves resident borrows.
 pub struct GraphData<V> {
     vertices: Vec<Arc<V>>,
-    index: BTreeMap<VertexId, usize>,
+    index: VertexIndex,
     ancestry_reader: Option<Arc<RetainedContext>>,
 }
 impl<V> Default for GraphData<V> {
     fn default() -> Self {
         Self {
             vertices: Vec::new(),
-            index: BTreeMap::new(),
+            index: VertexIndex::default(),
             ancestry_reader: None,
         }
     }
@@ -376,6 +381,7 @@ impl<V> Clone for GraphData<V> {
 pub(crate) struct PreparedVertex {
     vertex: Arc<VerifiedVertex>,
     revision: usize,
+    index: Option<VertexIndex>,
 }
 impl PreparedVertex {
     pub fn vertex(&self) -> &VerifiedVertex {
@@ -396,7 +402,7 @@ impl PreparedVertex {
         });
         Ok(())
     }
-    pub(crate) fn retain_ancestry<V: GraphEntry>(
+    pub(crate) fn retain_ancestry<V: RetainEntry>(
         &mut self,
         graph: &GraphData<V>,
         store: &mut crate::store::Store,
@@ -411,7 +417,21 @@ impl PreparedVertex {
             .ok_or(Error::Unavailable("shared prepared ancestry publication"))?
             .info
             .ancestors
-            .retain(store, reader, budget)
+            .retain(store, reader.clone(), budget)?;
+        if V::DURABLE_INDEX {
+            if self.revision != graph.len() {
+                return Err(Error::Unavailable("stale staged vertex index"));
+            }
+            let mut rows = graph.index.materialize(Some(budget))?;
+            if rows
+                .insert(VertexId::from_bytes(self.vertex.info.id), graph.len())
+                .is_some()
+            {
+                return Err(Error::Unavailable("duplicate staged vertex index"));
+            }
+            self.index = Some(VertexIndex::retain(&rows, store, reader.domain(), budget)?);
+        }
+        Ok(())
     }
 }
 
@@ -521,10 +541,41 @@ impl<V: GraphEntry> GraphData<V> {
     /// # Errors
     /// Refuses an identifier absent from this receiver's admitted graph.
     pub fn get(&self, id: VertexId) -> Result<&V> {
-        self.index
-            .get(&id)
-            .map(|i| self.vertices[*i].as_ref())
-            .ok_or(Error::Unavailable("missing admitted vertex"))
+        self.get_checked(id, None)
+    }
+    pub(crate) fn find_checked(&self, id: VertexId, budget: &JobBudget) -> Result<Option<&V>> {
+        let Some(position) = self.index.lookup(&id, Some(budget))? else {
+            return Ok(None);
+        };
+        let vertex = self
+            .vertices
+            .get(position)
+            .ok_or(Error::Unavailable("vertex index position mismatch"))?;
+        if vertex.graph_info().id != id.into_bytes() {
+            return Err(Error::Unavailable("vertex index identity mismatch"));
+        }
+        Ok(Some(vertex.as_ref()))
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_index_pages(&self) -> Vec<Digest> {
+        self.index.retained_ids()
+    }
+    fn position(&self, id: VertexId, budget: Option<&JobBudget>) -> Result<usize> {
+        let position = self
+            .index
+            .lookup(&id, budget)?
+            .ok_or(Error::Unavailable("missing admitted vertex"))?;
+        if self
+            .vertices
+            .get(position)
+            .is_none_or(|vertex| vertex.graph_info().id != id.into_bytes())
+        {
+            return Err(Error::Unavailable("vertex index identity mismatch"));
+        }
+        Ok(position)
+    }
+    fn get_checked(&self, id: VertexId, budget: Option<&JobBudget>) -> Result<&V> {
+        Ok(self.vertices[self.position(id, budget)?].as_ref())
     }
     pub(crate) fn header(
         &self,
@@ -533,7 +584,7 @@ impl<V: GraphEntry> GraphData<V> {
         budget: &JobBudget,
     ) -> Result<Arc<Header>> {
         budget.check()?;
-        let info = self.get(id)?.graph_info();
+        let info = self.get_checked(id, Some(budget))?.graph_info();
         if let HeaderRecord::Resident(header) = &info.header {
             return Ok(header.clone());
         }
@@ -571,11 +622,7 @@ impl<V: GraphEntry> GraphData<V> {
         Ok(Arc::new(candidate.header))
     }
     pub(crate) fn retained_candidate_matches(&self, id: VertexId, expected: &[u8]) -> Result<bool> {
-        let index = *self
-            .index
-            .get(&id)
-            .ok_or(Error::Unavailable("missing admitted vertex"))?;
-        let info = self.vertices[index].graph_info();
+        let info = self.get(id)?.graph_info();
         let source = info
             .retained_source
             .as_ref()
@@ -607,10 +654,7 @@ impl<V: GraphEntry> GraphData<V> {
         V: RetainEntry,
     {
         budget.check()?;
-        let index = *self
-            .index
-            .get(&id)
-            .ok_or(Error::Unavailable("missing admitted vertex"))?;
+        let index = self.position(id, Some(budget))?;
         let vertex = &self.vertices[index];
         let Some(reader) = &self.ancestry_reader else {
             return V::resident(vertex).ok_or(Error::Unavailable("durable vertex reader absent"));
@@ -669,7 +713,7 @@ impl<V: GraphEntry> GraphData<V> {
         parents: &Sg0ParentSetV1,
         budget: &JobBudget,
     ) -> Result<Sg0OrderSnapshotV1> {
-        let bits = self.parent_closure(parents)?;
+        let bits = self.parent_closure_checked(parents, Some(budget))?;
         Ok(derive_virtual_order_chain_fast_v1(&View {
             graph: self,
             added: None,
@@ -677,33 +721,49 @@ impl<V: GraphEntry> GraphData<V> {
             budget,
         })?)
     }
+    #[cfg(test)]
     fn parent_closure(&self, parents: &Sg0ParentSetV1) -> Result<PagedAncestry> {
+        self.parent_closure_checked(parents, None)
+    }
+    fn parent_closure_checked(
+        &self,
+        parents: &Sg0ParentSetV1,
+        budget: Option<&JobBudget>,
+    ) -> Result<PagedAncestry> {
         if let Sg0ParentSetV1::Vertices(p) = parents {
             Sg0ParentSetV1::vertices(p.clone())?;
         }
         let mut bits = PagedAncestry::default();
         for p in parents.ordinary_parents() {
-            let i = *self
-                .index
-                .get(p)
-                .ok_or(Error::Unavailable("candidate parent dependency"))?;
+            let i = self.position(*p, budget)?;
             let v = self.vertices[i].graph_info();
             bits.union(&v.ancestors)?;
             bits.insert(i)?;
         }
         if let [a, b] = parents.ordinary_parents()
-            && (self.is_ancestor(*a, *b)? || self.is_ancestor(*b, *a)?)
+            && (self.is_ancestor_checked(*a, *b, budget)?
+                || self.is_ancestor_checked(*b, *a, budget)?)
         {
             return Err(Error::Invalid("comparable parents"));
         }
         Ok(bits)
     }
+    #[cfg(test)]
     pub(crate) fn is_ancestor(&self, a: VertexId, b: VertexId) -> Result<bool> {
-        let ai = *self
-            .index
-            .get(&a)
-            .ok_or(Error::Unavailable("missing ancestor"))?;
-        Ok(self.get(b)?.graph_info().ancestors.contains(ai)?)
+        self.is_ancestor_checked(a, b, None)
+    }
+    pub(crate) fn is_ancestor_checked(
+        &self,
+        a: VertexId,
+        b: VertexId,
+        budget: Option<&JobBudget>,
+    ) -> Result<bool> {
+        let ai = self.position(a, budget)?;
+        Ok(self
+            .get_checked(b, budget)?
+            .graph_info()
+            .ancestors
+            .contains(ai)?)
     }
 
     /// Only freshly decoded canonical bytes enter the validity pipeline.
@@ -713,13 +773,14 @@ impl<V: GraphEntry> GraphData<V> {
         bytes: &[u8],
         g: &Genesis,
         clock: Option<&LocalClock>,
+        budget: &JobBudget,
     ) -> Result<Candidate> {
         if self.len() >= 4096 {
             return Err(Error::Paused("admitted-vertex reference horizon"));
         }
         let candidate = Candidate::decode(bytes, g)?;
         let id = VertexId::from_bytes(candidate.id);
-        if self.index.contains_key(&id) {
+        if self.index.lookup(&id, Some(budget))?.is_some() {
             return Err(Error::Unavailable("already admitted exact vertex"));
         }
         if let Some(clock) = clock {
@@ -763,7 +824,7 @@ impl<V: GraphEntry> GraphData<V> {
                 id: candidate.id,
                 header: HeaderRecord::Resident(Arc::new(candidate.header.clone())),
                 facts,
-                ancestors: self.parent_closure(&candidate.header.parents)?,
+                ancestors: self.parent_closure_checked(&candidate.header.parents, Some(budget))?,
                 metadata: None,
                 retained_source: None,
             },
@@ -801,22 +862,61 @@ impl<V: GraphEntry> GraphData<V> {
         Ok(PreparedVertex {
             vertex: Arc::new(vertex),
             revision: self.len(),
+            index: None,
         })
     }
+    #[cfg(test)]
     pub(crate) fn publish(&mut self, prepared: PreparedVertex) -> Result<()>
     where
         V: RetainEntry,
     {
+        self.publish_checked(prepared, &JobBudget::checkpoint()?)
+    }
+    pub(crate) fn publish_checked(
+        &mut self,
+        prepared: PreparedVertex,
+        budget: &JobBudget,
+    ) -> Result<()>
+    where
+        V: RetainEntry,
+    {
+        budget.check()?;
         if prepared.revision != self.len()
             || self
                 .index
-                .contains_key(&VertexId::from_bytes(prepared.vertex.candidate.id))
+                .lookup(
+                    &VertexId::from_bytes(prepared.vertex.candidate.id),
+                    Some(budget),
+                )?
+                .is_some()
         {
             return Err(Error::Unavailable("stale graph publication"));
         }
         let id = VertexId::from_bytes(prepared.vertex.candidate.id);
+        // Finish every fallible page read before publishing any graph credit.
+        let next_index = if V::DURABLE_INDEX {
+            let next = prepared
+                .index
+                .ok_or(Error::Unavailable("durable vertex index absent"))?;
+            let rows = next.materialize(Some(budget))?;
+            if rows.len() != self.len() + 1 || rows.get(&id) != Some(&self.len()) {
+                return Err(Error::Unavailable("staged vertex index length"));
+            }
+            for (position, vertex) in self.vertices.iter().enumerate() {
+                budget.graph_read()?;
+                if rows.get(&VertexId::from_bytes(vertex.graph_info().id)) != Some(&position) {
+                    return Err(Error::Unavailable("staged vertex index identity"));
+                }
+            }
+            next
+        } else {
+            let mut rows = self.index.materialize(Some(budget))?;
+            rows.insert(id, self.len());
+            VertexIndex::Resident(Arc::new(rows))
+        };
+        budget.check()?;
         let entry = V::retain(prepared.vertex, self.ancestry_reader.as_ref())?;
-        self.index.insert(id, self.len());
+        self.index = next_index;
         self.vertices.push(entry);
         Ok(())
     }
@@ -836,7 +936,20 @@ impl<V: GraphEntry> View<'_, V> {
         if let Some(v) = self.added.filter(|v| v.id == id.into_bytes()) {
             return Ok(v);
         }
-        let i = *self.graph.index.get(&id).ok_or(Sg0Error::MissingVertex)?;
+        let i = self
+            .graph
+            .index
+            .lookup(&id, Some(self.budget))
+            .map_err(index_error)?
+            .ok_or(Sg0Error::MissingVertex)?;
+        if self
+            .graph
+            .vertices
+            .get(i)
+            .is_none_or(|vertex| vertex.graph_info().id != id.into_bytes())
+        {
+            return Err(Sg0Error::Invariant);
+        }
         if let Some(bits) = self.members
             && !bits.contains(i)?
         {
@@ -850,8 +963,21 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         &self,
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
     ) -> std::result::Result<(), Sg0Error> {
-        for (id, i) in &self.graph.index {
+        let rows = self
+            .graph
+            .index
+            .materialize(Some(self.budget))
+            .map_err(index_error)?;
+        for (id, i) in &rows {
             self.budget.graph_read()?;
+            if self
+                .graph
+                .vertices
+                .get(*i)
+                .is_none_or(|vertex| vertex.graph_info().id != id.into_bytes())
+            {
+                return Err(Sg0Error::Invariant);
+            }
             if self
                 .members
                 .map(|bits| bits.contains(*i))
@@ -909,10 +1035,24 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
     ) -> std::result::Result<bool, Sg0Error> {
         self.lookup(a)?;
         let v = self.lookup(b)?;
+        // The one sealed candidate has no admitted ordinal yet. It cannot be
+        // in an existing vertex's strict past, or in its own strict past.
+        if self.added.is_some_and(|added| added.id == a.into_bytes()) {
+            return Ok(false);
+        }
         self.graph
             .index
-            .get(&a)
-            .map_or(Ok(false), |i| v.ancestors.contains(*i))
+            .lookup(&a, Some(self.budget))
+            .map_err(index_error)?
+            .map_or(Err(Sg0Error::Invariant), |i| v.ancestors.contains(i))
+    }
+}
+
+fn index_error(error: Error) -> Sg0Error {
+    match error {
+        Error::Order(error) => error,
+        Error::Paused(_) => Sg0Error::ResourceBudget,
+        _ => Sg0Error::Invariant,
     }
 }
 
@@ -1015,6 +1155,104 @@ mod tests {
         graph
     }
     #[test]
+    fn disk_index_graph_missing_current_or_staged_page_refuses_without_partial_credit() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic index publication fixture")
+            .unwrap();
+        for (label, parents) in [(1, &[][..]), (2, &[1][..]), (3, &[1][..])] {
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, parents), &budget)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            store
+                .commit(&[&record], b"synthetic original record")
+                .unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            prepared
+                .retain_ancestry(&graph, &mut store, &budget)
+                .unwrap();
+            graph.publish_checked(prepared, &budget).unwrap();
+        }
+        assert!(matches!(graph.index, VertexIndex::Retained(_)));
+        let fork = graph.clone();
+        let order = graph.order(&budget).unwrap();
+        let current = graph.retained_index_pages()[0];
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 4, &[2, 3]), &budget)
+            .unwrap();
+        let record = prepared.vertex().retained_record().unwrap();
+        store
+            .commit(&[&record], b"synthetic fourth original record")
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        prepared
+            .retain_ancestry(&graph, &mut store, &budget)
+            .unwrap();
+        let staged = prepared.index.as_ref().unwrap().retained_ids()[0];
+        assert_ne!(staged, current);
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(staged)));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        let head = store.head();
+        assert!(matches!(
+            graph.publish_checked(prepared, &budget),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(graph.len(), 3);
+        assert_eq!(graph.retained_index_pages(), vec![current]);
+        assert_eq!(graph.order(&budget).unwrap(), order);
+        std::fs::rename(&held, &path).unwrap();
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 4, &[2, 3]), &budget)
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(current)));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(matches!(graph.get(id(2)), Err(Error::Io(_))));
+        assert!(graph.find_checked(id(2), &budget).is_err());
+        assert!(graph.order(&budget).is_err());
+        assert!(
+            graph
+                .parent_order(
+                    &Sg0ParentSetV1::vertices(vec![id(2), id(3)]).unwrap(),
+                    &budget
+                )
+                .is_err()
+        );
+        assert!(graph.is_ancestor(id(1), id(3)).is_err());
+        assert!(
+            prepared
+                .retain_ancestry(&graph, &mut store, &budget)
+                .is_err()
+        );
+        assert_eq!(graph.len(), 3);
+        assert_eq!(store.head(), head);
+        std::fs::rename(&held, &path).unwrap();
+        prepared
+            .retain_ancestry(&graph, &mut store, &budget)
+            .unwrap();
+        graph.publish_checked(prepared, &budget).unwrap();
+        assert_eq!(
+            graph.order(&budget).unwrap(),
+            diamond(&budget).order(&budget).unwrap()
+        );
+        assert_eq!(fork.order(&budget).unwrap(), order);
+        assert_eq!(fork.retained_index_pages(), vec![current]);
+    }
+    #[test]
     fn disk_detach_graph_drops_published_carriers_and_preserves_exact_metadata_order_and_sources() {
         let (_temp, mut store) = crate::store::ancestry_test_store();
         let budget = JobBudget::checkpoint().unwrap();
@@ -1079,6 +1317,7 @@ mod tests {
                 .vertices()
                 .all(|v| matches!(v.info.metadata, Some(Metadata::Retained { .. })))
         );
+        assert!(matches!(durable.index, VertexIndex::Retained(_)));
         let retained_view = View {
             graph: &durable,
             added: None,

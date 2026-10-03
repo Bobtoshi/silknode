@@ -470,7 +470,11 @@ impl Node {
         let budget = JobBudget::vertex()?;
         self.core.clock.observe(system_wall()?)?;
         let c = Candidate::decode(bytes, &self.core.genesis)?;
-        if let Ok(v) = self.core.graph.get(VertexId::from_bytes(c.id)) {
+        if let Some(v) = self
+            .core
+            .graph
+            .find_checked(VertexId::from_bytes(c.id), &budget)?
+        {
             if self
                 .core
                 .graph
