@@ -17,6 +17,71 @@ const PAGES: usize = 8;
 // graph/order/ledger/sync resource design, not silently widening this directory.
 const _: () = assert!(PAGES * POSITIONS_PER_PAGE == HISTORY_LIMIT_V1);
 
+/// One owned 64-byte leaf, scoped to an immutable receiver graph operation.
+pub(super) struct AncestryOperation<'a> {
+    reader: Option<&'a Arc<RetainedContext>>,
+    leaf: Option<(Digest, usize, [u64; WORDS_PER_PAGE])>,
+    #[cfg(test)]
+    loads: usize,
+}
+impl<'a> AncestryOperation<'a> {
+    pub(super) const fn new(reader: Option<&'a Arc<RetainedContext>>) -> Self {
+        Self {
+            reader,
+            leaf: None,
+            #[cfg(test)]
+            loads: 0,
+        }
+    }
+    #[cfg(test)]
+    pub(super) const fn loads(&self) -> usize {
+        self.loads
+    }
+    pub(super) fn contains(
+        &mut self,
+        bits: &PagedAncestry,
+        position: usize,
+        budget: &JobBudget,
+    ) -> Result<bool, Sg0Error> {
+        let check = || budget.check().map_err(|_| Sg0Error::ResourceBudget);
+        check()?;
+        let page = position / POSITIONS_PER_PAGE;
+        let slot = bits.pages.get(page).ok_or(Sg0Error::Invariant)?;
+        let words = match slot.as_deref() {
+            None => None,
+            Some(Leaf::Resident(words)) => Some(*words),
+            Some(Leaf::Retained(id)) => {
+                let reader = bits.reader.as_ref().ok_or(Sg0Error::Invariant)?;
+                if !self.reader.is_some_and(|bound| Arc::ptr_eq(bound, reader)) {
+                    return Err(Sg0Error::Invariant);
+                }
+                if self
+                    .leaf
+                    .as_ref()
+                    .is_none_or(|(cached, ordinal, _)| cached != id || *ordinal != page)
+                {
+                    budget.source().map_err(|_| Sg0Error::ResourceBudget)?;
+                    let words = bits.words(page)?.ok_or(Sg0Error::Invariant)?;
+                    check()?;
+                    // Install only a complete hash/inode/domain/page-qualified
+                    // positive leaf. Failures and missing objects are not bits.
+                    self.leaf = Some((*id, page, words));
+                    #[cfg(test)]
+                    {
+                        self.loads += 1;
+                    }
+                }
+                Some(self.leaf.as_ref().ok_or(Sg0Error::Invariant)?.2)
+            }
+        };
+        let present = words.is_some_and(|words| {
+            words[position / 64 % WORDS_PER_PAGE] & (1_u64 << (position % 64)) != 0
+        });
+        check()?;
+        Ok(present)
+    }
+}
+
 #[derive(Clone)]
 enum Leaf {
     Resident([u64; WORDS_PER_PAGE]),
@@ -298,6 +363,97 @@ mod tests {
         drop(store);
         // Same live receiver-derived references, not cold validity adoption.
         assert!(bits.contains(4095).unwrap());
+    }
+
+    #[test]
+    fn operation_ancestry_leaf_is_bounded_exact_and_cannot_hide_failed_fresh_reads() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        store
+            .begin_replay(b"synthetic operation ancestry fixture")
+            .unwrap();
+        let reader = context(&store);
+        let bound = Some(reader.clone());
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut bits = PagedAncestry::default();
+        for position in [0, 63, 64, 511, 512, 4095] {
+            bits.insert(position).unwrap();
+        }
+        bits.retain(&mut store, reader, &budget).unwrap();
+        let path = page_path(&temp, bits.retained_ids()[0]);
+        let original = std::fs::read(&path).unwrap();
+        let held = path.with_extension("held");
+        let mut operation = AncestryOperation::new(bound.as_ref());
+        for position in 0..POSITIONS_PER_PAGE {
+            assert_eq!(
+                operation.contains(&bits, position, &budget).unwrap(),
+                [0, 63, 64, 511].contains(&position)
+            );
+        }
+        assert_eq!(operation.loads(), 1);
+        assert_eq!(
+            std::mem::size_of_val(&operation.leaf.as_ref().unwrap().2),
+            64
+        );
+        std::fs::rename(&path, &held).unwrap();
+        assert!(operation.contains(&bits, 0, &budget).unwrap());
+        let mut fresh = AncestryOperation::new(bound.as_ref());
+        for position in [0, 1] {
+            assert_eq!(
+                fresh.contains(&bits, position, &budget),
+                Err(Sg0Error::Invariant)
+            );
+        }
+        assert_eq!(fresh.loads(), 0);
+        assert!(operation.contains(&bits, 512, &budget).unwrap());
+        assert_eq!(operation.loads(), 2);
+        assert_eq!(
+            operation.contains(&bits, 0, &budget),
+            Err(Sg0Error::Invariant)
+        );
+        std::fs::rename(&held, &path).unwrap();
+        let mut changed = original.clone();
+        changed[48] ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert_eq!(fresh.contains(&bits, 1, &budget), Err(Sg0Error::Invariant));
+        std::fs::write(&path, &original).unwrap();
+        std::fs::hard_link(&path, &held).unwrap();
+        assert_eq!(fresh.contains(&bits, 0, &budget), Err(Sg0Error::Invariant));
+        std::fs::remove_file(&held).unwrap();
+        assert!(fresh.contains(&bits, 0, &budget).unwrap());
+        assert_eq!(fresh.loads(), 1);
+        for offset in [8, 40] {
+            let mut foreign = original.clone();
+            foreign[offset] ^= 1;
+            let foreign_id = store.retain_ancestry_page(&foreign).unwrap();
+            let mut wrong = bits.clone();
+            wrong.pages[0] = Some(Arc::new(Leaf::Retained(foreign_id)));
+            assert_eq!(fresh.contains(&wrong, 0, &budget), Err(Sg0Error::Invariant));
+            assert_eq!(fresh.loads(), 1);
+        }
+        let foreign_bound = Some(context(&store));
+        let mut foreign = AncestryOperation::new(foreign_bound.as_ref());
+        assert_eq!(
+            foreign.contains(&bits, 0, &budget),
+            Err(Sg0Error::Invariant)
+        );
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert_eq!(
+            fresh.contains(&bits, 0, &expired),
+            Err(Sg0Error::ResourceBudget)
+        );
+        assert_eq!(
+            fresh.contains(&bits, HISTORY_LIMIT_V1, &budget),
+            Err(Sg0Error::Invariant)
+        );
+        assert_eq!(
+            fresh.contains(&bits, usize::MAX, &budget),
+            Err(Sg0Error::Invariant)
+        );
+        let resident = bits.materialize().unwrap();
+        let mut resident_reads = AncestryOperation::new(None);
+        assert!(resident_reads.contains(&resident, 4095, &budget).unwrap());
+        assert!(!resident_reads.contains(&resident, 1024, &budget).unwrap());
+        assert_eq!(resident_reads.loads(), 0);
     }
 
     #[test]

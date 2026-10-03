@@ -10,7 +10,7 @@ use crate::{
     genesis::Genesis,
     wire::{raw_hash, u32le, u64le},
 };
-use ancestry::{PagedAncestry, RetainedContext};
+use ancestry::{AncestryOperation, PagedAncestry, RetainedContext};
 use directory::{DirectoryOperation, VertexDirectory};
 use facts::FactsRecord;
 use index::{IndexOperation, VertexIndex};
@@ -1201,6 +1201,7 @@ struct View<'a, V> {
     budget: &'a JobBudget,
     reads: RefCell<DirectoryOperation<'a, V>>,
     index_reads: RefCell<IndexOperation<'a>>,
+    ancestry_reads: RefCell<AncestryOperation<'a>>,
 }
 impl<'a, V> View<'a, V> {
     const fn new(
@@ -1216,6 +1217,7 @@ impl<'a, V> View<'a, V> {
             budget,
             reads: RefCell::new(DirectoryOperation::new(&graph.vertices)),
             index_reads: RefCell::new(IndexOperation::new(&graph.index)),
+            ancestry_reads: RefCell::new(AncestryOperation::new(graph.ancestry_reader.as_ref())),
         }
     }
 }
@@ -1252,7 +1254,10 @@ impl<V: GraphEntry> View<'_, V> {
             return Err(Sg0Error::Invariant);
         }
         if let Some(bits) = self.members
-            && !bits.contains(i)?
+            && !self
+                .ancestry_reads
+                .borrow_mut()
+                .contains(bits, i, self.budget)?
         {
             return Err(Sg0Error::MissingVertex);
         }
@@ -1287,7 +1292,11 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
             self.budget.graph_read()?;
             if self
                 .members
-                .map(|bits| bits.contains(*i))
+                .map(|bits| {
+                    self.ancestry_reads
+                        .borrow_mut()
+                        .contains(bits, *i, self.budget)
+                })
                 .transpose()?
                 .unwrap_or(true)
             {
@@ -1361,11 +1370,15 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         if self.added.is_some_and(|added| added.id == a.into_bytes()) {
             return Ok(false);
         }
-        self.index_reads
+        let i = self
+            .index_reads
             .borrow_mut()
             .lookup(&a, self.budget)
             .map_err(index_error)?
-            .map_or(Err(Sg0Error::Invariant), |i| v.info().ancestors.contains(i))
+            .ok_or(Sg0Error::Invariant)?;
+        self.ancestry_reads
+            .borrow_mut()
+            .contains(&v.info().ancestors, i, self.budget)
     }
 }
 
@@ -1492,6 +1505,27 @@ mod tests {
         assert_eq!(view.reads.borrow().loads(), 5);
         assert!(view.receiver_verified_is_ancestor(id(1), id(64)).unwrap());
         assert_eq!(view.index_reads.borrow().loads(), 2);
+        for label in 1..64 {
+            assert!(
+                view.receiver_verified_is_ancestor(id(label), id(64))
+                    .unwrap()
+            );
+        }
+        assert!(!view.receiver_verified_is_ancestor(id(64), id(64)).unwrap());
+        assert_eq!(view.ancestry_reads.borrow().loads(), 1);
+        let target = graph.get_owned(id(65), None).unwrap();
+        let filtered = View::new(&graph, None, Some(&target.info.ancestors), &budget);
+        let mut members = Vec::new();
+        filtered
+            .visit_vertex_ids(&mut |vertex| {
+                members.push(vertex);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(members, (1..=64).map(id).collect::<Vec<_>>());
+        assert_eq!(filtered.ancestry_reads.borrow().loads(), 1);
+        assert!(!filtered.receiver_verified_contains(id(65)).unwrap());
+        assert_eq!(filtered.ancestry_reads.borrow().loads(), 1);
         let later = temp.path().join("store").join(format!(
             "{}.obj",
             hex::encode(graph.retained_directory_pages()[1])
