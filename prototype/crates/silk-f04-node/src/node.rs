@@ -5,6 +5,8 @@ mod ancestry_tests;
 #[cfg(test)]
 mod export_tests;
 #[cfg(test)]
+mod fork_tests;
+#[cfg(test)]
 mod order_tests;
 mod replay;
 use crate::core::order::{CoreOrder, snapshot_bytes as order_bytes};
@@ -12,7 +14,7 @@ use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
     capacity::{GENERATION_LIMIT_V1, HistoryCapacityV1},
-    carriage::{Body, Candidate, encode_parents},
+    carriage::{Body, Candidate, MiningTemplate, encode_parents},
     core::{Admission, AdmissionJob, Core, Status},
     deadline::NativeGuard,
     genesis::Genesis,
@@ -41,6 +43,11 @@ pub enum Ingress {
     Pending,
     /// Complete graph evidence is durable; state status still requires inspection.
     Admitted,
+}
+
+enum MiningOutput {
+    Candidate(Candidate),
+    Template(MiningTemplate),
 }
 
 /// Sole writer of a private F0.4 node store. Not `Send`: RandomX belongs to this thread.
@@ -734,6 +741,28 @@ impl Node {
     ) -> Result<Candidate> {
         self.mine_inner(body, owner, reward_nonce, parents, None)
     }
+    /// Prepare an owned template under the unchanged foreground preparation
+    /// budget, then close its durable job before any nonce search. An external
+    /// miner can evaluate single nonces under its own explicit resource limits.
+    /// No vertex is admitted; ordinary ingress freshly rederives all validity.
+    /// This private experiment API does not bypass wallet/relay policy.
+    ///
+    /// # Errors
+    /// Returns the ordinary local availability, clock, parent, storage or budget
+    /// refusal. Failed preparation never grants admission or mining authority.
+    pub fn prepare_mining_current(
+        &mut self,
+        body: Body,
+        owner: Digest,
+        reward_nonce: Digest,
+        parents: Option<Sg0ParentSetV1>,
+    ) -> Result<MiningTemplate> {
+        self.mining_job(body, owner, reward_nonce, parents, None, true)
+            .and_then(|output| match output {
+                MiningOutput::Template(template) => Ok(template),
+                MiningOutput::Candidate(_) => Err(Error::Unavailable("mining operation result")),
+            })
+    }
     fn mine_inner(
         &mut self,
         body: Body,
@@ -742,6 +771,21 @@ impl Node {
         parents: Option<Sg0ParentSetV1>,
         fixture_timestamp: Option<u64>,
     ) -> Result<Candidate> {
+        self.mining_job(body, owner, reward_nonce, parents, fixture_timestamp, false)
+            .and_then(|output| match output {
+                MiningOutput::Candidate(candidate) => Ok(candidate),
+                MiningOutput::Template(_) => Err(Error::Unavailable("mining operation result")),
+            })
+    }
+    fn mining_job(
+        &mut self,
+        body: Body,
+        owner: Digest,
+        reward_nonce: Digest,
+        parents: Option<Sg0ParentSetV1>,
+        fixture_timestamp: Option<u64>,
+        template_only: bool,
+    ) -> Result<MiningOutput> {
         self.healthy()?;
         self.idle()?;
         if self.core.status != Status::Ready {
@@ -758,7 +802,11 @@ impl Node {
             None => self.core.selected_parent(&budget)?,
         };
         let mut marker = Vec::new();
-        marker.extend_from_slice(b"SNF04MJ1");
+        marker.extend_from_slice(if template_only {
+            b"SNF04MT1"
+        } else {
+            b"SNF04MJ1"
+        });
         marker.extend_from_slice(&self.core.genesis.domain());
         marker.extend_from_slice(&self.local_head()?);
         marker.extend_from_slice(&(self.core.graph.len() as u64).to_le_bytes());
@@ -778,15 +826,31 @@ impl Node {
             Ok(guard) => guard,
             Err(e) => return self.job_failed(job_id, e),
         };
-        match self.core.mine(
-            body,
-            owner,
-            reward_nonce,
-            parents,
-            fixture_timestamp,
-            budget,
-        ) {
-            Ok(candidate) => {
+        let result = if template_only {
+            self.core
+                .prepare_mining(
+                    body,
+                    owner,
+                    reward_nonce,
+                    parents,
+                    fixture_timestamp,
+                    budget,
+                )
+                .map(|(template, _budget)| MiningOutput::Template(template))
+        } else {
+            self.core
+                .mine(
+                    body,
+                    owner,
+                    reward_nonce,
+                    parents,
+                    fixture_timestamp,
+                    budget,
+                )
+                .map(MiningOutput::Candidate)
+        };
+        match result {
+            Ok(output) => {
                 // Completed mining has NOT admitted a vertex. Only the ordinary
                 // live receiver may subsequently grant graph credit.
                 if let Err(e) = self.store.finish_job(job_id, false) {
@@ -794,7 +858,7 @@ impl Node {
                     return Err(e);
                 }
                 guard.finish();
-                Ok(candidate)
+                Ok(output)
             }
             Err(e) => self.job_failed(job_id, e),
         }

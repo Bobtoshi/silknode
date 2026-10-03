@@ -5,6 +5,7 @@ use silk_pow::{Uint256, dag_randomx_v3::dag_target_for_work_v3, randomx_v2_work_
 use silk_randomx::RandomXV2Vm;
 use silk_sapling_f04::codec::{ENVELOPE_BYTES, Envelope, EnvelopeView, carriage_hash};
 use silk_types::VertexId;
+use std::sync::Arc;
 
 /// Maximum full canonical work-bearing vertex.
 pub const MAX_VERTEX_BYTES: usize = 90_000;
@@ -354,6 +355,24 @@ impl Default for WorkEngine {
     }
 }
 impl WorkEngine {
+    /// Evaluate exactly one nonce of a prepared template, without touching a node.
+    /// The miner must impose its own aggregate CPU/wall/memory limits; this native
+    /// hash is not interruptible by a cooperative callback. A returned candidate
+    /// is unadmitted and must pass the ordinary receiver's fresh checks.
+    ///
+    /// # Errors
+    /// Returns a local error if native work initialization/evaluation fails.
+    pub fn evaluate_nonce(
+        &mut self,
+        template: &MiningTemplate,
+        nonce: u64,
+    ) -> Result<Option<Candidate>> {
+        let hash = self.hash(
+            template.key,
+            &work_input(&template.header, &template.genesis, template.key, nonce)?,
+        )?;
+        template.candidate(nonce, hash)
+    }
     fn hash(&mut self, key: Digest, input: &[u8]) -> Result<Digest> {
         if self.current.as_ref().is_none_or(|(k, _)| *k != key) {
             self.current = Some((
@@ -393,40 +412,81 @@ impl WorkEngine {
     /// Mine genuinely, pausing on a bounded local deadline rather than weakening work.
     pub(crate) fn mine(
         &mut self,
-        header: Header,
-        body: Body,
-        genesis: &Genesis,
-        f: &ParentFacts,
+        template: &MiningTemplate,
         budget: &JobBudget,
     ) -> Result<Candidate> {
-        let header = Header::decode(header.bytes, &body, genesis)?;
-        header.check_facts(f)?;
-        let t = target(f.work)?;
         for nonce in 0..u64::MAX {
             budget.check()?;
             let hash = self.hash(
-                f.key_material,
-                &work_input(&header, genesis, f.key_material, nonce)?,
+                template.key,
+                &work_input(&template.header, &template.genesis, template.key, nonce)?,
             )?;
             // Cooperative boundary on every platform; the Linux coordinator's
             // original native lease also spans initialization/evaluation itself.
             budget.check()?;
-            if Uint256::from_be_bytes(hash) <= t {
-                let mut proof = [0; 52];
-                proof[..8].copy_from_slice(b"SLKDPOW4");
-                proof[9] = 4;
-                proof[12..20].copy_from_slice(&nonce.to_be_bytes());
-                proof[20..].copy_from_slice(&hash);
-                let id = vertex_id(&header, &proof, genesis, f.key_material)?;
-                return Ok(Candidate {
-                    id,
-                    header,
-                    body,
-                    proof,
-                });
+            if let Some(candidate) = template.candidate(nonce, hash)? {
+                return Ok(candidate);
             }
         }
         Err(Error::Paused("nonce space"))
+    }
+}
+
+#[cfg(test)]
+#[path = "carriage/mining_tests.rs"]
+mod mining_tests;
+
+/// Owned, immutable local mining input, not a validity token or graph authority.
+///
+/// It can outlive its preparing node. Staleness is resolved by ordinary ingress,
+/// not by trusting the preparation or importing its parent derivation cache.
+pub struct MiningTemplate {
+    header: Header,
+    body: Body,
+    genesis: Arc<Genesis>,
+    key: Digest,
+}
+impl MiningTemplate {
+    pub(crate) fn new(
+        header: &Header,
+        body: Body,
+        genesis: Arc<Genesis>,
+        facts: &ParentFacts,
+    ) -> Result<Self> {
+        let header = Header::decode(header.bytes, &body, &genesis)?;
+        header.check_facts(facts)?;
+        Ok(Self {
+            header,
+            body,
+            genesis,
+            key: facts.key_material,
+        })
+    }
+    /// Exact header claims; receivers independently rederive them.
+    #[must_use]
+    pub const fn header(&self) -> &Header {
+        &self.header
+    }
+    /// Exact committed body, never a wallet submission or relay bypass.
+    #[must_use]
+    pub const fn body(&self) -> &Body {
+        &self.body
+    }
+    fn candidate(&self, nonce: u64, hash: Digest) -> Result<Option<Candidate>> {
+        if Uint256::from_be_bytes(hash) > target(self.header.work)? {
+            return Ok(None);
+        }
+        let mut proof = [0; 52];
+        proof[..8].copy_from_slice(b"SLKDPOW4");
+        proof[9] = 4;
+        proof[12..20].copy_from_slice(&nonce.to_be_bytes());
+        proof[20..].copy_from_slice(&hash);
+        Ok(Some(Candidate {
+            id: vertex_id(&self.header, &proof, &self.genesis, self.key)?,
+            header: self.header.clone(),
+            body: self.body.clone(),
+            proof,
+        }))
     }
 }
 

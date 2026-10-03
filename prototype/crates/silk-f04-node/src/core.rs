@@ -6,7 +6,7 @@ use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
     capacity::HistoryCapacityV1,
-    carriage::{Body, Candidate, Header, ParentFacts, WorkEngine},
+    carriage::{Body, Candidate, Header, MiningTemplate, ParentFacts, WorkEngine},
     genesis::Genesis,
     graph::{CryptoCache, DurableGraph as Graph, PreparedVertex},
     parent::PrefixCache,
@@ -369,6 +369,28 @@ impl Core {
         fixture_timestamp: Option<u64>,
         budget: JobBudget,
     ) -> Result<Candidate> {
+        let (template, budget) = self.prepare_mining(
+            body,
+            owner,
+            reward_nonce,
+            parents,
+            fixture_timestamp,
+            budget,
+        )?;
+        budget.check()?;
+        let result = self.work.mine(&template, &budget);
+        budget.check()?;
+        result
+    }
+    pub fn prepare_mining(
+        &mut self,
+        body: Body,
+        owner: Digest,
+        reward_nonce: Digest,
+        parents: Sg0ParentSetV1,
+        fixture_timestamp: Option<u64>,
+        budget: JobBudget,
+    ) -> Result<(MiningTemplate, JobBudget)> {
         if self.status != Status::Ready || self.active_admission {
             return Err(Error::Paused("mining during reconciliation"));
         }
@@ -402,9 +424,9 @@ impl Core {
         // Mining is separate from receiver admission. Finding work does not
         // publish graph credit; the ordinary receiver must verify it again.
         budget.check()?;
-        let result = self.work.mine(header, body, &self.genesis, &facts, &budget);
+        let result = MiningTemplate::new(&header, body, self.genesis.clone(), &facts)?;
         budget.check()?;
-        result
+        Ok((result, budget))
     }
     pub fn selected_parent(&self, budget: &JobBudget) -> Result<Sg0ParentSetV1> {
         // Default mining selection may not proceed on an unreadable order.

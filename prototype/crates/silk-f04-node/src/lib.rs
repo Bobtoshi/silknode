@@ -1,5 +1,8 @@
 //! Private, valueless F0.4 node integration. No implicit legacy-profile activation.
 
+#[cfg(test)]
+extern crate self as silk_f04_node;
+
 pub mod address;
 pub mod auth;
 pub mod budget;
