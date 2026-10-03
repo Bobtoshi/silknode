@@ -11,7 +11,7 @@ use crate::{
     wire::{raw_hash, u32le, u64le},
 };
 use ancestry::{PagedAncestry, RetainedContext};
-use directory::VertexDirectory;
+use directory::{DirectoryOperation, VertexDirectory};
 use facts::FactsRecord;
 use index::VertexIndex;
 use silk_order::sg0_v1::{
@@ -26,6 +26,7 @@ use silk_sapling_f04::{
 };
 use silk_types::VertexId;
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
@@ -933,12 +934,9 @@ impl<V: GraphEntry> GraphData<V> {
         Ok(Arc::new(restored))
     }
     pub(crate) fn order(&self, budget: &JobBudget) -> Result<Sg0OrderSnapshotV1> {
-        Ok(derive_virtual_order_chain_fast_v1(&View {
-            graph: self,
-            added: None,
-            members: None,
-            budget,
-        })?)
+        Ok(derive_virtual_order_chain_fast_v1(&View::new(
+            self, None, None, budget,
+        ))?)
     }
     pub(crate) fn order_with(
         &self,
@@ -948,12 +946,12 @@ impl<V: GraphEntry> GraphData<V> {
         if prepared.revision != self.len() {
             return Err(Error::Unavailable("stale staged order"));
         }
-        Ok(derive_virtual_order_chain_fast_v1(&View {
-            graph: self,
-            added: Some(&prepared.vertex.info),
-            members: None,
+        Ok(derive_virtual_order_chain_fast_v1(&View::new(
+            self,
+            Some(&prepared.vertex.info),
+            None,
             budget,
-        })?)
+        ))?)
     }
     pub(crate) fn parent_order(
         &self,
@@ -961,12 +959,12 @@ impl<V: GraphEntry> GraphData<V> {
         budget: &JobBudget,
     ) -> Result<Sg0OrderSnapshotV1> {
         let bits = self.parent_closure_checked(parents, Some(budget))?;
-        Ok(derive_virtual_order_chain_fast_v1(&View {
-            graph: self,
-            added: None,
-            members: Some(&bits),
+        Ok(derive_virtual_order_chain_fast_v1(&View::new(
+            self,
+            None,
+            Some(&bits),
             budget,
-        })?)
+        ))?)
     }
     #[cfg(test)]
     fn parent_closure(&self, parents: &Sg0ParentSetV1) -> Result<PagedAncestry> {
@@ -1090,21 +1088,13 @@ impl<V: GraphEntry> GraphData<V> {
     ) -> Result<PreparedVertex> {
         let id = VertexId::from_bytes(vertex.candidate.id);
         vertex.info.metadata = Some(Metadata::Resident(Arc::new(
-            derive_append_vertex_data_v1(
-                &View {
-                    graph: self,
-                    added: Some(&vertex.info),
-                    members: None,
-                    budget,
-                },
-                id,
-            )
-            .map_err(|error| match error {
-                Sg0Error::RedundantOrCyclicParent | Sg0Error::InvalidParents => {
-                    Error::Invalid("candidate SG0 parent rule")
-                }
-                other => Error::Order(other),
-            })?,
+            derive_append_vertex_data_v1(&View::new(self, Some(&vertex.info), None, budget), id)
+                .map_err(|error| match error {
+                    Sg0Error::RedundantOrCyclicParent | Sg0Error::InvalidParents => {
+                        Error::Invalid("candidate SG0 parent rule")
+                    }
+                    other => Error::Order(other),
+                })?,
         )));
         budget.check()?;
         Ok(PreparedVertex {
@@ -1209,6 +1199,23 @@ struct View<'a, V> {
     added: Option<&'a GraphInfo>,
     members: Option<&'a PagedAncestry>,
     budget: &'a JobBudget,
+    reads: RefCell<DirectoryOperation<'a, V>>,
+}
+impl<'a, V> View<'a, V> {
+    const fn new(
+        graph: &'a GraphData<V>,
+        added: Option<&'a GraphInfo>,
+        members: Option<&'a PagedAncestry>,
+        budget: &'a JobBudget,
+    ) -> Self {
+        Self {
+            graph,
+            added,
+            members,
+            budget,
+            reads: RefCell::new(DirectoryOperation::new(&graph.vertices)),
+        }
+    }
 }
 enum ViewEntry<'a, V> {
     Added(&'a GraphInfo),
@@ -1235,9 +1242,9 @@ impl<V: GraphEntry> View<'_, V> {
             .map_err(index_error)?
             .ok_or(Sg0Error::MissingVertex)?;
         let vertex = self
-            .graph
-            .vertices
-            .load(i, Some(self.budget))
+            .reads
+            .borrow_mut()
+            .load(i, self.budget)
             .map_err(index_error)?;
         if vertex.graph_info().id != id.into_bytes() {
             return Err(Sg0Error::Invariant);
@@ -1260,16 +1267,22 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
             .index
             .materialize(Some(self.budget))
             .map_err(index_error)?;
-        for (id, i) in &rows {
+        // Validate in ordinal/page order before visiting the unchanged sorted
+        // IDs. One-page scratch then reads each directory page exactly once,
+        // even when ID sorting interleaves many different ordinal pages.
+        for i in 0..self.graph.len() {
             self.budget.graph_read()?;
             let vertex = self
-                .graph
-                .vertices
-                .load(*i, Some(self.budget))
+                .reads
+                .borrow_mut()
+                .load(i, self.budget)
                 .map_err(index_error)?;
-            if vertex.graph_info().id != id.into_bytes() {
+            if rows.get(&VertexId::from_bytes(vertex.graph_info().id)) != Some(&i) {
                 return Err(Sg0Error::Invariant);
             }
+        }
+        for (id, i) in &rows {
+            self.budget.graph_read()?;
             if self
                 .members
                 .map(|bits| bits.contains(*i))
@@ -1313,17 +1326,23 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
     ) -> std::result::Result<(), Sg0Error> {
         let bits = self.lookup(id)?.info().ancestors.materialize()?;
-        for (i, v) in self
-            .graph
-            .vertices
-            .materialize(Some(self.budget))
-            .map_err(index_error)?
-            .iter()
-            .enumerate()
-        {
+        // Preserve the old all-directory-reads-before-callback contract without
+        // retaining a full graph of decoded carriers: only bounded IDs escape
+        // the one-page scratch reader into this operation-local traversal list.
+        let mut ids = Vec::with_capacity(self.graph.len());
+        for i in 0..self.graph.len() {
+            self.budget.graph_read()?;
+            let v = self
+                .reads
+                .borrow_mut()
+                .load(i, self.budget)
+                .map_err(index_error)?;
+            ids.push(VertexId::from_bytes(v.graph_info().id));
+        }
+        for (i, vertex_id) in ids.into_iter().enumerate() {
             self.budget.graph_read()?;
             if bits.contains(i)? {
-                visitor(VertexId::from_bytes(v.graph_info().id))?;
+                visitor(vertex_id)?;
             }
         }
         Ok(())
@@ -1436,6 +1455,59 @@ mod tests {
         assert_eq!(graph.retained_directory_pages()[0], old_directory[0]);
         assert_eq!(fork.len(), 64);
         assert_eq!(fork.retained_directory_pages(), old_directory);
+        let view = View::new(&graph, None, None, &budget);
+        let mut visited = Vec::new();
+        view.visit_vertex_ids(&mut |id| {
+            visited.push(id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(view.reads.borrow().loads(), 2);
+        assert_eq!(
+            visited,
+            graph
+                .index
+                .materialize(Some(&budget))
+                .unwrap()
+                .into_keys()
+                .collect::<Vec<_>>()
+        );
+        let mut past = Vec::new();
+        view.visit_strict_past_ids(id(65), &mut |id| {
+            past.push(id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(past, (1..=64).map(id).collect::<Vec<_>>());
+        assert_eq!(view.reads.borrow().loads(), 4);
+        let later = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(graph.retained_directory_pages()[1])
+        ));
+        let held_later = later.with_extension("held");
+        std::fs::rename(&later, &held_later).unwrap();
+        let fresh = View::new(&graph, None, None, &budget);
+        let mut callbacks = 0;
+        assert!(
+            fresh
+                .visit_strict_past_ids(id(64), &mut |_| {
+                    callbacks += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(callbacks, 0);
+        let fresh = View::new(&graph, None, None, &budget);
+        assert!(
+            fresh
+                .visit_vertex_ids(&mut |_| {
+                    callbacks += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(callbacks, 0);
+        std::fs::rename(&held_later, &later).unwrap();
         assert_eq!(graph.order(&budget).unwrap().eligible_order().len(), 65);
     }
     #[test]
@@ -2048,18 +2120,8 @@ mod tests {
                 .all(|v| matches!(v.info.facts, FactsRecord::Retained { .. }))
         );
         assert!(matches!(durable.index, VertexIndex::Retained(_)));
-        let retained_view = View {
-            graph: &durable,
-            added: None,
-            members: None,
-            budget: &budget,
-        };
-        let resident_view = View {
-            graph: &resident,
-            added: None,
-            members: None,
-            budget: &budget,
-        };
+        let retained_view = View::new(&durable, None, None, &budget);
+        let resident_view = View::new(&resident, None, None, &budget);
         for label in 1..=4 {
             assert_eq!(
                 retained_view.vertex_data(id(label)).unwrap(),
@@ -2127,12 +2189,7 @@ mod tests {
         let held = path.with_extension("held");
         let original = std::fs::read(&path).unwrap();
         std::fs::rename(&path, &held).unwrap();
-        let view = View {
-            graph: &graph,
-            added: None,
-            members: None,
-            budget: &budget,
-        };
+        let view = View::new(&graph, None, None, &budget);
         assert!(matches!(view.vertex_data(id(4)), Err(Sg0Error::Invariant)));
         assert!(graph.order(&budget).is_err());
         assert!(
@@ -2389,12 +2446,7 @@ mod tests {
         let error = graph.is_ancestor(id(1), id(3)).unwrap_err();
         assert!(matches!(error, Error::Order(Sg0Error::Invariant)));
         assert!(!crate::node::storage_integrity_failure(&error));
-        let view = View {
-            graph: &graph,
-            added: None,
-            members: None,
-            budget: &budget,
-        };
+        let view = View::new(&graph, None, None, &budget);
         assert_eq!(
             view.receiver_verified_is_ancestor(id(1), id(3)),
             Err(Sg0Error::Invariant)
@@ -2426,12 +2478,7 @@ mod tests {
         assert!(!graph.is_ancestor(id(4), id(4)).unwrap());
         let parents = Sg0ParentSetV1::vertices(vec![id(2), id(3)]).unwrap();
         let members = graph.parent_closure(&parents).unwrap();
-        let view = View {
-            graph: &graph,
-            added: None,
-            members: Some(&members),
-            budget: &budget,
-        };
+        let view = View::new(&graph, None, Some(&members), &budget);
         let mut visible = Vec::new();
         view.visit_vertex_ids(&mut |v| {
             visible.push(v);
@@ -2486,12 +2533,7 @@ mod tests {
         let prepared = branch
             .seal(synthetic_vertex(&branch, 5, &[4]), &budget)
             .unwrap();
-        let view = View {
-            graph: &branch,
-            added: Some(&prepared.vertex().info),
-            members: None,
-            budget: &budget,
-        };
+        let view = View::new(&branch, Some(&prepared.vertex().info), None, &budget);
         let mut past = Vec::new();
         view.visit_strict_past_ids(id(5), &mut |v| {
             past.push(v);

@@ -19,6 +19,69 @@ type Decoder<V> = fn(&[u8], &Arc<RetainedContext>, Bindings) -> Result<Arc<V>>;
 type Encoder<V> = fn(&V) -> Result<Vec<u8>>;
 type Capabilities<V> = fn(&V) -> Bindings;
 
+/// A single operation's owned, already hash-checked page, not graph authority.
+/// The immutable directory borrow prevents reuse across publication or reopen.
+pub(super) struct DirectoryOperation<'a, V> {
+    directory: &'a VertexDirectory<V>,
+    page: Option<(usize, Vec<Arc<V>>)>,
+    #[cfg(test)]
+    loads: usize,
+}
+impl<'a, V> DirectoryOperation<'a, V> {
+    #[cfg(test)]
+    pub(super) const fn loads(&self) -> usize {
+        self.loads
+    }
+    pub(super) const fn new(directory: &'a VertexDirectory<V>) -> Self {
+        Self {
+            directory,
+            page: None,
+            #[cfg(test)]
+            loads: 0,
+        }
+    }
+    pub(super) fn load(&mut self, ordinal: usize, budget: &JobBudget) -> Result<Arc<V>> {
+        budget.check()?;
+        let VertexDirectory::Retained(rows, decode) = self.directory else {
+            return self.directory.load(ordinal, Some(budget));
+        };
+        if ordinal >= rows.len {
+            return Err(Error::Unavailable("operation directory ordinal"));
+        }
+        let page_ordinal = ordinal / ITEMS;
+        if self
+            .page
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != page_ordinal)
+        {
+            let bytes = VertexDirectory::<V>::page(rows, page_ordinal, Some(budget))?;
+            let mut entries = Vec::with_capacity(rows.pages[page_ordinal].count);
+            for (position, slot) in bytes[HEADER..].chunks_exact(SLOT).enumerate() {
+                entries.push(decode(
+                    slot,
+                    &rows.reader,
+                    rows.bindings[page_ordinal * ITEMS + position].clone(),
+                )?);
+            }
+            budget.check()?;
+            // Never cache a partial decode, an absence, or a failed read.
+            self.page = Some((page_ordinal, entries));
+            #[cfg(test)]
+            {
+                self.loads += 1;
+            }
+        }
+        let vertex = self
+            .page
+            .as_ref()
+            .and_then(|(_, entries)| entries.get(ordinal % ITEMS))
+            .cloned()
+            .ok_or(Error::Unavailable("operation directory slot"))?;
+        budget.check()?;
+        Ok(vertex)
+    }
+}
+
 #[derive(Clone)]
 struct Page {
     id: Digest,
@@ -41,6 +104,69 @@ mod tests {
             return Err(Error::Unavailable("synthetic directory slot"));
         }
         Ok(Arc::new(u64le(bytes, 0)?))
+    }
+    #[test]
+    fn operation_page_reader_is_bounded_exact_and_does_not_cache_read_failures() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let reader = RetainedContext::new(store.object_reader().unwrap(), [7; 32]);
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic operation directory pages")
+            .unwrap();
+        let rows: Vec<_> = (0..65_u64).map(Arc::new).collect();
+        let directory = VertexDirectory::retain(
+            &rows,
+            &mut store,
+            reader,
+            &budget,
+            encode,
+            capabilities,
+            decode,
+        )
+        .unwrap();
+        let mut operation = DirectoryOperation::new(&directory);
+        for ordinal in 0..64 {
+            assert_eq!(operation.load(ordinal, &budget).unwrap(), rows[ordinal]);
+        }
+        assert_eq!(operation.loads, 1);
+        assert_eq!(operation.page.as_ref().unwrap().1.len(), 64);
+        let first = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(directory.retained_ids()[0])));
+        let first_held = first.with_extension("held");
+        std::fs::rename(&first, &first_held).unwrap();
+        // This operation owns its previously checked immutable snapshot, not
+        // a fresh-read promise. A fresh operation cannot inherit it.
+        assert_eq!(operation.load(0, &budget).unwrap(), rows[0]);
+        assert!(
+            DirectoryOperation::new(&directory)
+                .load(0, &budget)
+                .is_err()
+        );
+        let second = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(directory.retained_ids()[1])));
+        let second_held = second.with_extension("held");
+        std::fs::rename(&second, &second_held).unwrap();
+        assert!(matches!(operation.load(64, &budget), Err(Error::Io(_))));
+        assert_eq!(operation.loads, 1);
+        std::fs::rename(&second_held, &second).unwrap();
+        assert_eq!(operation.load(64, &budget).unwrap(), rows[64]);
+        assert_eq!(operation.loads, 2);
+        assert_eq!(operation.page.as_ref().unwrap().1.len(), 1);
+        assert!(operation.load(0, &budget).is_err());
+        std::fs::rename(&first_held, &first).unwrap();
+        assert_eq!(operation.load(0, &budget).unwrap(), rows[0]);
+        assert_eq!(operation.loads, 3);
+        assert!(operation.load(65, &budget).is_err());
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(matches!(operation.load(0, &expired), Err(Error::Paused(_))));
+        assert_eq!(operation.loads, 3);
+        let cached = Arc::downgrade(&operation.load(0, &budget).unwrap());
+        drop(operation);
+        assert!(cached.upgrade().is_none());
     }
     #[test]
     fn incremental_directory_tail_append_matches_full_bytes_and_preserves_immutable_prefix() {
