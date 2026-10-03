@@ -11,6 +11,68 @@ use std::{collections::BTreeMap, sync::Arc};
 
 const KEYS: usize = 64;
 const HEADER: usize = 52;
+
+/// One operation's owned leaf, tied to the immutable receiver-created index.
+pub(super) struct IndexOperation<'a> {
+    index: &'a VertexIndex,
+    page: Option<(usize, Vec<(VertexId, usize)>)>,
+    #[cfg(test)]
+    loads: usize,
+}
+impl<'a> IndexOperation<'a> {
+    #[cfg(test)]
+    pub(super) const fn loads(&self) -> usize {
+        self.loads
+    }
+    pub(super) const fn new(index: &'a VertexIndex) -> Self {
+        Self {
+            index,
+            page: None,
+            #[cfg(test)]
+            loads: 0,
+        }
+    }
+    pub(super) fn lookup(&mut self, id: &VertexId, budget: &JobBudget) -> Result<Option<usize>> {
+        budget.check()?;
+        let VertexIndex::Retained(rows) = self.index else {
+            return self.index.lookup(id, Some(budget));
+        };
+        if rows.len > HISTORY_LIMIT_V1 {
+            return Err(Error::Unavailable("operation vertex index horizon"));
+        }
+        let ordinal = rows.pages.partition_point(|page| page.last < *id);
+        let Some(page) = rows.pages.get(ordinal) else {
+            return Ok(None);
+        };
+        if *id < page.first {
+            return Ok(None);
+        }
+        if self
+            .page
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != ordinal)
+        {
+            let entries = VertexIndex::page(rows, ordinal, Some(budget))?;
+            // No partial page, I/O error, or decoded error becomes cached data.
+            self.page = Some((ordinal, entries));
+            #[cfg(test)]
+            {
+                self.loads += 1;
+            }
+        }
+        let entries = &self
+            .page
+            .as_ref()
+            .ok_or(Error::Unavailable("operation index leaf absent"))?
+            .1;
+        let result = entries
+            .binary_search_by_key(id, |(key, _)| *key)
+            .ok()
+            .map(|position| entries[position].1);
+        budget.check()?;
+        Ok(result)
+    }
+}
 #[derive(Clone)]
 struct Page {
     id: Digest,
@@ -229,6 +291,87 @@ mod tests {
         (0..count)
             .map(|position| (key(position * 2), count - 1 - position))
             .collect()
+    }
+    #[test]
+    fn operation_index_leaf_is_exact_bounded_and_does_not_hide_failed_target_reads() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        store.begin_replay(b"synthetic operation index").unwrap();
+        let source = rows(129);
+        let retained = VertexIndex::retain(&source, &mut store, [21; 32], &budget).unwrap();
+        let mut operation = IndexOperation::new(&retained);
+        for position in 0..64 {
+            assert_eq!(
+                operation.lookup(&key(position * 2), &budget).unwrap(),
+                Some(128 - position)
+            );
+            assert_eq!(
+                operation.lookup(&key(position * 2 + 1), &budget).unwrap(),
+                None
+            );
+        }
+        assert_eq!(operation.loads, 1);
+        assert_eq!(operation.page.as_ref().unwrap().1.len(), 64);
+        let pages = retained.retained_ids();
+        let first = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(pages[0])));
+        let first_held = first.with_extension("held");
+        fs::rename(&first, &first_held).unwrap();
+        // The old operation owns already checked bytes; no new operation or
+        // publication inherits this positive snapshot after storage changes.
+        assert_eq!(operation.lookup(&key(0), &budget).unwrap(), Some(128));
+        assert!(
+            IndexOperation::new(&retained)
+                .lookup(&key(1), &budget)
+                .is_err()
+        );
+        let second = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(pages[1])));
+        let second_held = second.with_extension("held");
+        let original = fs::read(&second).unwrap();
+        fs::rename(&second, &second_held).unwrap();
+        assert!(matches!(
+            operation.lookup(&key(128), &budget),
+            Err(Error::Io(_))
+        ));
+        assert!(operation.lookup(&key(129), &budget).is_err());
+        assert_eq!(operation.loads, 1);
+        fs::rename(&second_held, &second).unwrap();
+        let mut damaged = original.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&second, damaged).unwrap();
+        assert!(operation.lookup(&key(129), &budget).is_err());
+        fs::write(&second, original).unwrap();
+        fs::hard_link(&second, &second_held).unwrap();
+        assert!(operation.lookup(&key(129), &budget).is_err());
+        fs::remove_file(&second_held).unwrap();
+        assert_eq!(operation.lookup(&key(128), &budget).unwrap(), Some(64));
+        assert_eq!(operation.lookup(&key(129), &budget).unwrap(), None);
+        assert_eq!(operation.loads, 2);
+        assert!(operation.lookup(&key(0), &budget).is_err());
+        fs::rename(&first_held, &first).unwrap();
+        assert_eq!(operation.lookup(&key(0), &budget).unwrap(), Some(128));
+        assert_eq!(operation.loads, 3);
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(matches!(
+            operation.lookup(&key(0), &expired),
+            Err(Error::Paused(_))
+        ));
+        assert_eq!(operation.loads, 3);
+        assert_eq!(
+            IndexOperation::new(&retained)
+                .lookup(&key(260), &budget)
+                .unwrap(),
+            None
+        );
+        let resident = VertexIndex::Resident(Arc::new(source));
+        let mut resident_read = IndexOperation::new(&resident);
+        assert_eq!(resident_read.lookup(&key(128), &budget).unwrap(), Some(64));
+        assert_eq!(resident_read.loads, 0);
     }
     #[test]
     fn disk_index_roundtrip_page_boundaries_horizon_detaches_and_anchors_directory() {

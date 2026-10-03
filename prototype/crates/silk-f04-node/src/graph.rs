@@ -13,7 +13,7 @@ use crate::{
 use ancestry::{PagedAncestry, RetainedContext};
 use directory::{DirectoryOperation, VertexDirectory};
 use facts::FactsRecord;
-use index::VertexIndex;
+use index::{IndexOperation, VertexIndex};
 use silk_order::sg0_v1::{
     ReceiverVerifiedSg0Graph, Sg0Error, Sg0OrderSnapshotV1, Sg0ParentSetV1, Sg0VertexDataV1,
     budgeted::{derive_append_vertex_data_v1, derive_virtual_order_chain_fast_v1},
@@ -1200,6 +1200,7 @@ struct View<'a, V> {
     members: Option<&'a PagedAncestry>,
     budget: &'a JobBudget,
     reads: RefCell<DirectoryOperation<'a, V>>,
+    index_reads: RefCell<IndexOperation<'a>>,
 }
 impl<'a, V> View<'a, V> {
     const fn new(
@@ -1214,6 +1215,7 @@ impl<'a, V> View<'a, V> {
             members,
             budget,
             reads: RefCell::new(DirectoryOperation::new(&graph.vertices)),
+            index_reads: RefCell::new(IndexOperation::new(&graph.index)),
         }
     }
 }
@@ -1236,9 +1238,9 @@ impl<V: GraphEntry> View<'_, V> {
             return Ok(ViewEntry::Added(v));
         }
         let i = self
-            .graph
-            .index
-            .lookup(&id, Some(self.budget))
+            .index_reads
+            .borrow_mut()
+            .lookup(&id, self.budget)
             .map_err(index_error)?
             .ok_or(Sg0Error::MissingVertex)?;
         let vertex = self
@@ -1359,9 +1361,9 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         if self.added.is_some_and(|added| added.id == a.into_bytes()) {
             return Ok(false);
         }
-        self.graph
-            .index
-            .lookup(&a, Some(self.budget))
+        self.index_reads
+            .borrow_mut()
+            .lookup(&a, self.budget)
             .map_err(index_error)?
             .map_or(Err(Sg0Error::Invariant), |i| v.info().ancestors.contains(i))
     }
@@ -1480,6 +1482,16 @@ mod tests {
         .unwrap();
         assert_eq!(past, (1..=64).map(id).collect::<Vec<_>>());
         assert_eq!(view.reads.borrow().loads(), 4);
+        for label in 1..=64 {
+            assert_eq!(
+                view.receiver_verified_work_be(id(label)).unwrap(),
+                Uint256::from_u64(1).to_be_bytes()
+            );
+        }
+        assert_eq!(view.index_reads.borrow().loads(), 2);
+        assert_eq!(view.reads.borrow().loads(), 5);
+        assert!(view.receiver_verified_is_ancestor(id(1), id(64)).unwrap());
+        assert_eq!(view.index_reads.borrow().loads(), 2);
         let later = temp.path().join("store").join(format!(
             "{}.obj",
             hex::encode(graph.retained_directory_pages()[1])
