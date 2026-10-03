@@ -1074,14 +1074,15 @@ fn derive_for_tips(
     if tips.is_empty() {
         return Err(Sg0Error::InvalidParents);
     }
-    for tip in tips {
-        ensure_vertex_exists(graph, *tip)?;
-        metadata(graph, *tip)?;
-    }
     let selected = tips
         .iter()
         .copied()
-        .map(|tip| metadata(graph, tip).map(|data| (tip, data.blue_work())))
+        .map(|tip| {
+            ensure_vertex_exists(graph, tip)?;
+            // Own the already qualified work field instead of reopening the
+            // same metadata immediately after validating every tip.
+            metadata(graph, tip).map(|data| (tip, data.blue_work()))
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .reduce(|left, right| {
@@ -1332,8 +1333,11 @@ fn order_through(
         if !seen.insert(vertex) {
             return Err(Sg0Error::Cycle);
         }
-        selected_chain.push(vertex);
-        cursor = match metadata(graph, vertex)?.selected_parent() {
+        let selected_parent = metadata(graph, vertex)?.selected_parent();
+        // Only this immutable field is retained in the operation's existing
+        // selected-chain list; no merge-list/metadata/validity cache is added.
+        selected_chain.push((vertex, selected_parent));
+        cursor = match selected_parent {
             Sg0SelectedParentV1::Anchor => None,
             Sg0SelectedParentV1::Vertex(parent) => Some(parent),
         };
@@ -1341,9 +1345,8 @@ fn order_through(
     selected_chain.reverse();
     let mut order = Vec::new();
     let mut emitted = BTreeSet::new();
-    for vertex in selected_chain {
+    for (vertex, selected_parent) in selected_chain {
         let parents = validated_parents(graph, vertex)?;
-        let selected_parent = metadata(graph, vertex)?.selected_parent();
         for merge_vertex in merge_order_for(graph, &parents, selected_parent)? {
             if !emitted.insert(merge_vertex) {
                 return Err(Sg0Error::Invariant);
@@ -1622,6 +1625,7 @@ mod tests {
         vertices: BTreeMap<VertexId, TestVertex>,
         data: BTreeMap<VertexId, Sg0VertexDataV1>,
         past_visits: std::cell::Cell<usize>,
+        metadata_reads: std::cell::Cell<usize>,
     }
 
     impl TestGraph {
@@ -1675,6 +1679,7 @@ mod tests {
         }
 
         fn vertex_data(&self, vertex: VertexId) -> Result<Option<Sg0VertexDataV1>, Sg0Error> {
+            self.metadata_reads.set(self.metadata_reads.get() + 1);
             Ok(self.data.get(&vertex).cloned())
         }
 
@@ -1686,6 +1691,224 @@ mod tests {
             self.past_visits.set(self.past_visits.get() + 1);
             reference_visit_strict_past(self, vertex, visitor)
         }
+    }
+
+    // Exact pre-change algorithms, frozen as local test-only byte/result oracles.
+    fn reference_selected_walk(
+        graph: &impl ReceiverVerifiedSg0Graph,
+        tip: VertexId,
+    ) -> Result<Vec<VertexId>, Sg0Error> {
+        let mut selected_chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cursor = Some(tip);
+        while let Some(vertex) = cursor {
+            if !seen.insert(vertex) {
+                return Err(Sg0Error::Cycle);
+            }
+            selected_chain.push(vertex);
+            cursor = match metadata(graph, vertex)?.selected_parent() {
+                Sg0SelectedParentV1::Anchor => None,
+                Sg0SelectedParentV1::Vertex(parent) => Some(parent),
+            };
+        }
+        selected_chain.reverse();
+        let mut order = Vec::new();
+        let mut emitted = BTreeSet::new();
+        for vertex in selected_chain {
+            let parents = validated_parents(graph, vertex)?;
+            let selected_parent = metadata(graph, vertex)?.selected_parent();
+            for merge_vertex in merge_order_for(graph, &parents, selected_parent)? {
+                if !emitted.insert(merge_vertex) {
+                    return Err(Sg0Error::Invariant);
+                }
+                order.push(merge_vertex);
+            }
+            if !emitted.insert(vertex) {
+                return Err(Sg0Error::Invariant);
+            }
+            order.push(vertex);
+        }
+        Ok(order)
+    }
+
+    fn reference_selected_tips(
+        graph: &impl ReceiverVerifiedSg0Graph,
+        tips: &[VertexId],
+    ) -> Result<Sg0OrderSnapshotV1, Sg0Error> {
+        if tips.is_empty() {
+            return Err(Sg0Error::InvalidParents);
+        }
+        for tip in tips {
+            ensure_vertex_exists(graph, *tip)?;
+            metadata(graph, *tip)?;
+        }
+        let selected = tips
+            .iter()
+            .copied()
+            .map(|tip| metadata(graph, tip).map(|data| (tip, data.blue_work())))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .reduce(|left, right| {
+                if right.1 > left.1 || (right.1 == left.1 && right.0 < left.0) {
+                    right
+                } else {
+                    left
+                }
+            })
+            .ok_or(Sg0Error::Invariant)?
+            .0;
+
+        let selected_parent = Sg0SelectedParentV1::Vertex(selected);
+        let merge_order = merge_order_for(graph, tips, selected_parent)?;
+        let mut blue = blue_closure(graph, selected)?;
+        let mut virtual_colors = BTreeMap::new();
+        for candidate in &merge_order {
+            let mut trial = blue.clone();
+            trial.insert(*candidate);
+            if is_k_cluster(graph, &trial)? {
+                blue = trial;
+                virtual_colors.insert(*candidate, Sg0Color::Blue);
+            } else {
+                virtual_colors.insert(*candidate, Sg0Color::Red);
+            }
+        }
+
+        let mut total_ids = reference_selected_walk(graph, selected)?;
+        total_ids.extend(merge_order.iter().copied());
+        let expected = closure_for_tips(graph, tips)?;
+        if total_ids.len() != expected.len()
+            || total_ids.iter().copied().collect::<BTreeSet<_>>() != expected
+        {
+            return Err(Sg0Error::Invariant);
+        }
+
+        let mut total_order = Vec::with_capacity(total_ids.len());
+        let mut eligible_order = Vec::new();
+        let mut eligible_work = Uint256::ZERO;
+        for id in total_ids {
+            let color = if blue.contains(&id) {
+                Sg0Color::Blue
+            } else {
+                Sg0Color::Red
+            };
+            if virtual_colors
+                .get(&id)
+                .is_some_and(|expected_color| *expected_color != color)
+            {
+                return Err(Sg0Error::Invariant);
+            }
+            total_order.push(Sg0OrderedVertexV1 {
+                vertex_id: id,
+                color,
+            });
+            if color == Sg0Color::Blue {
+                eligible_order.push(id);
+                eligible_work = eligible_work
+                    .checked_add(work(graph, id)?)
+                    .ok_or(Sg0Error::WorkOverflow)?;
+            }
+        }
+        let vertices = all_vertex_ids(graph)?;
+        let colored: Vec<_> = total_order
+            .iter()
+            .map(|entry| (entry.vertex_id, entry.color))
+            .collect();
+        Ok(Sg0OrderSnapshotV1 {
+            graph_commitment: graph_commitment(graph, &vertices)?,
+            selected_tip: Some(selected),
+            total_order_commitment: colored_commitment(TOTAL_ORDER_COMMITMENT_DOMAIN, &colored)?,
+            eligible_order_commitment: ids_commitment(
+                ELIGIBLE_ORDER_COMMITMENT_DOMAIN,
+                &eligible_order,
+            )?,
+            total_order,
+            eligible_order,
+            eligible_work,
+        })
+    }
+
+    #[test]
+    fn selected_metadata_fields_preserve_all_snapshot_bytes_and_remove_exact_duplicate_reads() {
+        let mut graph = TestGraph::default();
+        graph.push(1, Sg0ParentSetV1::anchor(), 1);
+        for value in 2..=5 {
+            graph.push(
+                value,
+                Sg0ParentSetV1::vertices(vec![TestGraph::id(1)]).unwrap(),
+                u64::from(value),
+            );
+        }
+        graph.push(
+            6,
+            Sg0ParentSetV1::vertices(vec![TestGraph::id(2), TestGraph::id(3)]).unwrap(),
+            1,
+        );
+        graph.push(
+            7,
+            Sg0ParentSetV1::vertices(vec![TestGraph::id(4), TestGraph::id(5)]).unwrap(),
+            1,
+        );
+        graph.push(
+            8,
+            Sg0ParentSetV1::vertices(vec![TestGraph::id(6), TestGraph::id(7)]).unwrap(),
+            1,
+        );
+        for tips in [vec![1], vec![2], vec![2, 3], vec![6, 7], vec![8]] {
+            let tips: Vec<_> = tips.into_iter().map(TestGraph::id).collect();
+            graph.metadata_reads.set(0);
+            let reference = reference_selected_tips(&graph, &tips).unwrap();
+            let prior_reads = graph.metadata_reads.get();
+            graph.metadata_reads.set(0);
+            let actual = derive_for_tips(&graph, &tips).unwrap();
+            let actual_reads = graph.metadata_reads.get();
+            assert_eq!(actual, reference); // every snapshot field and commitment
+            let mut chain_len = 0;
+            let mut cursor = reference.selected_tip;
+            while let Some(vertex) = cursor {
+                chain_len += 1;
+                cursor = match graph.data[&vertex].selected_parent() {
+                    Sg0SelectedParentV1::Anchor => None,
+                    Sg0SelectedParentV1::Vertex(parent) => Some(parent),
+                };
+            }
+            assert_eq!(prior_reads - actual_reads, tips.len() + chain_len);
+        }
+    }
+
+    #[test]
+    fn selected_metadata_fields_keep_missing_metadata_vertex_and_cycle_refusal() {
+        let mut graph = TestGraph::default();
+        graph.push(1, Sg0ParentSetV1::anchor(), 1);
+        graph.push(
+            2,
+            Sg0ParentSetV1::vertices(vec![TestGraph::id(1)]).unwrap(),
+            1,
+        );
+        let tips = [TestGraph::id(2)];
+        let metadata = graph.data.remove(&tips[0]).unwrap();
+        assert_eq!(
+            derive_for_tips(&graph, &tips),
+            reference_selected_tips(&graph, &tips)
+        );
+        assert_eq!(
+            derive_for_tips(&graph, &tips),
+            Err(Sg0Error::MissingMetadata)
+        );
+        graph.data.insert(tips[0], metadata.clone());
+        graph.data.get_mut(&tips[0]).unwrap().selected_parent =
+            Sg0SelectedParentV1::Vertex(tips[0]);
+        assert_eq!(
+            derive_for_tips(&graph, &tips),
+            reference_selected_tips(&graph, &tips)
+        );
+        assert_eq!(derive_for_tips(&graph, &tips), Err(Sg0Error::Cycle));
+        graph.data.insert(tips[0], metadata);
+        graph.vertices.remove(&TestGraph::id(1));
+        assert_eq!(
+            derive_for_tips(&graph, &tips),
+            reference_selected_tips(&graph, &tips)
+        );
+        assert_eq!(derive_for_tips(&graph, &tips), Err(Sg0Error::MissingVertex));
     }
 
     #[test]
