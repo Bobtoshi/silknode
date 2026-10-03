@@ -1,5 +1,6 @@
 //! Receiver-owned full-data graph. No decoded peer object can construct validity.
 mod ancestry;
+mod facts;
 mod index;
 use crate::{
     Digest, Error, Result,
@@ -9,6 +10,7 @@ use crate::{
     wire::{raw_hash, u32le},
 };
 use ancestry::{PagedAncestry, RetainedContext};
+use facts::FactsRecord;
 use index::VertexIndex;
 use silk_order::sg0_v1::{
     ReceiverVerifiedSg0Graph, Sg0Error, Sg0OrderSnapshotV1, Sg0ParentSetV1, Sg0VertexDataV1,
@@ -37,7 +39,7 @@ pub struct VerifiedVertex {
 pub struct GraphInfo {
     id: Digest,
     header: HeaderRecord,
-    facts: ParentFacts,
+    facts: FactsRecord,
     metadata: Option<Metadata>,
     ancestors: PagedAncestry,
     retained_source: Option<RetainedSource>,
@@ -147,6 +149,26 @@ impl GraphInfo {
             return Err(Error::Unavailable("retained execution header binding"));
         }
         info.header = HeaderRecord::Resident(Arc::new(header.clone()));
+        let source = self
+            .retained_source
+            .as_ref()
+            .ok_or(Error::Unavailable("retained parent facts source absent"))?;
+        let start = 12_usize
+            .checked_add(source.candidate_len)
+            .ok_or(Error::Unavailable("retained parent facts length"))?;
+        if bytes.len() != source.record_len
+            || raw_hash(bytes) != source.id
+            || bytes.get(..8) != Some(b"SNF04VR1")
+            || u32le(bytes, 8)? as usize != source.candidate_len
+        {
+            return Err(Error::Unavailable("retained parent facts original binding"));
+        }
+        let source_record = bytes
+            .get(start..start + 184)
+            .ok_or(Error::Unavailable("retained parent facts source framing"))?
+            .try_into()
+            .map_err(|_| Error::Unavailable("retained parent facts source framing"))?;
+        info.facts = self.facts.restore(header, source_record)?;
         if matches!(self.metadata, Some(Metadata::Retained { .. })) {
             info.metadata = Some(Metadata::Resident(Arc::new(self.bound_metadata(bytes)?)));
         }
@@ -272,6 +294,7 @@ impl RetainEntry for RetainedVertex {
         let mut info = vertex.info;
         info.metadata = Some(Metadata::Retained { len: metadata_len });
         info.header = info.header.retain();
+        info.facts = info.facts.retain();
         // Candidate, full envelopes AND sealed SG0 data drop before graph credit.
         Ok(Arc::new(Self { info, bindings }))
     }
@@ -330,7 +353,7 @@ impl VerifiedVertex {
     /// Parent-local facts, not the current canonical branch's source by index.
     #[must_use]
     pub const fn facts(&self) -> &ParentFacts {
-        &self.info.facts
+        self.info.facts.resident()
     }
     pub(crate) fn retained_record(&self) -> Result<Vec<u8>> {
         let bytes = self.candidate.encode();
@@ -342,7 +365,7 @@ impl VerifiedVertex {
         b.extend_from_slice(b"SNF04VR1");
         b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         b.extend_from_slice(&bytes);
-        b.extend_from_slice(&self.info.facts.source_record);
+        b.extend_from_slice(&self.facts().source_record);
         b.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
         b.extend_from_slice(&metadata);
         Ok(b)
@@ -559,6 +582,12 @@ impl<V: GraphEntry> GraphData<V> {
     #[cfg(test)]
     pub(crate) fn retained_index_pages(&self) -> Vec<Digest> {
         self.index.retained_ids()
+    }
+    #[cfg(test)]
+    pub(crate) fn parent_facts_are_retained(&self) -> bool {
+        self.vertices
+            .iter()
+            .all(|vertex| matches!(vertex.graph_info().facts, FactsRecord::Retained { .. }))
     }
     fn position(&self, id: VertexId, budget: Option<&JobBudget>) -> Result<usize> {
         let position = self
@@ -823,7 +852,7 @@ impl<V: GraphEntry> GraphData<V> {
             info: GraphInfo {
                 id: candidate.id,
                 header: HeaderRecord::Resident(Arc::new(candidate.header.clone())),
-                facts,
+                facts: FactsRecord::Resident(Box::new(facts)),
                 ancestors: self.parent_closure_checked(&candidate.header.parents, Some(budget))?,
                 metadata: None,
                 retained_source: None,
@@ -1113,7 +1142,7 @@ mod tests {
             info: GraphInfo {
                 id: candidate.id,
                 header: HeaderRecord::Resident(Arc::new(candidate.header.clone())),
-                facts,
+                facts: FactsRecord::Resident(Box::new(facts)),
                 ancestors,
                 metadata: None,
                 retained_source: None,
@@ -1153,6 +1182,100 @@ mod tests {
             graph.publish(prepared).unwrap();
         }
         graph
+    }
+    #[test]
+    fn disk_facts_detaches_payload_restores_exact_original_and_preserves_const_borrow() {
+        const fn borrow_facts(vertex: &VerifiedVertex) -> &ParentFacts {
+            vertex.facts()
+        }
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic parent fact retention")
+            .unwrap();
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 1, &[]), &budget)
+            .unwrap();
+        let expected = borrow_facts(prepared.vertex()).clone();
+        let header = prepared.vertex().candidate().header.clone();
+        let record = prepared.vertex().retained_record().unwrap();
+        store
+            .commit(&[&record], b"synthetic full original record")
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        prepared
+            .retain_ancestry(&graph, &mut store, &budget)
+            .unwrap();
+        let weak = Arc::downgrade(&prepared.vertex);
+        graph.publish_checked(prepared, &budget).unwrap();
+        assert!(weak.upgrade().is_none());
+        let info = &graph.get(id(1)).unwrap().info;
+        assert!(matches!(info.facts, FactsRecord::Retained { .. }));
+        assert!(std::mem::size_of::<FactsRecord>() < std::mem::size_of::<ParentFacts>());
+        let restored = info.execution_info(&record, &header).unwrap();
+        assert_eq!(restored.facts.resident(), &expected);
+        assert!(matches!(restored.facts, FactsRecord::Resident(_)));
+        assert_eq!(
+            graph
+                .get(id(1))
+                .unwrap()
+                .info
+                .facts
+                .restore(&header, expected.source_record)
+                .unwrap()
+                .resident(),
+            &expected
+        );
+        let mut changed = record.clone();
+        changed[12 + u32le(&record, 8).unwrap() as usize] ^= 1;
+        assert!(info.execution_info(&changed, &header).is_err());
+        assert_eq!(graph.len(), 1);
+        assert_eq!(
+            info.execution_info(&record, &header)
+                .unwrap()
+                .facts
+                .resident(),
+            &expected
+        );
+    }
+    #[test]
+    fn disk_facts_full_live_binding_refuses_any_changed_parent_payload_or_header_claim() {
+        let graph = Graph::default();
+        let vertex = synthetic_vertex(&graph, 1, &[]);
+        let original = vertex.facts().clone();
+        let header = vertex.candidate().header.clone();
+        let retained = vertex.info.facts.retain();
+        let mut source_record = original.source_record;
+        source_record[183] ^= 1;
+        assert!(retained.restore(&header, source_record).is_err());
+        assert!(vertex.info.facts.restore(&header, source_record).is_err());
+        for field in 0..7 {
+            let mut changed = header.clone();
+            match field {
+                0 => changed.epoch ^= 1,
+                1 => changed.daa[0] ^= 1,
+                2 => changed.work += 1,
+                3 => changed.source_index ^= 1,
+                4 => changed.source_checkpoint[0] ^= 1,
+                5 => changed.source_j[0] ^= 1,
+                _ => changed.seed[0] ^= 1,
+            }
+            assert!(retained.restore(&changed, original.source_record).is_err());
+        }
+        let mut wrong = retained.clone();
+        if let FactsRecord::Retained { minimum_time, .. } = &mut wrong {
+            *minimum_time = 1;
+        }
+        assert!(wrong.restore(&header, original.source_record).is_err());
+        let mut wrong = retained;
+        if let FactsRecord::Retained { key_material, .. } = &mut wrong {
+            key_material[0] ^= 1;
+        }
+        assert!(wrong.restore(&header, original.source_record).is_err());
     }
     #[test]
     fn disk_order_staged_source_missing_refuses_core_graph_credit() {
@@ -1442,6 +1565,11 @@ mod tests {
             durable
                 .vertices()
                 .all(|v| matches!(v.info.metadata, Some(Metadata::Retained { .. })))
+        );
+        assert!(
+            durable
+                .vertices()
+                .all(|v| matches!(v.info.facts, FactsRecord::Retained { .. }))
         );
         assert!(matches!(durable.index, VertexIndex::Retained(_)));
         let retained_view = View {

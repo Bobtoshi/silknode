@@ -62,6 +62,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         .order
         .retained_id()
         .expect("core order must be disk retained");
+    assert!(node.core.graph.parent_facts_are_retained());
     let completed = node.core.state.clone();
     assert_eq!(completed.retained_recovery_pages().len(), 1);
     assert!(
@@ -287,6 +288,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
             .header(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
             .unwrap();
         assert_eq!(header.bytes, loaded.candidate().header.bytes);
+        header.check_facts(loaded.facts()).unwrap();
         assert!(!std::ptr::eq(header.as_ref(), &loaded.candidate().header));
         let source = retained.source_id().unwrap();
         assert_eq!(
