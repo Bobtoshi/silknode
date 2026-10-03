@@ -1155,6 +1155,132 @@ mod tests {
         graph
     }
     #[test]
+    fn disk_order_staged_source_missing_refuses_core_graph_credit() {
+        // Private synthetic publication fixture only; never native admission.
+        use crate::core::{
+            Admission, Core, Status,
+            order::{CoreOrder, snapshot_bytes},
+        };
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut core = Core::new(
+            Arc::new(crate::genesis::public_testnet_v1::genesis().unwrap()),
+            LocalClock::default(),
+        )
+        .unwrap();
+        core.graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic order publication fence")
+            .unwrap();
+        let mut vertex = core
+            .graph
+            .seal(synthetic_vertex(&core.graph, 1, &[]), &budget)
+            .unwrap();
+        let order = core.graph.order_with(&vertex, &budget).unwrap();
+        let record = vertex.vertex().retained_record().unwrap();
+        let original = snapshot_bytes(&order);
+        store
+            .commit(
+                &[&record, &original],
+                b"synthetic complete original records",
+            )
+            .unwrap();
+        vertex.bind_retained_source(&record).unwrap();
+        vertex
+            .retain_ancestry(&core.graph, &mut store, &budget)
+            .unwrap();
+        let retained = CoreOrder::retain(&order, store.object_reader().unwrap(), &budget).unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(raw_hash(&original))));
+        std::fs::rename(&path, path.with_extension("held")).unwrap();
+        let manifest = core.state.manifest();
+        let head = store.head();
+        let old_order = core.order.bytes(&budget).unwrap();
+        assert!(matches!(
+            core.publish(Admission {
+                vertex,
+                order,
+                retained_order: Some(retained),
+                status: Status::Ready,
+                budget
+            }),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(core.graph.len(), 0);
+        assert!(core.graph.get(id(1)).is_err());
+        assert_eq!(core.state.manifest(), manifest);
+        assert_eq!(core.status, Status::Ready);
+        assert_eq!(
+            core.order.bytes(&JobBudget::checkpoint().unwrap()).unwrap(),
+            old_order
+        );
+        assert_eq!(store.head(), head);
+    }
+    #[test]
+    fn disk_order_retention_drops_both_snapshot_vectors_and_preserves_original_order_bytes() {
+        use crate::core::order::{CoreOrder, snapshot_bytes};
+        let (_temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let snapshot = Arc::new(diamond(&budget).order(&budget).unwrap());
+        let weak = Arc::downgrade(&snapshot);
+        let original = snapshot_bytes(&snapshot);
+        let ids = snapshot.eligible_order().to_vec();
+        let selected = snapshot.selected_tip();
+        store
+            .commit(&[&original], b"synthetic original order record")
+            .unwrap();
+        let retained =
+            CoreOrder::retain(&snapshot, store.object_reader().unwrap(), &budget).unwrap();
+        assert_eq!(retained.retained_id(), Some(raw_hash(&original)));
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(retained.bytes(&budget).unwrap(), original);
+        assert_eq!(retained.eligible(&budget).unwrap(), ids);
+        assert_eq!(retained.selected_tip(), selected);
+        assert_eq!(retained.clone().bytes(&budget).unwrap(), original);
+    }
+    #[test]
+    fn disk_order_missing_tampered_hardlinked_original_refuses_all_owned_reads() {
+        use crate::core::order::{CoreOrder, snapshot_bytes};
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let snapshot = diamond(&budget).order(&budget).unwrap();
+        let original = snapshot_bytes(&snapshot);
+        assert!(CoreOrder::retain(&snapshot, store.object_reader().unwrap(), &budget).is_err());
+        store
+            .commit(&[&original], b"synthetic original order record")
+            .unwrap();
+        let retained =
+            CoreOrder::retain(&snapshot, store.object_reader().unwrap(), &budget).unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(raw_hash(&original))));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(matches!(retained.bytes(&budget), Err(Error::Io(_))));
+        assert!(retained.eligible(&budget).is_err());
+        assert!(CoreOrder::retain(&snapshot, store.object_reader().unwrap(), &budget).is_err());
+        std::fs::rename(&held, &path).unwrap();
+        let mut changed = original.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert!(retained.eligible(&budget).is_err());
+        std::fs::write(&path, &original).unwrap();
+        std::fs::hard_link(&path, &held).unwrap();
+        assert!(retained.bytes(&budget).is_err());
+        std::fs::remove_file(&held).unwrap();
+        std::fs::rename(temp.path().join("store"), temp.path().join("original")).unwrap();
+        std::fs::create_dir(temp.path().join("store")).unwrap();
+        assert_eq!(retained.bytes(&budget).unwrap(), original);
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(retained.eligible(&expired).is_err());
+    }
+    #[test]
     fn disk_index_graph_missing_current_or_staged_page_refuses_without_partial_credit() {
         let (temp, mut store) = crate::store::ancestry_test_store();
         let budget = JobBudget::checkpoint().unwrap();

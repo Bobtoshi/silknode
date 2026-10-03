@@ -4,7 +4,10 @@
 mod ancestry_tests;
 #[cfg(test)]
 mod export_tests;
+#[cfg(test)]
+mod order_tests;
 mod replay;
+use crate::core::order::{CoreOrder, snapshot_bytes as order_bytes};
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
@@ -18,7 +21,7 @@ use crate::{
     wire::{field, raw_hash, u32le, u64le},
 };
 use rand_core::{OsRng, RngCore};
-use silk_order::sg0_v1::{Sg0OrderSnapshotV1, Sg0ParentSetV1};
+use silk_order::sg0_v1::Sg0ParentSetV1;
 use silk_sapling_f04::parameters::SaplingParameters;
 use silk_types::VertexId;
 use std::{
@@ -85,14 +88,18 @@ impl Node {
             state_view: OnceLock::new(),
         };
         let data = genesis_material(&node.core.genesis);
+        let budget = JobBudget::checkpoint()?;
         node.commit(
             0,
             &data,
             node.core.state.clone(),
-            &order_bytes(&node.core.order),
+            &node.core.order.bytes(&budget)?,
             0,
             node.core.status,
         )?;
+        if let CoreOrder::Resident(order) = &node.core.order {
+            node.core.order = CoreOrder::retain(order, node.store.object_reader()?, &budget)?;
+        }
         Ok(node)
     }
 
@@ -320,6 +327,11 @@ impl Node {
                     }
                     a.vertex.retain_ancestry(&core.graph, store, &a.budget)?;
                     a.vertex.bind_retained_source(&data)?;
+                    a.retained_order = Some(CoreOrder::retain(
+                        &a.order,
+                        store.object_reader()?,
+                        &a.budget,
+                    )?);
                     core.publish(a)?
                 }
                 2 | 3 if index > 0 => {
@@ -350,9 +362,12 @@ impl Node {
                 || core.graph.len() as u64 != r.vertices
                 || core.state.checkpoint_id() != r.checkpoint
                 || store.object(r.state)? != core.state.manifest()
-                || store.object(r.order)? != order_bytes(&core.order)
+                || store.object(r.order)? != core.order.bytes(&budget)?
             {
                 return Err(Error::Unavailable("complete generation mismatch"));
+            }
+            if let CoreOrder::Resident(order) = &core.order {
+                core.order = CoreOrder::retain(order, store.object_reader()?, &budget)?;
             }
             previous = raw_hash(&r.encode());
             last_sequence = r.sequence;
@@ -597,7 +612,14 @@ impl Node {
         if let Err(error) = (|| {
             a.vertex
                 .retain_ancestry(&self.core.graph, &mut self.store, &a.budget)?;
-            a.vertex.bind_retained_source(&data)
+            a.vertex.bind_retained_source(&data).and_then(|()| {
+                a.retained_order = Some(CoreOrder::retain(
+                    &a.order,
+                    self.store.object_reader()?,
+                    &a.budget,
+                )?);
+                Ok(())
+            })
         })() {
             self.faulted = true;
             return Err(error);
@@ -645,7 +667,7 @@ impl Node {
                 if step.rollback { 3 } else { 2 },
                 &data,
                 step.state.clone(),
-                &order_bytes(&self.core.order),
+                &self.core.order.bytes(&budget)?,
                 self.core.graph.len() as u64,
                 step.status,
             )?;
@@ -680,7 +702,7 @@ impl Node {
             4,
             &[],
             self.core.state.clone(),
-            &order_bytes(&self.core.order),
+            &self.core.order.bytes(&budget)?,
             self.core.graph.len() as u64,
             self.core.status,
         )?;
@@ -730,7 +752,10 @@ impl Node {
         if let Some(timestamp) = fixture_timestamp {
             self.core.clock.check_new(timestamp)?;
         }
-        let parents = parents.unwrap_or_else(|| self.core.selected_parent());
+        let parents = match parents {
+            Some(parents) => parents,
+            None => self.core.selected_parent(&budget)?,
+        };
         let mut marker = Vec::new();
         marker.extend_from_slice(b"SNF04MJ1");
         marker.extend_from_slice(&self.core.genesis.domain());
@@ -891,17 +916,6 @@ pub(crate) fn system_wall() -> Result<u64> {
 }
 fn genesis_material(g: &Genesis) -> Vec<u8> {
     g.local_bundle()
-}
-fn order_bytes(o: &Sg0OrderSnapshotV1) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.extend_from_slice(b"SNF04OR1");
-    b.extend_from_slice(&o.graph_commitment().into_bytes());
-    b.extend_from_slice(&o.total_order_commitment().into_bytes());
-    b.extend_from_slice(&(o.eligible_order().len() as u32).to_le_bytes());
-    for id in o.eligible_order() {
-        b.extend_from_slice(&id.into_bytes());
-    }
-    b
 }
 struct Record {
     kind: u8,

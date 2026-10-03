@@ -1,4 +1,7 @@
 //! Serialized node coordinator. The durable adapter publishes its prepared changes.
+// Keep this adapter explicitly crate-private even inside the private core.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod order;
 use crate::{
     Digest, Error, Result,
     budget::{JobBudget, LocalClock},
@@ -10,6 +13,7 @@ use crate::{
     quantum::{Job, Progress},
     state::{BranchState, EffectOutcome},
 };
+use order::CoreOrder;
 use silk_order::sg0_v1::{Sg0OrderSnapshotV1, Sg0ParentSetV1};
 use silk_sapling_f04::parameters::SaplingParameters;
 use silk_types::VertexId;
@@ -39,7 +43,7 @@ pub(crate) struct Core {
     pub genesis: Arc<Genesis>,
     pub graph: Graph,
     pub state: Arc<BranchState>,
-    pub order: Sg0OrderSnapshotV1,
+    pub order: CoreOrder,
     pub clock: LocalClock,
     pub status: Status,
     prefixes: Option<PrefixCache>,
@@ -51,6 +55,7 @@ pub(crate) struct Core {
 pub(crate) struct Admission {
     pub vertex: PreparedVertex,
     pub order: Sg0OrderSnapshotV1,
+    pub retained_order: Option<CoreOrder>,
     pub status: Status,
     pub budget: JobBudget,
 }
@@ -89,7 +94,7 @@ impl Core {
             genesis,
             graph,
             state,
-            order,
+            order: CoreOrder::resident(order),
             clock,
             status: Status::Ready,
             prefixes: Some(prefixes),
@@ -215,6 +220,7 @@ impl Core {
                     return Ok(Some(Admission {
                         vertex,
                         order,
+                        retained_order: None,
                         status,
                         budget,
                     }));
@@ -233,8 +239,22 @@ impl Core {
     }
     pub fn publish(&mut self, a: Admission) -> Result<JobBudget> {
         a.budget.check()?;
+        let retained_order = a
+            .retained_order
+            .ok_or(Error::Unavailable("durable order binding absent"))?;
+        if !matches!(retained_order, CoreOrder::Retained(_)) {
+            return Err(Error::Unavailable(
+                "durable order must release resident snapshot",
+            ));
+        }
+        if retained_order.bytes(&a.budget)? != order::snapshot_bytes(&a.order)
+            || retained_order.selected_tip() != a.order.selected_tip()
+        {
+            return Err(Error::Unavailable("staged order publication mismatch"));
+        }
+        a.budget.check()?;
         self.graph.publish_checked(a.vertex, &a.budget)?;
-        self.order = a.order;
+        self.order = retained_order;
         self.status = a.status;
         Ok(a.budget)
     }
@@ -243,17 +263,17 @@ impl Core {
             return Err(Error::Unavailable("no reconciliation pending"));
         }
         budget.check()?;
-        let ids = self.order.eligible_order();
+        let ids = self.order.eligible(budget)?;
         let old_len = self.state.executed_len();
         let common = self
             .state
-            .common_executed_prefix_checked(ids, Some(budget))?;
+            .common_executed_prefix_checked(&ids, Some(budget))?;
         if common < old_len {
             let end = common / 8 * 8;
             let mut selected: Option<Arc<BranchState>> = None;
             for state in &self.history {
                 if state.executed_len() <= end
-                    && state.executed_prefix_matches_checked(ids, Some(budget))?
+                    && state.executed_prefix_matches_checked(&ids, Some(budget))?
                     && selected
                         .as_ref()
                         .is_none_or(|selected| state.executed_len() >= selected.executed_len())
@@ -265,7 +285,7 @@ impl Core {
             // A cached reversible snapshot is not permission to publish a
             // rollback whose original ledger pages are now unreadable.
             let state = Arc::new(state.materialize_ledger(Some(budget))?);
-            let derived_status = status_for(&state, ids, budget)?;
+            let derived_status = status_for(&state, &ids, budget)?;
             let status = if derived_status == Status::Ready {
                 Status::Ready
             } else if self.status == Status::ArchiveReplay {
@@ -301,7 +321,7 @@ impl Core {
         )?;
         budget.check()?;
         let state = Arc::new(t.state);
-        let status = if status_for(&state, ids, budget)? == Status::Ready {
+        let status = if status_for(&state, &ids, budget)? == Status::Ready {
             Status::Ready
         } else {
             self.status
@@ -318,10 +338,10 @@ impl Core {
     /// state mutation. A divergent prefix may require genesis rollback plus all
     /// complete intervals; reuse of retained checkpoints can only lower the cost.
     pub fn reconciliation_generations(&self, budget: &JobBudget) -> Result<u64> {
-        let ids = self.order.eligible_order();
+        let ids = self.order.eligible(budget)?;
         let common = self
             .state
-            .common_executed_prefix_checked(ids, Some(budget))?;
+            .common_executed_prefix_checked(&ids, Some(budget))?;
         HistoryCapacityV1::reconciliation_generations(self.state.executed_len(), common, ids.len())
     }
     pub fn publish_step(&mut self, s: Step) -> Result<()> {
@@ -386,12 +406,15 @@ impl Core {
         budget.check()?;
         result
     }
-    pub fn selected_parent(&self) -> Sg0ParentSetV1 {
-        self.order
+    pub fn selected_parent(&self, budget: &JobBudget) -> Result<Sg0ParentSetV1> {
+        // Default mining selection may not proceed on an unreadable order.
+        self.order.bytes(budget)?;
+        Ok(self
+            .order
             .selected_tip()
             .map_or(Sg0ParentSetV1::Anchor, |id| {
                 Sg0ParentSetV1::Vertices(vec![id])
-            })
+            }))
     }
 }
 fn status_for(state: &BranchState, ids: &[VertexId], budget: &JobBudget) -> Result<Status> {

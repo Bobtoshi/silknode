@@ -57,6 +57,11 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.leaves(), 7);
     let index_pages = node.core.graph.retained_index_pages();
     assert_eq!(index_pages.len(), 1);
+    let order_id = node
+        .core
+        .order
+        .retained_id()
+        .expect("core order must be disk retained");
     let completed = node.core.state.clone();
     assert_eq!(completed.retained_recovery_pages().len(), 1);
     assert!(
@@ -120,7 +125,11 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         assert_eq!(node.local_head().unwrap(), pin);
         fs::rename(&held, &path).unwrap();
     }
-    let ids = node.core.order.eligible_order().to_vec();
+    let ids = node
+        .core
+        .order
+        .eligible(&JobBudget::checkpoint().unwrap())
+        .unwrap();
     let prior = node
         .core
         .retained_history_for_test()
@@ -170,8 +179,16 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
             &Sg0ParentSetV1::vertices(vec![ids[7]]).unwrap(),
             &JobBudget::checkpoint().unwrap(),
         )
+        .map(CoreOrder::resident)
         .unwrap();
-    assert_eq!(node.core.order.eligible_order().len(), 8);
+    assert_eq!(
+        node.core
+            .order
+            .eligible(&JobBudget::checkpoint().unwrap())
+            .unwrap()
+            .len(),
+        8
+    );
     node.core.status = Status::NeedsReconcile;
     let rollback = node
         .core
@@ -424,17 +441,52 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.manifest(), scratch_manifest);
     assert_eq!(node.local_head().unwrap(), pin);
     fs::rename(&index_held, &index_path).unwrap();
+    let order_path = root.join(format!("{}.obj", hex::encode(order_id)));
+    let order_held = order_path.with_extension("held");
+    fs::rename(&order_path, &order_held).unwrap();
+    assert!(matches!(
+        node.core.order.eligible(&JobBudget::checkpoint().unwrap()),
+        Err(Error::Io(_))
+    ));
+    assert!(
+        node.core
+            .reconciliation_generations(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(
+        node.core
+            .prepare_step(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(
+        node.core
+            .selected_parent(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(matches!(node.advance(), Err(Error::Io(_))));
+    assert!(matches!(node.flush_clock(), Err(Error::Io(_))));
+    assert_eq!(node.core.state.manifest(), scratch_manifest);
+    assert_eq!(node.local_head().unwrap(), pin);
+    assert!(!root.join("ACTIVE_JOB").exists());
+    fs::rename(&order_held, &order_path).unwrap();
+    assert_eq!(
+        node.core
+            .order
+            .eligible(&JobBudget::checkpoint().unwrap())
+            .unwrap(),
+        ids
+    );
     drop(node);
-    // A damaged auxiliary page is NOT damaged original HEAD lineage. A fresh
-    // reopen must stop, never fall back to PREVIOUS and expose an older ledger.
-    let set_path = root.join(format!("{}.obj", hex::encode(index_pages[0])));
+    // This is an ORIGINAL order object, not auxiliary saved validity. Exact
+    // pinned reopen refuses corruption, without adopting a previous head.
+    let set_path = root.join(format!("{}.obj", hex::encode(order_id)));
     let set_bytes = fs::read(&set_path).unwrap();
     let mut damaged = set_bytes.clone();
     *damaged.last_mut().unwrap() ^= 1;
     fs::write(&set_path, damaged).unwrap();
     assert!(matches!(
         Node::open_retained_pinned(&root, &margin, accepted_genesis, &parameters, pin),
-        Err(Error::Unavailable("retained vertex index page damaged"))
+        Err(Error::Unavailable("owned object reader content"))
     ));
     assert_eq!(
         fs::read(root.join("HEAD")).unwrap(),
@@ -446,7 +498,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; full_graph_headers_disk_backed=true; owned_original_header_reads_exact=true; vertex_index_disk_backed=true; missing_index_refuses_get_repeat_order_header_and_execution=true; damaged_index_cold_replay_stops_without_previous_fallback=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_header_and_reducers_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; full_graph_headers_disk_backed=true; owned_original_header_reads_exact=true; vertex_index_disk_backed=true; core_order_disk_backed=true; missing_index_refuses_get_repeat_order_header_and_execution=true; missing_original_order_refuses_reconcile_capacity_default_mining_selection_advance_and_flush_before_marker=true; damaged_original_order_pinned_cold_replay_stops_without_adoption=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_header_and_reducers_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
     );
 }
 
@@ -575,7 +627,11 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
     );
     assert_eq!(node.local_head().unwrap(), pin);
     let completed = node.core.state.clone();
-    let ids = node.core.order.eligible_order().to_vec();
+    let ids = node
+        .core
+        .order
+        .eligible(&JobBudget::checkpoint().unwrap())
+        .unwrap();
     for id in &ids {
         let loaded = node
             .core
