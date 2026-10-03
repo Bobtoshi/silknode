@@ -393,6 +393,32 @@ impl Store {
             "retained vertex index page publication failed",
         )
     }
+    /// Private live receiver-derived vertex directory; never cold validity input.
+    pub(crate) fn retain_vertex_directory_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        const HEADER: usize = 52;
+        const SLOT: usize = 561;
+        let count = if bytes.len() >= HEADER {
+            u32le(bytes, 48)? as usize
+        } else {
+            0
+        };
+        if bytes.get(..8) != Some(b"SNF04DP1")
+            || !(1..=64).contains(&count)
+            || bytes.len() != HEADER + count * SLOT
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "vertex directory page requires active verified transition",
+            ));
+        }
+        self.retain_ledger_page(
+            bytes,
+            "vertex directory page writer stopped",
+            "retained vertex directory page damaged",
+            "post-vertex-directory-page host margin",
+            "retained vertex directory page publication failed",
+        )
+    }
     fn retain_ledger_page(
         &mut self,
         bytes: &[u8],
@@ -774,6 +800,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reader.object(id, 64).unwrap(), value);
+    }
+    #[test]
+    fn disk_directory_writer_requires_fence_and_damage_is_stop_without_previous_adoption() {
+        let (temp, mut store) = ancestry_test_store();
+        store
+            .commit(&[], b"prior synthetic directory head")
+            .unwrap();
+        let head = store
+            .commit(&[], b"current synthetic directory head")
+            .unwrap();
+        let previous = fs::read(temp.path().join("store/PREVIOUS")).unwrap();
+        let mut page = vec![0; 52 + 561];
+        page[..8].copy_from_slice(b"SNF04DP1");
+        page[48..52].copy_from_slice(&1_u32.to_le_bytes());
+        let used = store.accounted_bytes();
+        assert!(store.retain_vertex_directory_page(&page).is_err());
+        assert_eq!(store.accounted_bytes(), used);
+        store
+            .begin_job(b"synthetic receiver-derived directory")
+            .unwrap();
+        assert!(
+            store
+                .retain_vertex_directory_page(&page[..page.len() - 1])
+                .is_err()
+        );
+        let id = store.retain_vertex_directory_page(&page).unwrap();
+        assert_eq!(store.head(), Some(head));
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(id)));
+        let mut damaged = page.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(path, damaged).unwrap();
+        let error = store.retain_vertex_directory_page(&page).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Unavailable("retained vertex directory page damaged")
+        ));
+        assert!(!crate::node::storage_integrity_failure(&error));
+        assert!(
+            store
+                .commit(&[], b"must not publish directory credit")
+                .is_err()
+        );
+        assert_eq!(store.head(), Some(head));
+        assert_eq!(
+            fs::read(temp.path().join("store/PREVIOUS")).unwrap(),
+            previous
+        );
+        assert!(store.active_job().unwrap().is_some());
     }
     #[test]
     fn disk_ancestry_writer_requires_fence_and_auxiliary_damage_is_stop() {

@@ -30,6 +30,42 @@ fn binding(facts: &ParentFacts) -> Digest {
     raw_hash(&bytes)
 }
 impl FactsRecord {
+    pub(super) fn directory_bytes(&self) -> Result<Vec<u8>> {
+        let Self::Retained {
+            minimum_time,
+            key_material,
+            binding,
+        } = self
+        else {
+            return Err(Error::Unavailable(
+                "directory requires compact parent facts",
+            ));
+        };
+        let mut bytes = Vec::with_capacity(72);
+        bytes.extend_from_slice(&minimum_time.to_le_bytes());
+        bytes.extend_from_slice(key_material);
+        bytes.extend_from_slice(binding);
+        Ok(bytes)
+    }
+    /// Private checked live directory ONLY; never a cold/imported constructor.
+    pub(super) fn from_live_directory(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 72 {
+            return Err(Error::Unavailable("parent facts directory length"));
+        }
+        Ok(Self::Retained {
+            minimum_time: u64::from_le_bytes(
+                bytes[..8]
+                    .try_into()
+                    .map_err(|_| Error::Unavailable("parent facts directory time"))?,
+            ),
+            key_material: bytes[8..40]
+                .try_into()
+                .map_err(|_| Error::Unavailable("parent facts directory key"))?,
+            binding: bytes[40..72]
+                .try_into()
+                .map_err(|_| Error::Unavailable("parent facts directory binding"))?,
+        })
+    }
     pub(super) fn retain(&self) -> Self {
         match self {
             Self::Resident(facts) => Self::Retained {

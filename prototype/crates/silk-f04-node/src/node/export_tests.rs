@@ -57,6 +57,22 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.core.state.leaves(), 7);
     let index_pages = node.core.graph.retained_index_pages();
     assert_eq!(index_pages.len(), 1);
+    let directory_pages = node.core.graph.retained_directory_pages();
+    assert_eq!(directory_pages.len(), 1);
+    let directory_entry = node
+        .core
+        .graph
+        .get_owned(
+            node.core
+                .order
+                .eligible(&JobBudget::checkpoint().unwrap())
+                .unwrap()[0],
+            None,
+        )
+        .unwrap();
+    let weak_directory_entry = Arc::downgrade(&directory_entry);
+    drop(directory_entry);
+    assert!(weak_directory_entry.upgrade().is_none());
     let order_id = node
         .core
         .order
@@ -281,7 +297,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
             .graph
             .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
             .unwrap();
-        let retained = node.core.graph.get(*id).unwrap();
+        let retained = node.core.graph.get_owned(*id, None).unwrap();
         let header = node
             .core
             .graph
@@ -297,7 +313,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         );
         assert!(!std::ptr::eq(
             crate::graph::GraphEntry::graph_info(loaded.as_ref()),
-            crate::graph::GraphEntry::graph_info(retained),
+            crate::graph::GraphEntry::graph_info(retained.as_ref()),
         ));
         assert_eq!(
             loaded.envelopes().len(),
@@ -414,7 +430,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     let index_held = index_path.with_extension("held");
     fs::rename(&index_path, &index_held).unwrap();
     assert!(matches!(
-        node.core.graph.get(ids[position]),
+        node.core.graph.get_owned(ids[position], None),
         Err(Error::Io(_))
     ));
     assert!(matches!(node.begin_ingest(&repeated), Err(Error::Io(_))));
@@ -471,6 +487,61 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
     assert_eq!(node.local_head().unwrap(), pin);
     assert!(!root.join("ACTIVE_JOB").exists());
     fs::rename(&order_held, &order_path).unwrap();
+    let directory_path = root.join(format!("{}.obj", hex::encode(directory_pages[0])));
+    let directory_held = directory_path.with_extension("held");
+    fs::rename(&directory_path, &directory_held).unwrap();
+    assert!(matches!(
+        node.core.graph.get_owned(ids[position], None),
+        Err(Error::Io(_))
+    ));
+    assert!(matches!(node.begin_ingest(&repeated), Err(Error::Io(_))));
+    assert!(node.export_range(0, 16).is_err());
+    assert!(
+        node.core
+            .graph
+            .order(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(
+        node.core
+            .graph
+            .header(
+                ids[position],
+                &node.core.genesis,
+                &JobBudget::checkpoint().unwrap()
+            )
+            .is_err()
+    );
+    assert!(
+        node.core
+            .graph
+            .load_for_execution(
+                ids[position],
+                &node.core.genesis,
+                &JobBudget::checkpoint().unwrap()
+            )
+            .is_err()
+    );
+    assert!(
+        node.core
+            .prepare_step(&JobBudget::checkpoint().unwrap())
+            .is_err()
+    );
+    assert!(
+        crate::parent::replay_source_for_test(
+            &node.core.graph,
+            &node.core.genesis,
+            &ids,
+            &JobBudget::checkpoint().unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(node.core.state.manifest(), scratch_manifest);
+    assert_eq!(node.core.graph.len(), 16);
+    assert_eq!(node.core.status, Status::NeedsReconcile);
+    assert_eq!(node.local_head().unwrap(), pin);
+    assert!(!root.join("ACTIVE_JOB").exists());
+    fs::rename(&directory_held, &directory_path).unwrap();
     assert_eq!(
         node.core
             .order
@@ -479,16 +550,16 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         ids
     );
     drop(node);
-    // This is an ORIGINAL order object, not auxiliary saved validity. Exact
-    // pinned reopen refuses corruption, without adopting a previous head.
-    let set_path = root.join(format!("{}.obj", hex::encode(order_id)));
+    // Cold replay rederives this exact auxiliary directory after full verification.
+    // Damaged derived bytes STOP, not saved validity or previous-head adoption.
+    let set_path = directory_path;
     let set_bytes = fs::read(&set_path).unwrap();
     let mut damaged = set_bytes.clone();
     *damaged.last_mut().unwrap() ^= 1;
     fs::write(&set_path, damaged).unwrap();
     assert!(matches!(
         Node::open_retained_pinned(&root, &margin, accepted_genesis, &parameters, pin),
-        Err(Error::Unavailable("owned object reader content"))
+        Err(Error::Unavailable("retained vertex directory page damaged"))
     ));
     assert_eq!(
         fs::read(root.join("HEAD")).unwrap(),
@@ -500,7 +571,7 @@ fn disk_detach_nonempty_native_replay_execution_and_refusal_preserve_original_st
         assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
     }
     println!(
-        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_compact=true; full_graph_headers_disk_backed=true; owned_original_header_reads_exact=true; vertex_index_disk_backed=true; core_order_disk_backed=true; missing_index_refuses_get_repeat_order_header_and_execution=true; missing_original_order_refuses_reconcile_capacity_default_mining_selection_advance_and_flush_before_marker=true; damaged_original_order_pinned_cold_replay_stops_without_adoption=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_header_and_reducers_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
+        "retained_vertices=16; fresh_full_replay=true; nonempty_representations={representations}; graph_entries_disk_directory=true; graph_entry_carriers_physically_dropped=true; parent_facts_disk_backed=true; live_crypto_capabilities_not_serialized=true; full_graph_headers_disk_backed=true; owned_original_header_reads_exact=true; vertex_index_disk_backed=true; core_order_disk_backed=true; missing_index_refuses_get_repeat_order_header_and_execution=true; missing_original_order_refuses_reconcile_capacity_default_mining_selection_advance_and_flush_before_marker=true; missing_directory_refuses_get_repeat_export_order_header_execution_and_parent_replay=true; damaged_auxiliary_directory_pinned_cold_replay_stops_without_adoption=true; recovery_history_disk_backed=true; nullifier_and_effect_sets_disk_backed=true; executed_reward_output_link_histories_disk_backed=true; public_snapshot_resident=true; missing_ledger_pages_refuse_first_snapshot_execution_and_scratch_rollback=true; missing_executed_page_refuses_prefix_and_forward_delta=true; exact_owned_crypto_bodies=true; original_two_checkpoint_economic_state=true; checkpoint_and_parent_scratch_exact=true; missing_nonempty_source_refuses_header_and_reducers_without_publication=true; source_bytes_unchanged=true; native_reorg=false; mined=0; new_proofs=0"
     );
 }
 
@@ -543,7 +614,9 @@ fn disk_source_native_fresh_replay_exports_exact_originals_and_missing_last_refu
     let expected: Vec<_> = node
         .core
         .graph
-        .vertices()
+        .owned_vertices(None)
+        .unwrap()
+        .iter()
         .map(|v| {
             node.core
                 .graph
@@ -564,7 +637,9 @@ fn disk_source_native_fresh_replay_exports_exact_originals_and_missing_last_refu
     let record = node
         .core
         .graph
-        .vertices()
+        .owned_vertices(None)
+        .unwrap()
+        .into_iter()
         .last()
         .unwrap()
         .source_id()
@@ -640,10 +715,10 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
             .graph
             .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
             .unwrap();
-        let resident = node.core.graph.get(*id).unwrap();
+        let resident = node.core.graph.get_owned(*id, None).unwrap();
         assert!(!std::ptr::eq(
             crate::graph::GraphEntry::graph_info(loaded.as_ref()),
-            crate::graph::GraphEntry::graph_info(resident)
+            crate::graph::GraphEntry::graph_info(resident.as_ref())
         ));
         assert_eq!(
             loaded.retained_record().unwrap(),
@@ -681,7 +756,9 @@ fn disk_execution_native_checkpoint_and_parent_scratch_refuse_missing_source_wit
     let record = node
         .core
         .graph
-        .vertices()
+        .owned_vertices(None)
+        .unwrap()
+        .into_iter()
         .last()
         .unwrap()
         .source_id()

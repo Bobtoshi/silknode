@@ -226,7 +226,7 @@ impl Node {
                         && Some(terminal.vertices) == count.checked_add(1)
                         && core
                             .graph
-                            .get(VertexId::from_bytes(candidate.id))
+                            .get_owned(VertexId::from_bytes(candidate.id), None)
                             .is_ok_and(|v| {
                                 v.source_id().is_ok_and(|source| source == terminal.data)
                                     && core
@@ -234,6 +234,7 @@ impl Node {
                                         .retained_candidate_matches(
                                             VertexId::from_bytes(candidate.id),
                                             &bytes[100..],
+                                            None,
                                         )
                                         .is_ok_and(|same| same)
                             })
@@ -490,11 +491,11 @@ impl Node {
             .graph
             .find_checked(VertexId::from_bytes(c.id), &budget)?
         {
-            if self
-                .core
-                .graph
-                .retained_candidate_matches(VertexId::from_bytes(v.id()), bytes)?
-            {
+            if self.core.graph.retained_candidate_matches(
+                VertexId::from_bytes(v.id()),
+                bytes,
+                Some(&budget),
+            )? {
                 return Ok(Ingress::AlreadyKnown);
             }
             return Err(Error::Invalid(
@@ -506,7 +507,7 @@ impl Node {
         }
         self.core.clock.check_new(c.header.timestamp)?;
         for parent in c.header.parents.ordinary_parents() {
-            self.core.graph.get(*parent)?;
+            self.core.graph.get_owned(*parent, Some(&budget))?;
         }
         // Do not create an interrupted-attempt fence or start native work for
         // an admission that cannot fit its eventual complete reconciliation.

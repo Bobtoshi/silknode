@@ -45,6 +45,50 @@ pub(super) struct PagedAncestry {
     reader: Option<Arc<RetainedContext>>,
 }
 impl PagedAncestry {
+    pub(super) fn directory_bytes(&self) -> crate::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(PAGES * 33);
+        for leaf in &self.pages {
+            match leaf.as_deref() {
+                None => bytes.extend_from_slice(&[0; 33]),
+                Some(Leaf::Retained(id)) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(id);
+                }
+                Some(Leaf::Resident(_)) => {
+                    return Err(crate::Error::Unavailable(
+                        "directory requires disk ancestry",
+                    ));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+    /// Addresses from private receiver-minted, hash-bound live directory pages.
+    pub(super) fn from_live_directory(
+        bytes: &[u8],
+        reader: Arc<RetainedContext>,
+    ) -> crate::Result<Self> {
+        if bytes.len() != PAGES * 33 {
+            return Err(crate::Error::Unavailable("ancestry directory length"));
+        }
+        let mut result = Self {
+            reader: Some(reader),
+            ..Self::default()
+        };
+        for (page, bytes) in result.pages.iter_mut().zip(bytes.chunks_exact(33)) {
+            match bytes[0] {
+                0 if bytes[1..].iter().all(|byte| *byte == 0) => {}
+                1 => {
+                    *page =
+                        Some(Arc::new(Leaf::Retained(bytes[1..].try_into().map_err(
+                            |_| crate::Error::Unavailable("ancestry directory id"),
+                        )?)));
+                }
+                _ => return Err(crate::Error::Unavailable("ancestry directory kind")),
+            }
+        }
+        Ok(result)
+    }
     fn words(&self, page: usize) -> Result<Option<[u64; WORDS_PER_PAGE]>, Sg0Error> {
         let Some(leaf) = self.pages.get(page).ok_or(Sg0Error::Invariant)? else {
             return Ok(None);
