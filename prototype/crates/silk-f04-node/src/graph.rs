@@ -26,7 +26,7 @@ use silk_sapling_f04::{
 };
 use silk_types::VertexId;
 use std::{
-    cell::RefCell,
+    cell::{Ref, RefCell},
     collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
@@ -1194,6 +1194,13 @@ impl<V: GraphEntry> GraphData<V> {
 
 // Each view exposes ONLY admitted evidence plus, privately, one already fully
 // verified candidate. Ancestry is derived on insert from immutable parent closure.
+// Positive owned IDs, not metadata/validity flags or decoded graph carriers.
+// Both vectors are bounded by the unchanged horizon: <=160 KiB at 4,096 IDs
+// on a 64-bit target, excluding their fixed headers and allocator overhead.
+struct OrdinalInventory {
+    ids: Vec<VertexId>,
+    sorted: Vec<usize>,
+}
 struct View<'a, V> {
     graph: &'a GraphData<V>,
     added: Option<&'a GraphInfo>,
@@ -1202,6 +1209,7 @@ struct View<'a, V> {
     reads: RefCell<DirectoryOperation<'a, V>>,
     index_reads: RefCell<IndexOperation<'a>>,
     ancestry_reads: RefCell<AncestryOperation<'a>>,
+    inventory: RefCell<Option<OrdinalInventory>>,
 }
 impl<'a, V> View<'a, V> {
     const fn new(
@@ -1218,6 +1226,7 @@ impl<'a, V> View<'a, V> {
             reads: RefCell::new(DirectoryOperation::new(&graph.vertices)),
             index_reads: RefCell::new(IndexOperation::new(&graph.index)),
             ancestry_reads: RefCell::new(AncestryOperation::new(graph.ancestry_reader.as_ref())),
+            inventory: RefCell::new(None),
         }
     }
 }
@@ -1234,6 +1243,45 @@ impl<V: GraphEntry> ViewEntry<'_, V> {
     }
 }
 impl<V: GraphEntry> View<'_, V> {
+    fn inventory(&self) -> std::result::Result<Ref<'_, OrdinalInventory>, Sg0Error> {
+        self.budget.check().map_err(index_error)?;
+        if self.inventory.borrow().is_none() {
+            if self.graph.len() > crate::sync::HISTORY_LIMIT_V1 {
+                return Err(Sg0Error::Invariant);
+            }
+            let rows = self
+                .graph
+                .index
+                .materialize(Some(self.budget))
+                .map_err(index_error)?;
+            if rows.len() != self.graph.len() {
+                return Err(Sg0Error::Invariant);
+            }
+            let mut ids = Vec::with_capacity(self.graph.len());
+            // One sequential directory pass validates the complete ID/ordinal
+            // permutation before any caller receives an inventory or callback.
+            for i in 0..self.graph.len() {
+                self.budget.graph_read()?;
+                let vertex = self
+                    .reads
+                    .borrow_mut()
+                    .load(i, self.budget)
+                    .map_err(index_error)?;
+                let id = VertexId::from_bytes(vertex.graph_info().id);
+                if rows.get(&id) != Some(&i) {
+                    return Err(Sg0Error::Invariant);
+                }
+                ids.push(id);
+            }
+            let sorted = rows.into_values().collect();
+            self.budget.check().map_err(index_error)?;
+            // Only the fully qualified owned snapshot is installed. No failed
+            // or partial inventory escapes, nor survives this immutable View.
+            *self.inventory.borrow_mut() = Some(OrdinalInventory { ids, sorted });
+        }
+        self.budget.check().map_err(index_error)?;
+        Ref::filter_map(self.inventory.borrow(), Option::as_ref).map_err(|_| Sg0Error::Invariant)
+    }
     fn lookup(&self, id: VertexId) -> std::result::Result<ViewEntry<'_, V>, Sg0Error> {
         self.budget.graph_read()?;
         if let Some(v) = self.added.filter(|v| v.id == id.into_bytes()) {
@@ -1269,26 +1317,8 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         &self,
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
     ) -> std::result::Result<(), Sg0Error> {
-        let rows = self
-            .graph
-            .index
-            .materialize(Some(self.budget))
-            .map_err(index_error)?;
-        // Validate in ordinal/page order before visiting the unchanged sorted
-        // IDs. One-page scratch then reads each directory page exactly once,
-        // even when ID sorting interleaves many different ordinal pages.
-        for i in 0..self.graph.len() {
-            self.budget.graph_read()?;
-            let vertex = self
-                .reads
-                .borrow_mut()
-                .load(i, self.budget)
-                .map_err(index_error)?;
-            if rows.get(&VertexId::from_bytes(vertex.graph_info().id)) != Some(&i) {
-                return Err(Sg0Error::Invariant);
-            }
-        }
-        for (id, i) in &rows {
+        let inventory = self.inventory()?;
+        for i in &inventory.sorted {
             self.budget.graph_read()?;
             if self
                 .members
@@ -1300,7 +1330,7 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
                 .transpose()?
                 .unwrap_or(true)
             {
-                visitor(*id)?;
+                visitor(inventory.ids[*i])?;
             }
         }
         if let Some(v) = self.added {
@@ -1337,23 +1367,14 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
     ) -> std::result::Result<(), Sg0Error> {
         let bits = self.lookup(id)?.info().ancestors.materialize()?;
-        // Preserve the old all-directory-reads-before-callback contract without
-        // retaining a full graph of decoded carriers: only bounded IDs escape
-        // the one-page scratch reader into this operation-local traversal list.
-        let mut ids = Vec::with_capacity(self.graph.len());
-        for i in 0..self.graph.len() {
-            self.budget.graph_read()?;
-            let v = self
-                .reads
-                .borrow_mut()
-                .load(i, self.budget)
-                .map_err(index_error)?;
-            ids.push(VertexId::from_bytes(v.graph_info().id));
-        }
-        for (i, vertex_id) in ids.into_iter().enumerate() {
+        // The owned operation inventory preserves all-directory-validation
+        // before callbacks without reopening every page for every past walk.
+        // Ancestry bytes above remain a fresh full materialization per walk.
+        let inventory = self.inventory()?;
+        for (i, vertex_id) in inventory.ids.iter().enumerate() {
             self.budget.graph_read()?;
             if bits.contains(i)? {
-                visitor(vertex_id)?;
+                visitor(*vertex_id)?;
             }
         }
         Ok(())
@@ -1494,7 +1515,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(past, (1..=64).map(id).collect::<Vec<_>>());
-        assert_eq!(view.reads.borrow().loads(), 4);
+        assert_eq!(view.reads.borrow().loads(), 2);
+        assert_eq!(view.inventory.borrow().as_ref().unwrap().ids.len(), 65);
+        assert_eq!(view.inventory.borrow().as_ref().unwrap().sorted.len(), 65);
+        let mut repeated_past = Vec::new();
+        view.visit_strict_past_ids(id(65), &mut |vertex| {
+            repeated_past.push(vertex);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(repeated_past, past);
+        assert_eq!(view.reads.borrow().loads(), 2);
         for label in 1..=64 {
             assert_eq!(
                 view.receiver_verified_work_be(id(label)).unwrap(),
@@ -1502,7 +1533,7 @@ mod tests {
             );
         }
         assert_eq!(view.index_reads.borrow().loads(), 2);
-        assert_eq!(view.reads.borrow().loads(), 5);
+        assert_eq!(view.reads.borrow().loads(), 3);
         assert!(view.receiver_verified_is_ancestor(id(1), id(64)).unwrap());
         assert_eq!(view.index_reads.borrow().loads(), 2);
         for label in 1..64 {
@@ -1543,6 +1574,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(callbacks, 0);
+        assert!(fresh.inventory.borrow().is_none());
         let fresh = View::new(&graph, None, None, &budget);
         assert!(
             fresh
@@ -1553,9 +1585,81 @@ mod tests {
                 .is_err()
         );
         assert_eq!(callbacks, 0);
+        assert!(fresh.inventory.borrow().is_none());
+        // This operation owns its complete checked IDs, not a fresh-read
+        // promise. No full graph carriers or metadata enter that snapshot.
+        let mut warm_ids = Vec::new();
+        view.visit_vertex_ids(&mut |vertex| {
+            warm_ids.push(vertex);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(warm_ids, visited);
         std::fs::rename(&held_later, &later).unwrap();
+        // Strict-past ancestry is still freshly read even with a warm inventory.
+        let ancestry = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(target.info.ancestors.retained_ids()[0])
+        ));
+        let held_ancestry = ancestry.with_extension("held");
+        std::fs::rename(&ancestry, &held_ancestry).unwrap();
+        assert!(
+            view.visit_strict_past_ids(id(65), &mut |_| {
+                callbacks += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(callbacks, 0);
+        std::fs::rename(&held_ancestry, &ancestry).unwrap();
+        let mut restored_ids = Vec::new();
+        fresh
+            .visit_vertex_ids(&mut |vertex| {
+                restored_ids.push(vertex);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(restored_ids, visited);
         assert_eq!(graph.order(&budget).unwrap().eligible_order().len(), 65);
     }
+    #[test]
+    fn operation_inventory_preserves_reentrant_visitors_and_cumulative_deadline() {
+        let budget = JobBudget::checkpoint().unwrap();
+        let graph = diamond(&budget);
+        let view = View::new(&graph, None, None, &budget);
+        let mut ids = Vec::new();
+        view.visit_vertex_ids(&mut |vertex| {
+            let mut nested = Vec::new();
+            view.visit_vertex_ids(&mut |inner| {
+                nested.push(inner);
+                Ok(())
+            })?;
+            assert_eq!(nested, (1..=4).map(id).collect::<Vec<_>>());
+            ids.push(vertex);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ids, (1..=4).map(id).collect::<Vec<_>>());
+        assert_eq!(
+            view.visit_vertex_ids(&mut |_| Err(Sg0Error::Invariant)),
+            Err(Sg0Error::Invariant)
+        );
+        let deadline = JobBudget::testing(std::time::Duration::from_millis(20)).unwrap();
+        let view = View::new(&graph, None, None, &deadline);
+        view.inventory().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(21));
+        let mut callbacks = 0;
+        assert_eq!(
+            view.visit_vertex_ids(&mut |_| {
+                callbacks += 1;
+                Ok(())
+            }),
+            Err(Sg0Error::ResourceBudget)
+        );
+        assert_eq!(callbacks, 0);
+        assert!(view.inventory.borrow().is_some());
+    }
+
     #[test]
     fn disk_directory_graph_drops_entries_and_refuses_missing_current_or_staged_pages() {
         let (temp, mut store) = crate::store::ancestry_test_store();
