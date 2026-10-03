@@ -195,6 +195,46 @@ impl PagedAncestry {
         }
         Ok(result)
     }
+    /// Own only the set positions, in the same increasing ordinal order. Every
+    /// retained leaf is freshly qualified before this list can reach a visitor,
+    /// including leaves outside the requested prefix; they are never skipped.
+    pub(super) fn positions_before(
+        &self,
+        end: usize,
+        budget: &JobBudget,
+    ) -> Result<Vec<usize>, Sg0Error> {
+        if end > HISTORY_LIMIT_V1 {
+            return Err(Sg0Error::Invariant);
+        }
+        budget.check().map_err(|_| Sg0Error::ResourceBudget)?;
+        for leaf in &self.pages {
+            if matches!(leaf.as_deref(), Some(Leaf::Retained(_))) {
+                budget.source().map_err(|_| Sg0Error::ResourceBudget)?;
+            }
+        }
+        let materialized = self.materialize()?;
+        let mut positions = Vec::new();
+        for page in 0..PAGES {
+            budget.check().map_err(|_| Sg0Error::ResourceBudget)?;
+            let Some(words) = materialized.words(page)? else {
+                continue;
+            };
+            for (word_index, mut word) in words.into_iter().enumerate() {
+                budget.graph_read()?;
+                while word != 0 {
+                    let bit =
+                        usize::try_from(word.trailing_zeros()).map_err(|_| Sg0Error::Invariant)?;
+                    let position = page * POSITIONS_PER_PAGE + word_index * 64 + bit;
+                    if position < end {
+                        positions.push(position);
+                    }
+                    word &= word - 1;
+                }
+            }
+        }
+        budget.check().map_err(|_| Sg0Error::ResourceBudget)?;
+        Ok(positions)
+    }
     /// Addresses are receiver-local and never serialized in a head/snapshot.
     /// Cold reopen derives them again only AFTER original full admission checks.
     pub(super) fn retain(
@@ -363,6 +403,65 @@ mod tests {
         drop(store);
         // Same live receiver-derived references, not cold validity adoption.
         assert!(bits.contains(4095).unwrap());
+    }
+
+    #[test]
+    fn sparse_ancestry_positions_match_flat_prefixes_and_qualify_all_leaves_first() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        store
+            .begin_replay(b"synthetic sparse ancestry fixture")
+            .unwrap();
+        let reader = context(&store);
+        let budget = JobBudget::checkpoint().unwrap();
+        let expected: std::collections::BTreeSet<_> = (0..HISTORY_LIMIT_V1)
+            .step_by(37)
+            .chain([0, 63, 64, 511, 512, 513, 4095])
+            .collect();
+        let mut bits = PagedAncestry::default();
+        for position in &expected {
+            bits.insert(*position).unwrap();
+        }
+        let resident = bits.clone();
+        bits.retain(&mut store, reader, &budget).unwrap();
+        for end in [0, 1, 64, 65, 511, 512, 513, 1024, HISTORY_LIMIT_V1] {
+            let reference: Vec<_> = expected.range(..end).copied().collect();
+            assert_eq!(resident.positions_before(end, &budget).unwrap(), reference);
+            assert_eq!(bits.positions_before(end, &budget).unwrap(), reference);
+        }
+        let path = page_path(&temp, bits.retained_ids()[7]);
+        let held = path.with_extension("held");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::rename(&path, &held).unwrap();
+        // Even an empty or tiny requested prefix must read the late leaf. A
+        // partially built position list cannot become apparent empty ancestry.
+        assert_eq!(bits.positions_before(0, &budget), Err(Sg0Error::Invariant));
+        assert_eq!(bits.positions_before(1, &budget), Err(Sg0Error::Invariant));
+        std::fs::rename(&held, &path).unwrap();
+        let mut changed = original.clone();
+        changed[48] ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert_eq!(bits.positions_before(1, &budget), Err(Sg0Error::Invariant));
+        std::fs::write(&path, &original).unwrap();
+        assert_eq!(
+            bits.positions_before(HISTORY_LIMIT_V1, &budget).unwrap(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert_eq!(
+            bits.positions_before(1, &expired),
+            Err(Sg0Error::ResourceBudget)
+        );
+        assert_eq!(
+            bits.positions_before(HISTORY_LIMIT_V1 + 1, &budget),
+            Err(Sg0Error::Invariant)
+        );
+        let mut dense = PagedAncestry::default();
+        for position in 0..HISTORY_LIMIT_V1 {
+            dense.insert(position).unwrap();
+        }
+        let positions = dense.positions_before(HISTORY_LIMIT_V1, &budget).unwrap();
+        assert_eq!(positions, (0..HISTORY_LIMIT_V1).collect::<Vec<_>>());
+        assert!(positions.len() * std::mem::size_of::<usize>() <= 32 * 1024);
     }
 
     #[test]

@@ -1366,16 +1366,18 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         id: VertexId,
         visitor: &mut dyn FnMut(VertexId) -> std::result::Result<(), Sg0Error>,
     ) -> std::result::Result<(), Sg0Error> {
-        let bits = self.lookup(id)?.info().ancestors.materialize()?;
+        let positions = self
+            .lookup(id)?
+            .info()
+            .ancestors
+            .positions_before(self.graph.len(), self.budget)?;
         // The owned operation inventory preserves all-directory-validation
         // before callbacks without reopening every page for every past walk.
-        // Ancestry bytes above remain a fresh full materialization per walk.
+        // Ancestry bytes above remain freshly qualified in full per walk.
         let inventory = self.inventory()?;
-        for (i, vertex_id) in inventory.ids.iter().enumerate() {
+        for i in positions {
             self.budget.graph_read()?;
-            if bits.contains(i)? {
-                visitor(*vertex_id)?;
-            }
+            visitor(inventory.ids[i])?;
         }
         Ok(())
     }
