@@ -156,7 +156,9 @@ approved execution**:
 They require `SILK_F04_LARGER_HISTORY_NATIVE=1` plus an exact separately qualified
 task-volume/parameter/source contract. The flag itself grants no execution
 authority and does not enforce resources. Default tests do not run them.
-**Both native tests remain unexecuted and larger current-core replay UNPROVEN.**
+At source-26 publication both tests were unexecuted. The later independently
+approved execution failed during first-process ingestion, as recorded below;
+larger current-core replay remains UNPROVEN.
 
 The old native 3,080-record completion used older source, a different host and
 different storage representation. It cannot substitute for these current-source
@@ -165,3 +167,24 @@ Original large-fixture private recipient keys were not retained, so public
 history alone cannot establish cold wallet recovery. Independent two-host
 transport, discovery/churn, wallet custody, practical-speed and privacy gates
 remain separate. No live seed or service was changed by this source milestone.
+
+## Subsequent approved native execution: FAILED
+
+On 2026-10-04 the frozen source-26 native plan was executed once. Ingestion of
+candidate 1,361 (zero-based ordinal 1,360) returned
+`Paused("cumulative foreground CPU/wall budget")`. Last complete local generation
+contained 1,360 vertices, checkpoint 170, sequence 1,530 and Ready status. The
+active job marker and failed store are preserved. Overall run/RAM/disk limits
+were not exhausted; the CPU-versus-wall branch and finer ingress phase were not
+recorded and are not attributed. No receiving store was repaired or reopened.
+
+The full 3,080/checkpoint-385/original-state comparison was not reached, no fresh
+first-process pin receipt was emitted, and the second cold process never started.
+Native acceptance is false, not partial acceptance of the complete corpus.
+Result SHA-256:
+`81870c5e98b49839771a1bda638c2c178450ba23f9b094caf149770d8e19d369`.
+
+The subsequent [shared physical order storage slice](F04_SHARED_ORDER_STORAGE_V1.md)
+addresses independently identified quadratic order-prefix retention. Its focused
+storage checks do not prove it resolves this native foreground refusal. No native
+repeat or budget expansion follows from that source milestone.

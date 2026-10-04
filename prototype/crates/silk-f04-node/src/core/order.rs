@@ -119,9 +119,8 @@ impl CoreOrder {
                 if order.count > HISTORY_LIMIT_V1 {
                     return Err(Error::Unavailable("retained order horizon"));
                 }
-                budget.source()?;
                 let size = HEADER + order.count * 32;
-                let bytes = order.reader.object(order.id, size)?;
+                let bytes = order.reader.order(order.id, size, budget)?;
                 if bytes.len() != size
                     || bytes.get(..8) != Some(b"SNF04OR1")
                     || bytes[8..40] != order.graph

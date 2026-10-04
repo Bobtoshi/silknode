@@ -103,8 +103,8 @@ impl Node {
             &data,
             node.core.state.clone(),
             &node.core.order.bytes(&budget)?,
-            0,
-            node.core.status,
+            (0, node.core.status),
+            &budget,
         )?;
         if let CoreOrder::Resident(order) = &node.core.order {
             node.core.order = CoreOrder::retain(order, node.store.object_reader()?, &budget)?;
@@ -372,7 +372,7 @@ impl Node {
                 || core.graph.len() as u64 != r.vertices
                 || core.state.checkpoint_id() != r.checkpoint
                 || store.object(r.state)? != core.state.manifest()
-                || store.object(r.order)? != core.order.bytes(&budget)?
+                || store.order_object(r.order, &budget)? != core.order.bytes(&budget)?
             {
                 return Err(Error::Unavailable("complete generation mismatch"));
             }
@@ -616,8 +616,8 @@ impl Node {
             &data,
             self.core.state.clone(),
             &order,
-            self.core.graph.len() as u64 + 1,
-            a.status,
+            (self.core.graph.len() as u64 + 1, a.status),
+            &a.budget,
         )?;
         if let Err(error) = (|| {
             a.vertex
@@ -678,8 +678,8 @@ impl Node {
                 &data,
                 step.state.clone(),
                 &self.core.order.bytes(&budget)?,
-                self.core.graph.len() as u64,
-                step.status,
+                (self.core.graph.len() as u64, step.status),
+                &budget,
             )?;
             step.state = Arc::new(step.state.retain_ledger(&mut self.store, &budget)?);
             self.state_view.take();
@@ -713,8 +713,8 @@ impl Node {
             &[],
             self.core.state.clone(),
             &self.core.order.bytes(&budget)?,
-            self.core.graph.len() as u64,
-            self.core.status,
+            (self.core.graph.len() as u64, self.core.status),
+            &budget,
         )?;
         Ok(())
     }
@@ -903,9 +903,10 @@ impl Node {
         data: &[u8],
         state: Arc<BranchState>,
         order: &[u8],
-        vertices: u64,
-        status: Status,
+        publication: (u64, Status),
+        budget: &JobBudget,
     ) -> Result<Digest> {
+        let (vertices, status) = publication;
         if self.sequence >= GENERATION_LIMIT_V1 {
             return Err(Error::Paused("generation reference horizon"));
         }
@@ -923,7 +924,9 @@ impl Node {
             checkpoint: state.checkpoint_id(),
             vertices,
         };
-        let result = self.store.commit(&[data, &manifest, order], &r.encode());
+        let result = self
+            .store
+            .commit_ordered(&[data, &manifest], order, &r.encode(), budget);
         match result {
             Ok(id) => {
                 self.sequence += 1;

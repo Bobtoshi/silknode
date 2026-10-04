@@ -1,5 +1,6 @@
 //! Task-owned, append-only content store and atomic single-head publication.
 //! Unreachable files are retained/accounted, never promoted or garbage-collected.
+mod order;
 use crate::{
     Digest, Error, Result,
     wire::{raw_hash, u32le},
@@ -29,10 +30,19 @@ impl ObjectReader {
         if limit > MAX_OBJECT {
             return Err(Error::Unavailable("owned object reader limit"));
         }
-        let name = format!("{}.obj", hex::encode(id));
-        let file: File = rustix::fs::openat(
+        let bytes = self.named(&format!("{}.obj", hex::encode(id)), limit)?;
+        if raw_hash(&bytes) != id {
+            return Err(Error::Unavailable("owned object reader content"));
+        }
+        Ok(bytes)
+    }
+    fn named(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
+        if limit > MAX_OBJECT {
+            return Err(Error::Unavailable("owned object reader limit"));
+        }
+        let mut file: File = rustix::fs::openat(
             &self.directory,
-            name.as_str(),
+            name,
             rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::NONBLOCK
@@ -53,9 +63,24 @@ impl ObjectReader {
         let mut bytes = Vec::with_capacity(
             usize::try_from(meta.len()).map_err(|_| Error::Unavailable("object read length"))?,
         );
-        file.take(u64::try_from(limit).map_err(|_| Error::Unavailable("object read limit"))? + 1)
+        Read::by_ref(&mut file)
+            .take(u64::try_from(limit).map_err(|_| Error::Unavailable("object read limit"))? + 1)
             .read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).ok() != Some(meta.len()) || raw_hash(&bytes) != id {
+        let after = file.metadata()?;
+        let identity = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if u64::try_from(bytes.len()).ok() != Some(meta.len())
+            || identity(&meta) != identity(&after)
+        {
             return Err(Error::Unavailable("owned object reader content"));
         }
         Ok(bytes)
@@ -534,6 +559,7 @@ impl Store {
     }
     /// The caller orders full-data objects before state/delta/index objects; all
     /// are durable before the head. The previous complete generation is retained.
+    #[cfg(test)]
     pub fn commit(&mut self, objects: &[&[u8]], head: &[u8]) -> Result<Digest> {
         let total =
             objects
@@ -555,6 +581,9 @@ impl Store {
             self.put(object)?;
         }
         let id = self.put(head)?;
+        self.publish_written_head(id)
+    }
+    fn publish_written_head(&mut self, id: Digest) -> Result<Digest> {
         self.directory.sync_all()?;
         if let Some(previous) = self.head {
             self.replace_pointer("PREVIOUS", previous)?;
