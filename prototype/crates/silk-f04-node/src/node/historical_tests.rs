@@ -1,7 +1,7 @@
 //! Explicitly gated larger public fixture acceptance. Compiled, NOT run by default.
 //! No historical node store, wallet material or saved validity is imported.
 use super::*;
-use crate::{history::PublicHistoryV1, sync::RangeBatchV1};
+use crate::history::PublicHistoryV1;
 use sha2::{Digest as _, Sha256};
 use std::{fs, os::unix::fs::MetadataExt, path::PathBuf};
 
@@ -110,7 +110,7 @@ fn historical_public_ranges_ingest_and_reconcile_fresh_node() {
     let mut node = Node::create(&root.join("node"), &margin, genesis).unwrap();
     for start in (0..history.len()).step_by(32) {
         let bytes = history.read_range(start, 32).unwrap();
-        let range = RangeBatchV1::decode(&bytes, start, history.len()).unwrap();
+        let range = history.decode_range(&bytes, start, 32).unwrap();
         for carrier in range.carriers() {
             let ordinal = node.vertex_count();
             let ingress = node.ingest(carrier, &parameters);
@@ -179,7 +179,9 @@ fn historical_foreground_diagnostic_prefix_1361_fresh_node() {
     const PREFIX: usize = 1361;
     for start in (0..PREFIX).step_by(32) {
         let bytes = history.read_range(start, (PREFIX - start).min(32)).unwrap();
-        let range = RangeBatchV1::decode(&bytes, start, history.len()).unwrap();
+        let range = history
+            .decode_range(&bytes, start, (PREFIX - start).min(32))
+            .unwrap();
         for carrier in range.carriers() {
             let ordinal = node.vertex_count();
             let ingress = node.ingest(carrier, &parameters);
@@ -241,7 +243,7 @@ fn historical_public_history_second_process_cold_parity() {
     assert_eq!(public_ledger(&node), ledger);
     for start in [0, 3072] {
         let bytes = history.read_range(start, 1).unwrap();
-        let range = RangeBatchV1::decode(&bytes, start, history.len()).unwrap();
+        let range = history.decode_range(&bytes, start, 1).unwrap();
         assert_eq!(
             node.ingest(range.carriers()[0], &parameters).unwrap(),
             Ingress::AlreadyKnown
@@ -252,5 +254,119 @@ fn historical_public_history_second_process_cold_parity() {
     }
     println!(
         "cold_process_replay_parity=true; vertices=3080; checkpoints=385; original_claimed_state_derived=true; exact_repeat_no_new_credit=true; new_work_records=0; new_payment_proofs=0; no_wallet_recovery_claim=true"
+    );
+}
+
+#[test]
+#[ignore = "bounded task-owned four-carrier resume fixture only; no mining/new proofs"]
+fn historical_received_prefix_interruption_and_local_resume_hint() {
+    assert_eq!(
+        std::env::var("SILK_F04_RESUME_PREFIX_NATIVE").as_deref(),
+        Ok("1")
+    );
+    let (root, margin, genesis, history, parameters) = inputs();
+    let mut node = Node::create(&root.join("node"), &margin, genesis.clone()).unwrap();
+    let bytes = history.read_range(0, 4).unwrap();
+    assert!(
+        history
+            .decode_range(&bytes[..bytes.len() - 1], 0, 4)
+            .is_err()
+    );
+    assert_eq!(history.admitted_prefix(&node).unwrap(), 0);
+    let range = history.decode_range(&bytes, 0, 4).unwrap();
+    for carrier in range.carriers() {
+        assert_eq!(
+            node.ingest(carrier, &parameters).unwrap(),
+            Ingress::Admitted
+        );
+        for _ in 0..386 {
+            if node.status().unwrap() == Status::Ready {
+                break;
+            }
+            node.advance().unwrap();
+        }
+        assert_eq!(node.status().unwrap(), Status::Ready);
+    }
+    assert_eq!(node.vertex_count(), 4);
+    assert_eq!(history.admitted_prefix(&node).unwrap(), 4);
+    let head = node.local_head().unwrap();
+    let corpus =
+        std::path::PathBuf::from(std::env::var_os("SILK_F04_PUBLIC_HISTORY_ROOT").unwrap());
+    let manifest = fs::read(corpus.join("history.manifest")).unwrap();
+    let client = root.join("client-manifest");
+    fs::create_dir(&client).unwrap();
+    let mut reordered = manifest.clone();
+    const HEADER: usize = 176;
+    const ROW: usize = 68;
+    for index in 0..ROW {
+        reordered.swap(HEADER + ROW + index, HEADER + 8 * ROW + index);
+    }
+    fs::write(client.join("history.manifest"), &reordered).unwrap();
+    let changed =
+        PublicHistoryV1::open(&client, raw_hash(&reordered), Arc::new(genesis.clone())).unwrap();
+    assert_eq!(changed.admitted_prefix(&node).unwrap(), 1);
+    let mut conflicting = manifest;
+    conflicting[HEADER + 32..HEADER + 64].fill(0);
+    fs::write(client.join("history.manifest"), &conflicting).unwrap();
+    let changed =
+        PublicHistoryV1::open(&client, raw_hash(&conflicting), Arc::new(genesis)).unwrap();
+    assert!(matches!(
+        changed.admitted_prefix(&node),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(node.local_head().unwrap(), head);
+    assert!(!root.join("node/ACTIVE_JOB").exists());
+    println!(
+        "resume_receiver_head={}; admitted_prefix=4; source_total=3080; reordered_prefix=1; partial_response_no_credit=true; known_conflict_refused=true; new_work_records=0; new_payment_proofs=0; two_host_transport=false",
+        hex::encode(head)
+    );
+}
+
+#[test]
+#[ignore = "separate process for successful four-carrier fixture only; no failed-owner reopen"]
+fn historical_received_prefix_cold_resume_and_fresh_source_refusal() {
+    assert_eq!(
+        std::env::var("SILK_F04_RESUME_PREFIX_NATIVE").as_deref(),
+        Ok("1")
+    );
+    let (root, margin, genesis, history, parameters) = inputs();
+    let head = digest(&std::env::var("SILK_F04_RESUME_RECEIVER_HEAD").unwrap());
+    let node = Node::open_retained_pinned(
+        &root.join("node"),
+        &margin,
+        genesis.clone(),
+        &parameters,
+        head,
+    )
+    .unwrap();
+    assert_eq!(node.vertex_count(), 4);
+    assert_eq!(node.status().unwrap(), Status::Ready);
+    assert!(!node.recovered_previous());
+    assert_eq!(history.admitted_prefix(&node).unwrap(), 4);
+    assert_eq!(node.local_head().unwrap(), head);
+    let first = history.read_range(0, 1).unwrap();
+    let range = history.decode_range(&first, 0, 1).unwrap();
+    let id = Candidate::decode(range.carriers()[0], &genesis).unwrap().id;
+    let mut damaged = None;
+    for entry in fs::read_dir(root.join("node")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().ends_with(".obj") {
+            let bytes = fs::read(entry.path()).unwrap();
+            if bytes.get(..8) == Some(b"SNF04VR1") && bytes.get(24..56) == Some(id.as_slice()) {
+                assert!(damaged.replace(entry.path()).is_none());
+            }
+        }
+    }
+    let damaged = damaged.unwrap();
+    let quarantine = root.join("quarantined-source");
+    fs::create_dir(&quarantine).unwrap();
+    fs::rename(&damaged, quarantine.join(damaged.file_name().unwrap())).unwrap();
+    assert!(history.admitted_prefix(&node).is_err());
+    assert_eq!(node.vertex_count(), 4);
+    assert_eq!(node.local_head().unwrap(), head);
+    assert!(!root.join("node/ACTIVE_JOB").exists());
+    assert!(!root.join("node/ACTIVE_REPLAY").exists());
+    println!(
+        "cold_resume_prefix=4; receiver_head_pinned=true; fresh_source_missing_refused_after_warm_query=true; fixture_source_quarantined_recoverably=true; no_repair_or_adoption=true; two_host_transport=false; new_work_records=0; new_payment_proofs=0"
     );
 }

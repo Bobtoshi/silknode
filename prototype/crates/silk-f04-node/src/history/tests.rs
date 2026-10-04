@@ -101,6 +101,143 @@ fn public_history_ranges_match_existing_wire_and_never_assert_work_validity() {
     // them as unverified full bytes cannot confer graph credit or crypto validity.
 }
 
+fn received_batch(carriers: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = vec![u8::try_from(carriers.len()).unwrap()];
+    for carrier in carriers {
+        bytes.extend_from_slice(&u32::try_from(carrier.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(carrier);
+    }
+    bytes
+}
+
+#[test]
+fn received_history_ranges_bind_exact_windows_without_work_authority() {
+    let (temp, genesis, manifest, carriers) = fixture(35);
+    let source = open(temp.path(), genesis, &manifest).unwrap();
+    for start in [0, 32, 34] {
+        let bytes = source.read_range(start, 32).unwrap();
+        for _ in 0..2 {
+            let received = source.decode_range(&bytes, start, 32).unwrap();
+            assert_eq!(
+                received.carriers(),
+                carriers[start..(start + 32).min(35)]
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(received.carriers()[0].as_ptr(), bytes[5..].as_ptr());
+        }
+    }
+    // Static identity only: these synthetic proofs/ID claims are not valid work.
+    // Repeating a transport decode neither admits a carrier nor advances a node.
+}
+
+#[test]
+fn received_history_ranges_refuse_partial_reordered_replayed_and_foreign_bytes() {
+    let (temp, genesis, manifest, carriers) = fixture(3);
+    let source = open(temp.path(), genesis.clone(), &manifest).unwrap();
+    let good = source.read_range(0, 3).unwrap();
+    for cut in [0, 1, 4, 5, 5 + carriers[0].len(), good.len() - 1] {
+        assert!(source.decode_range(&good[..cut], 0, 3).is_err());
+    }
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(source.decode_range(&trailing, 0, 3).is_err());
+    let short = source.read_range(0, 2).unwrap();
+    assert!(RangeBatchV1::decode(&short, 0, 3).is_ok());
+    assert!(source.decode_range(&short, 0, 3).is_err());
+    let replayed = source.read_range(1, 2).unwrap();
+    assert!(source.decode_range(&replayed, 0, 2).is_err());
+    let reordered = received_batch(&[&carriers[1], &carriers[0], &carriers[2]]);
+    assert!(RangeBatchV1::decode(&reordered, 0, 3).is_ok());
+    assert!(source.decode_range(&reordered, 0, 3).is_err());
+    let duplicated = received_batch(&[&carriers[0], &carriers[0], &carriers[2]]);
+    assert!(source.decode_range(&duplicated, 0, 3).is_err());
+
+    // A different independently framed source can supply a different final row.
+    // The original immutable pin must refuse the entire mixed response.
+    let mut foreign = carriers[2].clone();
+    foreign[36..44].copy_from_slice(&99_u64.to_be_bytes());
+    let mut other_manifest = manifest.clone();
+    let row = HEADER + 2 * ROW;
+    other_manifest[row..row + 32].copy_from_slice(&foreign[12..44]);
+    other_manifest[row + 32..row + 64].copy_from_slice(&raw_hash(&foreign));
+    fs::write(
+        temp.path()
+            .join(format!("{}.vertex", hex::encode(raw_hash(&foreign)))),
+        &foreign,
+    )
+    .unwrap();
+    let other = open(temp.path(), genesis, &other_manifest).unwrap();
+    let mixed = other.read_range(0, 3).unwrap();
+    assert!(other.decode_range(&mixed, 0, 3).is_ok());
+    assert!(source.decode_range(&mixed, 0, 3).is_err());
+    assert!(source.decode_range(&good, 0, 3).is_ok());
+}
+
+#[test]
+fn received_history_ranges_refuse_bad_requests_and_pinned_static_id_claims() {
+    let (temp, genesis, manifest, _) = fixture(1);
+    let source = open(temp.path(), genesis.clone(), &manifest).unwrap();
+    let bytes = source.read_range(0, 1).unwrap();
+    for (start, count) in [(0, 0), (0, 33), (1, 1), (usize::MAX, 1)] {
+        assert!(source.decode_range(&bytes, start, count).is_err());
+    }
+    let mut wrong = manifest.clone();
+    wrong[HEADER] ^= 1;
+    let wrong_source = open(temp.path(), genesis.clone(), &wrong).unwrap();
+    assert!(wrong_source.decode_range(&bytes, 0, 1).is_err());
+    let mut empty = manifest[..HEADER].to_vec();
+    empty[168..172].copy_from_slice(&0_u32.to_le_bytes());
+    let empty_source = open(temp.path(), genesis, &empty).unwrap();
+    assert!(empty_source.decode_range(&bytes, 0, 1).is_err());
+}
+
+#[test]
+fn received_history_prefix_queries_refuse_context_fences_and_expired_scope() {
+    let (temp, genesis, manifest, _) = fixture(1);
+    let source = open(temp.path(), genesis.clone(), &manifest).unwrap();
+    let margin = std::env::var_os("SILK_F04_HOST_MARGIN")
+        .map_or_else(|| std::path::PathBuf::from("/"), std::path::PathBuf::from);
+    let root = temp.path().join("receiver");
+    let node = Node::create(&root, &margin, (*genesis).clone()).unwrap();
+    let head = node.local_head().unwrap();
+    assert_eq!(source.admitted_prefix(&node).unwrap(), 0);
+    let mut empty_manifest = manifest[..HEADER].to_vec();
+    empty_manifest[168..172].copy_from_slice(&0_u32.to_le_bytes());
+    let empty = open(temp.path(), genesis.clone(), &empty_manifest).unwrap();
+    assert_eq!(empty.admitted_prefix(&node).unwrap(), 0);
+    let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+    assert!(source.admitted_prefix_budget(&node, &expired).is_err());
+    assert!(empty.admitted_prefix_budget(&node, &expired).is_err());
+    for marker in ["ACTIVE_JOB", "ACTIVE_REPLAY"] {
+        // Synthetic pointer to the existing genesis record, NOT a native attempt.
+        fs::write(root.join(marker), fs::read(root.join("HEAD")).unwrap()).unwrap();
+        assert!(matches!(
+            source.admitted_prefix(&node),
+            Err(Error::Paused(_))
+        ));
+        assert!(matches!(
+            empty.admitted_prefix(&node),
+            Err(Error::Paused(_))
+        ));
+        fs::remove_file(root.join(marker)).unwrap();
+    }
+    assert_eq!(source.admitted_prefix(&node).unwrap(), 0);
+    assert_eq!(node.local_head().unwrap(), head);
+    let other = Node::create(
+        &temp.path().join("other-receiver"),
+        &margin,
+        crate::genesis::public_testnet_v1::genesis().unwrap(),
+    )
+    .unwrap();
+    assert_ne!(other.genesis().domain(), source.genesis.domain());
+    assert!(matches!(
+        source.admitted_prefix(&other),
+        Err(Error::Invalid(_))
+    ));
+}
+
 #[test]
 fn public_history_manifest_hash_context_shapes_duplicates_and_horizon_refuse() {
     let (temp, genesis, manifest, _) = fixture(2);
@@ -236,7 +373,7 @@ fn historical_public_carrier_codec_and_range_compatibility() {
     let mut ranges = 0;
     for start in (0..source.len()).step_by(RANGE_LIMIT_V1) {
         let bytes = source.read_range(start, RANGE_LIMIT_V1).unwrap();
-        let decoded = RangeBatchV1::decode(&bytes, start, source.len()).unwrap();
+        let decoded = source.decode_range(&bytes, start, RANGE_LIMIT_V1).unwrap();
         count += decoded.carriers().len();
         ranges += 1;
     }

@@ -889,6 +889,45 @@ impl<V: GraphEntry> GraphData<V> {
         }
         Ok(matches)
     }
+    pub(crate) fn retained_candidate_hash_matches(
+        &self,
+        id: VertexId,
+        expected: Digest,
+        size: usize,
+        budget: &JobBudget,
+    ) -> Result<bool> {
+        let vertex = self.get_owned(id, Some(budget))?;
+        let source = vertex
+            .graph_info()
+            .retained_source
+            .as_ref()
+            .ok_or(Error::Unavailable("durable vertex source absent"))?;
+        if source.candidate_len != size {
+            return Ok(false);
+        }
+        let reader = self
+            .ancestry_reader
+            .as_ref()
+            .ok_or(Error::Unavailable("durable vertex reader absent"))?;
+        budget.source()?;
+        let bytes = reader.objects().object(source.id, source.record_len)?;
+        let end = 12_usize
+            .checked_add(source.candidate_len)
+            .ok_or(Error::Unavailable("durable candidate length"))?;
+        if bytes.len() != source.record_len
+            || bytes.get(..8) != Some(b"SNF04VR1")
+            || u32le(&bytes, 8)? as usize != source.candidate_len
+        {
+            return Err(Error::Unavailable("durable candidate framing"));
+        }
+        let matches = raw_hash(
+            bytes
+                .get(12..end)
+                .ok_or(Error::Unavailable("durable candidate framing"))?,
+        ) == expected;
+        budget.check()?;
+        Ok(matches)
+    }
     /// Owned execution body loaded from exact durable bytes. This is NOT new
     /// admission: the complete candidate must equal this live receiver's already
     /// verified candidate before its existing typed crypto capabilities are used.

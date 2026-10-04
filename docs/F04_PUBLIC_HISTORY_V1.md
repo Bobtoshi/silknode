@@ -1,5 +1,16 @@
 # F0.4 bounded public history source
 
+Received transport responses can now use `PublicHistoryV1::decode_range` to
+bind every unverified carrier to the exact requested window of this pinned
+manifest before ordinary node ingestion. Bare `RangeBatchV1::decode` remains
+framing-only. See [the receive binding](F04_PINNED_RANGE_RECEIVE_V1.md) for the
+implemented boundary, focused evidence and still-unproven two-host gate.
+
+`PublicHistoryV1::admitted_prefix(&Node)` derives a read-only request position
+from the receiver's freshly checked retained membership and original bytes,
+not a saved cursor or peer count. See [the receiver-prefix slice](F04_RECEIVER_RESUME_PREFIX_V1.md)
+for its bounded four-carrier/cold-query evidence and remaining transport gates.
+
 `silk_f04_node::history::PublicHistoryV1` distributes full public carrier bytes
 through the existing range codec. It is not a node-store importer, a verified
 snapshot, a validity cache or a replacement for ordinary receiver admission.
@@ -8,7 +19,7 @@ This local distribution format is non-consensus and adds no protocol activation.
 ## Receiver boundary
 
 Open an independently content-pinned manifest with an already admitted genesis.
-Read one range, decode it with the existing `RangeBatchV1`, and pass each carrier
+Read one range, bind it with `PublicHistoryV1::decode_range`, and pass each carrier
 to `Node::ingest` with the ordinary parameters. Reconcile the node normally;
 `Ready` is the node's derived state, never a source manifest claim.
 

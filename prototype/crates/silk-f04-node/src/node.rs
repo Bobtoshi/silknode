@@ -438,6 +438,37 @@ impl Node {
     pub fn genesis(&self) -> &Genesis {
         &self.core.genesis
     }
+    pub(crate) fn check_history_query_ready(&self) -> Result<()> {
+        self.healthy()?;
+        self.idle()?;
+        if self.core.status != Status::Ready
+            || self.store.active_job()?.is_some()
+            || self.store.active_replay()?.is_some()
+        {
+            return Err(Error::Paused("public history receiver not ready"));
+        }
+        Ok(())
+    }
+    pub(crate) fn knows_history_carrier(
+        &self,
+        id: Digest,
+        carrier: Digest,
+        bytes: usize,
+        budget: &JobBudget,
+    ) -> Result<bool> {
+        let id = VertexId::from_bytes(id);
+        if self.core.graph.find_checked(id, budget)?.is_none() {
+            return Ok(false);
+        }
+        if !self
+            .core
+            .graph
+            .retained_candidate_hash_matches(id, carrier, bytes, budget)?
+        {
+            return Err(Error::Invalid("public history known carrier mismatch"));
+        }
+        Ok(true)
+    }
     /// Retained full-data graph count, including red evidence.
     #[must_use]
     pub fn vertex_count(&self) -> usize {

@@ -4,9 +4,11 @@
 //! or its claimed checkpoint cannot bootstrap a verified node or import a store.
 use crate::{
     Digest, Error, Result,
+    budget::JobBudget,
     carriage::{Candidate, MAX_VERTEX_BYTES},
     genesis::Genesis,
-    sync::{HISTORY_LIMIT_V1, RANGE_LIMIT_V1},
+    node::Node,
+    sync::{HISTORY_LIMIT_V1, RANGE_LIMIT_V1, RangeBatchV1},
     wire::{field, raw_hash, u32le},
 };
 use std::{
@@ -128,6 +130,71 @@ impl PublicHistoryV1 {
     #[must_use]
     pub const fn claimed_state(&self) -> Digest {
         self.state
+    }
+
+    /// Bind a received response to this independently pinned manifest and the
+    /// exact requested window before exposing any UNVERIFIED carrier bytes.
+    /// A short final window is allowed only at this manifest's actual end.
+    /// No cursor, node state, work validity or source checkpoint is adopted.
+    /// Transports must still submit every carrier through ordinary `Node::ingest`.
+    ///
+    /// # Errors
+    /// Refuses partial/malformed responses, wrong counts or positions, changed
+    /// carrier bytes, and mismatched static ID/context/candidate framing.
+    pub fn decode_range<'a>(
+        &self,
+        bytes: &'a [u8],
+        start: usize,
+        count: usize,
+    ) -> Result<RangeBatchV1<'a>> {
+        if start >= self.entries.len() || !(1..=RANGE_LIMIT_V1).contains(&count) {
+            return Err(Error::Invalid("public history range bounds"));
+        }
+        let end = start + count.min(self.entries.len() - start);
+        let batch = RangeBatchV1::decode(bytes, start, self.entries.len())?;
+        if batch.carriers().len() != end - start {
+            return Err(Error::Invalid("public history response count"));
+        }
+        for (bytes, entry) in batch.carriers().iter().zip(&self.entries[start..end]) {
+            if bytes.len() != entry.size || raw_hash(bytes) != entry.carrier {
+                return Err(Error::Invalid("public history response carrier bytes"));
+            }
+            if Candidate::decode(bytes, &self.genesis)?.id != entry.vertex {
+                return Err(Error::Invalid("public history response carrier ID"));
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Derive the first missing source position from this receiver's own freshly
+    /// checked admitted IDs and exact original carrier bytes, not saved cursors,
+    /// peer counts or source checkpoint claims. This is only a request-planning
+    /// hint: it neither admits data nor proves source/ledger convergence.
+    /// One unchanged checkpoint allowance covers the entire read-only scan.
+    ///
+    /// # Errors
+    /// Refuses a non-ready/interrupted receiver, different genesis, damaged local
+    /// evidence, an already-known ID with different source bytes, or exhaustion.
+    pub fn admitted_prefix(&self, node: &Node) -> Result<usize> {
+        let budget = JobBudget::checkpoint()?;
+        self.admitted_prefix_budget(node, &budget)
+    }
+    fn admitted_prefix_budget(&self, node: &Node, budget: &JobBudget) -> Result<usize> {
+        node.check_history_query_ready()?;
+        if self.genesis.domain() != node.genesis().domain()
+            || self.genesis.local_bundle() != node.genesis().local_bundle()
+        {
+            return Err(Error::Invalid("public history receiver genesis"));
+        }
+        for (position, entry) in self.entries.iter().enumerate() {
+            budget.check()?;
+            if !node.knows_history_carrier(entry.vertex, entry.carrier, entry.size, budget)? {
+                budget.check()?;
+                return Ok(position);
+            }
+        }
+        budget.check()?;
+        Ok(self.entries.len())
     }
 
     /// Read and freshly hash/type/context/frame-check one complete public range.
