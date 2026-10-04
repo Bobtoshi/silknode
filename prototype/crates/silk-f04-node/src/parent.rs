@@ -1,7 +1,7 @@
 //! Exact candidate-parent DAA and branch-specific delayed key derivation.
 use crate::{
     Digest, Error, Result,
-    budget::JobBudget,
+    budget::{AdmissionPhase, JobBudget},
     carriage::{ParentFacts, encode_parents},
     genesis::Genesis,
     graph::DurableGraph as Graph,
@@ -60,8 +60,10 @@ impl PrefixCache {
         if g.domain() != self.domain {
             return Err(Error::Unavailable("prefix-cache context"));
         }
+        budget.phase(AdmissionPhase::ParentOrder);
         budget.check()?;
         let order = graph.parent_order(parents, budget)?;
+        budget.phase(AdmissionPhase::ParentCommitments);
         let e = order.eligible_order();
         let m = e.len();
         let mut js = Vec::with_capacity(m + 1);
@@ -70,6 +72,7 @@ impl PrefixCache {
             js.push(fold_j(&self.domain, js[i], i as u64 + 1, id.into_bytes()));
         }
         budget.check()?;
+        budget.phase(AdmissionPhase::ParentDifficulty);
         let q = m.min(43);
         let mut pv = Vec::with_capacity(257 + 56 * q);
         pv.extend_from_slice(b"SNPVF001\x01\0\0\0");
@@ -183,15 +186,29 @@ impl PrefixCache {
         let mut source = self.genesis.clone();
         let mut selected_frontier = Vec::new();
         let latest = if m >= 48 { ((m - 16) / 32) * 4 } else { 0 };
+        // One immutable graph operation owns fully checked ID/ordinal bindings
+        // and a fixed small target/ancestry working set for the entire search.
+        // No source candidate is skipped; ledger reconstruction is unchanged.
+        let mut ancestry = if latest >= 4 {
+            budget.phase(AdmissionPhase::ParentFrontierInventory);
+            Some(graph.ancestor_query(budget)?)
+        } else {
+            None
+        };
         // Each search quantum is <=16 source candidates; each replay quantum below
         // is exactly eight positions. All quanta share this original job budget.
         for s in (4..=latest).rev().filter(|s| s % 4 == 0) {
+            budget.phase(AdmissionPhase::ParentSourceReplay);
             budget.source()?;
             budget.check()?;
             let end = s * 8;
             // A source MUST be reconstructed, including its full own ledger/cuts,
             // before any claim that it is unusable; a cache miss never skips it.
             let derived = self.reconstruct(graph, &e[..end], &js[..=end], g, budget)?;
+            budget.phase(AdmissionPhase::ParentFrontier);
+            let ancestry = ancestry
+                .as_mut()
+                .ok_or(Error::Unavailable("source frontier query absent"))?;
             let mut frontier = Vec::with_capacity(4);
             for id in e[..end].iter().rev() {
                 budget.probe()?;
@@ -199,7 +216,7 @@ impl PrefixCache {
                 let mut dominated = false;
                 for tip in &frontier {
                     budget.probe()?;
-                    if graph.is_ancestor_checked(*id, *tip, Some(budget))? {
+                    if ancestry.is_ancestor(*id, *tip)? {
                         dominated = true;
                         break;
                     }
@@ -221,7 +238,7 @@ impl PrefixCache {
             for f in &frontier {
                 for p in parents.ordinary_parents() {
                     budget.probe()?;
-                    if f != p && !graph.is_ancestor_checked(*f, *p, Some(budget))? {
+                    if f != p && !ancestry.is_ancestor(*f, *p)? {
                         common = false;
                     }
                 }
@@ -232,6 +249,7 @@ impl PrefixCache {
                 break;
             }
         }
+        budget.phase(AdmissionPhase::ParentKey);
         let s = source.checkpoint_index();
         let mut source_record = [0; 184];
         source_record[..8].copy_from_slice(&s.to_le_bytes());

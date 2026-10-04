@@ -112,10 +112,16 @@ fn historical_public_ranges_ingest_and_reconcile_fresh_node() {
         let bytes = history.read_range(start, 32).unwrap();
         let range = RangeBatchV1::decode(&bytes, start, history.len()).unwrap();
         for carrier in range.carriers() {
-            assert_eq!(
-                node.ingest(carrier, &parameters).unwrap(),
-                Ingress::Admitted
-            );
+            let ordinal = node.vertex_count();
+            let ingress = node.ingest(carrier, &parameters);
+            if let Err(error) = &ingress {
+                eprintln!(
+                    "ingress_refused_ordinal={ordinal}; carrier_sha256={}; error={error:?}; first_cooperative_budget_failure={:?}",
+                    hex::encode(raw_hash(carrier)),
+                    node.admission_budget_failure()
+                );
+            }
+            assert_eq!(ingress.unwrap(), Ingress::Admitted);
             // Hard finite bound, never an unbounded retry loop or raised budget.
             for _ in 0..386 {
                 if node.status().unwrap() == Status::Ready {
@@ -157,6 +163,56 @@ fn historical_public_ranges_ingest_and_reconcile_fresh_node() {
     );
     // A separate OS process must use independently frozen output pins, not read
     // arbitrary HEAD/expected files from inside the tested store itself.
+}
+
+#[test]
+#[ignore = "NEEDS exact independent outer execution approval; fresh 1361-carrier diagnostic prefix only, original budgets, NO mining/proof generation or failed-store reopen"]
+fn historical_foreground_diagnostic_prefix_1361_fresh_node() {
+    assert_eq!(
+        std::env::var("SILK_F04_FOREGROUND_PREFIX_DIAGNOSTIC").as_deref(),
+        Ok("1")
+    );
+    let (root, margin, genesis, history, parameters) = inputs();
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    let started = std::time::Instant::now();
+    let mut node = Node::create(&root.join("node"), &margin, genesis).unwrap();
+    const PREFIX: usize = 1361;
+    for start in (0..PREFIX).step_by(32) {
+        let bytes = history.read_range(start, (PREFIX - start).min(32)).unwrap();
+        let range = RangeBatchV1::decode(&bytes, start, history.len()).unwrap();
+        for carrier in range.carriers() {
+            let ordinal = node.vertex_count();
+            let ingress = node.ingest(carrier, &parameters);
+            if let Err(error) = &ingress {
+                eprintln!(
+                    "diagnostic_prefix_refused_ordinal={ordinal}; carrier_sha256={}; error={error:?}; first_cooperative_budget_failure={:?}",
+                    hex::encode(raw_hash(carrier)),
+                    node.admission_budget_failure()
+                );
+            }
+            assert_eq!(ingress.unwrap(), Ingress::Admitted);
+            for _ in 0..171 {
+                if node.status().unwrap() == Status::Ready {
+                    break;
+                }
+                node.advance().unwrap();
+            }
+            assert_eq!(node.status().unwrap(), Status::Ready);
+            assert!(!root.join("node/ACTIVE_JOB").exists());
+        }
+        println!(
+            "diagnostic_prefix_vertices={}; elapsed_seconds={}",
+            node.vertex_count(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    assert_eq!(node.vertex_count(), PREFIX);
+    assert_eq!(node.state().unwrap().checkpoint_index(), 170);
+    assert_eq!(node.state().unwrap().executed().len(), 1360);
+    println!(
+        "diagnostic_prefix_complete_vertices=1361; checkpoints=170; fresh_head={}; original_vertices_horizon=4096; larger3080_acceptance=false; cold_process_replay=false; new_work_records=0; new_payment_proofs=0",
+        hex::encode(node.local_head().unwrap())
+    );
 }
 
 #[test]

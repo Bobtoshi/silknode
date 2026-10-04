@@ -5,8 +5,94 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+/// Receiver-local diagnostic call boundary, never consensus or saved validity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionPhase {
+    /// Initial canonical input decoding.
+    Decode,
+    /// Existing ID/full-byte lookup.
+    KnownLookup,
+    /// Local time, parents and horizon checks.
+    Preflight,
+    /// Durable attempt marker publication.
+    AttemptFence,
+    /// Original native deadline lease arming.
+    NativeDeadline,
+    /// Core canonical decoding and duplicate lookup.
+    CoreDecode,
+    /// Parent closure ordering.
+    ParentOrder,
+    /// Eligible-prefix commitments.
+    ParentCommitments,
+    /// Full header reads and difficulty derivation.
+    ParentDifficulty,
+    /// Whole ID/directory qualification for one source-frontier operation.
+    ParentFrontierInventory,
+    /// Delayed-key source ledger reconstruction.
+    ParentSourceReplay,
+    /// Delayed-key frontier/common-ancestor search.
+    ParentFrontier,
+    /// Final delayed-key material construction.
+    ParentKey,
+    /// Body stage entry and parent-fact binding.
+    BodyStart,
+    /// Exact native work verification, including its following budget check.
+    Work,
+    /// Envelope decode and cryptographic verification.
+    BodyCrypto,
+    /// Verified candidate parent-closure reconstruction.
+    CandidateClosure,
+    /// New vertex SG-0 metadata derivation.
+    VertexMetadata,
+    /// New preferred/eligible graph order derivation.
+    GraphOrder,
+    /// Reconciliation-status derivation.
+    ReconciliationStatus,
+    /// Complete durable generation publication.
+    DurableGeneration,
+    /// Derived ancestry retention.
+    AncestryRetention,
+    /// Exact live order retention/binding.
+    OrderRetention,
+    /// Live graph publication and checked directories.
+    CorePublication,
+    /// Accepted attempt terminal closure.
+    TerminalClosure,
+}
+
+/// First cooperative expiration only. Absence does not prove success: native
+/// SIGKILL, clock failure, cancellation and other errors may provide no report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionBudgetFailure {
+    /// Call boundary active when the original budget first detected expiration.
+    pub phase: AdmissionPhase,
+    /// Monotonic elapsed time from the original job baseline.
+    pub wall_elapsed: Duration,
+    /// Process CPU elapsed time; None only if the extra wall-failure sample fails.
+    pub cpu_elapsed: Option<Duration>,
+    /// Original unchanged wall allowance.
+    pub wall_limit: Duration,
+    /// Original unchanged process-CPU allowance.
+    pub cpu_limit: Duration,
+    /// Whether the measured original wall threshold was reached.
+    pub wall_expired: bool,
+    /// CPU threshold observation; None means unavailable, not false.
+    pub cpu_expired: Option<bool>,
+}
+struct TraceState {
+    phase: AdmissionPhase,
+    failure: Option<AdmissionBudgetFailure>,
+}
+pub(crate) struct AdmissionTrace(Mutex<TraceState>);
+impl AdmissionTrace {
+    pub(crate) fn failure(&self) -> Option<AdmissionBudgetFailure> {
+        self.0.lock().ok().and_then(|state| state.failure)
+    }
+}
 
 /// Never reset between source search, replay, work, crypto and metadata derivation.
 pub(crate) struct JobBudget {
@@ -17,6 +103,9 @@ pub(crate) struct JobBudget {
     reads: Cell<u64>,
     gate: RefCell<Option<Gate>>,
     quantum: Cell<Usage>,
+    trace: Option<Arc<AdmissionTrace>>,
+    #[cfg(test)]
+    source_calls: Cell<u64>,
 }
 impl JobBudget {
     pub fn vertex() -> Result<Self> {
@@ -38,25 +127,69 @@ impl JobBudget {
             reads: Cell::new(0),
             gate: RefCell::new(None),
             quantum: Cell::new(Usage::default()),
+            trace: None,
+            #[cfg(test)]
+            source_calls: Cell::new(0),
         })
+    }
+    /// Optional live diagnostics share ownership, NOT a second/reset budget.
+    pub(crate) fn track_admission(&mut self) -> Arc<AdmissionTrace> {
+        let trace = self.trace.get_or_insert_with(|| {
+            Arc::new(AdmissionTrace(Mutex::new(TraceState {
+                phase: AdmissionPhase::Decode,
+                failure: None,
+            })))
+        });
+        trace.clone()
+    }
+    pub(crate) fn phase(&self, phase: AdmissionPhase) {
+        if let Some(trace) = &self.trace
+            && let Ok(mut state) = trace.0.lock()
+        {
+            state.phase = phase;
+        }
+    }
+    fn expired(&self, wall_elapsed: Duration, cpu_elapsed: Option<Duration>) -> Result<()> {
+        if let Some(trace) = &self.trace
+            && let Ok(mut state) = trace.0.lock()
+            && state.failure.is_none()
+        {
+            state.failure = Some(AdmissionBudgetFailure {
+                phase: state.phase,
+                wall_elapsed,
+                cpu_elapsed,
+                wall_limit: self.wall_limit,
+                cpu_limit: self.cpu_limit,
+                wall_expired: wall_elapsed >= self.wall_limit,
+                cpu_expired: cpu_elapsed.map(|cpu| cpu >= self.cpu_limit),
+            });
+        }
+        Err(Error::Paused("cumulative foreground CPU/wall budget"))
     }
     pub fn check(&self) -> Result<()> {
         if let Some(gate) = self.gate.borrow().as_ref() {
             gate.check_cancelled()?;
         }
-        if monotonic_time()?
+        let wall_elapsed = monotonic_time()?
             .checked_sub(self.start)
-            .ok_or(Error::Unavailable("monotonic clock regression"))?
-            >= self.wall_limit
-            || cpu_time()?
-                .checked_sub(self.cpu)
-                .ok_or(Error::Unavailable("process CPU clock regression"))?
-                >= self.cpu_limit
-        {
-            Err(Error::Paused("cumulative foreground CPU/wall budget"))
-        } else {
-            Ok(())
+            .ok_or(Error::Unavailable("monotonic clock regression"))?;
+        if wall_elapsed >= self.wall_limit {
+            // Original short-circuit wall refusal stays a wall refusal even if
+            // this extra diagnostic CPU sample is unavailable or regresses.
+            let cpu_elapsed = self
+                .trace
+                .as_ref()
+                .and_then(|_| cpu_time().ok())
+                .and_then(|cpu| cpu.checked_sub(self.cpu));
+            return self.expired(wall_elapsed, cpu_elapsed);
         }
+        let cpu_elapsed = cpu_time()?
+            .checked_sub(self.cpu)
+            .ok_or(Error::Unavailable("process CPU clock regression"))?;
+        if cpu_elapsed >= self.cpu_limit {
+            return self.expired(wall_elapsed, Some(cpu_elapsed));
+        }
+        Ok(())
     }
     /// Immutable absolute baselines survive worker handoff and every yield.
     pub(crate) fn deadlines(&self) -> Result<(Duration, Duration)> {
@@ -108,10 +241,17 @@ impl JobBudget {
         })
     }
     pub fn source(&self) -> Result<()> {
+        #[cfg(test)]
+        self.source_calls
+            .set(self.source_calls.get().saturating_add(1));
         self.charge(Usage {
             sources: 1,
             ..Usage::default()
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn source_calls(&self) -> u64 {
+        self.source_calls.get()
     }
     pub fn replay(&self) -> Result<()> {
         self.charge(Usage {
@@ -190,6 +330,92 @@ impl LocalClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_diagnostic_cpu_wall_both_and_unknown_are_not_conflated() {
+        for (wall, cpu, expect_wall, expect_cpu) in [
+            (Duration::from_secs(60), Duration::ZERO, false, true),
+            (Duration::ZERO, Duration::from_secs(60), true, false),
+            (Duration::ZERO, Duration::ZERO, true, true),
+        ] {
+            let mut b = JobBudget::new(wall, cpu).unwrap();
+            let trace = b.track_admission();
+            b.phase(AdmissionPhase::Work);
+            assert!(matches!(
+                b.check(),
+                Err(Error::Paused("cumulative foreground CPU/wall budget"))
+            ));
+            let failure = trace.failure().unwrap();
+            assert_eq!(failure.phase, AdmissionPhase::Work);
+            assert_eq!(failure.wall_expired, expect_wall);
+            assert_eq!(failure.cpu_expired, Some(expect_cpu));
+            assert_eq!((failure.wall_limit, failure.cpu_limit), (wall, cpu));
+        }
+        // Pure refusal-recording boundary: no invented unavailable CPU sample.
+        let mut b = JobBudget::new(Duration::ZERO, Duration::from_secs(60)).unwrap();
+        let trace = b.track_admission();
+        assert!(b.expired(Duration::ZERO, None).is_err());
+        assert!(trace.failure().unwrap().wall_expired);
+        assert_eq!(trace.failure().unwrap().cpu_elapsed, None);
+        assert_eq!(trace.failure().unwrap().cpu_expired, None);
+    }
+    #[test]
+    fn admission_diagnostic_first_failure_and_original_deadlines_survive_reattach() {
+        let mut b = JobBudget::new(Duration::from_secs(60), Duration::ZERO).unwrap();
+        let deadlines = b.deadlines().unwrap();
+        let trace = b.track_admission();
+        b.phase(AdmissionPhase::ParentFrontier);
+        assert!(b.check().is_err());
+        let first = trace.failure().unwrap();
+        b.phase(AdmissionPhase::DurableGeneration);
+        assert!(Arc::ptr_eq(&trace, &b.track_admission()));
+        assert!(b.check().is_err());
+        assert_eq!(trace.failure(), Some(first));
+        assert_eq!(b.deadlines().unwrap(), deadlines);
+    }
+    #[test]
+    fn admission_diagnostic_worker_failure_keeps_original_phase_and_budget() {
+        use crate::quantum::{Job, Progress};
+        let mut b = JobBudget::new(Duration::from_secs(60), Duration::from_secs(10)).unwrap();
+        let trace = b.track_admission();
+        let deadlines = b.deadlines().unwrap();
+        let mut job = Job::start(b, |budget| {
+            budget.phase(AdmissionPhase::ParentSourceReplay);
+            // Test-only forced elapsed baseline. Failure recording itself stays
+            // exactly the same path as an actual original-budget check refusal.
+            budget.expired(Duration::from_secs(60), Some(Duration::from_secs(2)))?;
+            Ok(())
+        })
+        .unwrap();
+        let Progress::Complete(result, b) = job.advance().unwrap() else {
+            panic!("complete")
+        };
+        assert!(matches!(
+            result,
+            Err(Error::Paused("cumulative foreground CPU/wall budget"))
+        ));
+        assert_eq!(
+            trace.failure().unwrap().phase,
+            AdmissionPhase::ParentSourceReplay
+        );
+        assert_eq!(b.deadlines().unwrap(), deadlines);
+        assert_eq!(trace.failure(), b.trace.as_ref().unwrap().failure());
+    }
+    #[test]
+    fn admission_diagnostic_no_expiry_is_not_invented_for_other_errors() {
+        let mut b = JobBudget::vertex().unwrap();
+        let trace = b.track_admission();
+        b.phase(AdmissionPhase::BodyCrypto);
+        b.check().unwrap();
+        assert_eq!(trace.failure(), None);
+        let mut job =
+            crate::quantum::Job::start(b, |_| Err::<(), _>(Error::Invalid("synthetic refusal")))
+                .unwrap();
+        let crate::quantum::Progress::Complete(result, _) = job.advance().unwrap() else {
+            panic!("complete")
+        };
+        assert!(matches!(result, Err(Error::Invalid(_))));
+        assert_eq!(trace.failure(), None);
+    }
     #[test]
     fn future_clock_rollback_and_overflow_are_local() {
         let mut c = LocalClock::default();

@@ -4,7 +4,7 @@
 pub(crate) mod order;
 use crate::{
     Digest, Error, Result,
-    budget::{JobBudget, LocalClock},
+    budget::{AdmissionPhase, JobBudget, LocalClock},
     capacity::HistoryCapacityV1,
     carriage::{Body, Candidate, Header, MiningTemplate, ParentFacts, WorkEngine},
     genesis::Genesis,
@@ -129,6 +129,7 @@ impl Core {
             .ok_or(Error::Paused("parent job already owns cache"))?;
         let graph = self.graph.clone();
         let genesis = self.genesis.clone();
+        budget.phase(AdmissionPhase::ParentOrder);
         Job::start(budget, move |budget| {
             let result = prefixes.derive(&graph, &parents, &genesis, budget);
             Ok((result, prefixes))
@@ -143,6 +144,7 @@ impl Core {
         if self.status != Status::Ready || self.active_admission {
             return Err(Error::Paused("reconcile before new admission"));
         }
+        budget.phase(AdmissionPhase::CoreDecode);
         budget.check()?;
         let candidate = self.graph.decode_candidate(
             bytes,
@@ -183,6 +185,7 @@ impl Core {
                 }
             },
             Phase::Body(candidate, facts, budget) => {
+                budget.phase(AdmissionPhase::BodyStart);
                 budget.check()?;
                 // Parent worker is joined before this sole exact work/crypto job.
                 let verified = self.graph.verify_body(
@@ -197,8 +200,10 @@ impl Core {
                 budget.check()?;
                 let vertex = verified?;
                 let graph = self.graph.clone();
+                budget.phase(AdmissionPhase::VertexMetadata);
                 job.phase = Phase::Order(Job::start(budget, move |budget| {
                     let vertex = graph.seal(vertex, budget)?;
+                    budget.phase(AdmissionPhase::GraphOrder);
                     let order = graph.order_with(&vertex, budget)?;
                     Ok((vertex, order))
                 })?);
@@ -211,6 +216,7 @@ impl Core {
                 Progress::Complete(result, budget) => {
                     budget.check()?;
                     let (vertex, order) = result?;
+                    budget.phase(AdmissionPhase::ReconciliationStatus);
                     let status = status_for(&self.state, order.eligible_order(), &budget)?;
                     budget.check()?;
                     for envelope in vertex.vertex().envelopes() {
@@ -238,6 +244,7 @@ impl Core {
         Ok(())
     }
     pub fn publish(&mut self, a: Admission) -> Result<JobBudget> {
+        a.budget.phase(AdmissionPhase::CorePublication);
         a.budget.check()?;
         let retained_order = a
             .retained_order

@@ -1012,6 +1012,29 @@ impl<V: GraphEntry> GraphData<V> {
             .contains(ai)?)
     }
 
+    /// One delayed-key search's owned ID snapshot and <=4 target descriptors.
+    /// Fresh qualification occurs per immutable operation, not per membership bit.
+    pub(crate) fn ancestor_query<'a>(
+        &'a self,
+        budget: &'a JobBudget,
+    ) -> Result<AncestorQuery<'a, V>> {
+        let view = View::new(self, None, None, budget);
+        // Whole index/directory qualification before returning any query result.
+        drop(view.inventory()?);
+        let inventory = view
+            .inventory
+            .into_inner()
+            .ok_or(Error::Unavailable("ancestor query inventory absent"))?;
+        Ok(AncestorQuery {
+            graph: self,
+            budget,
+            inventory,
+            targets: Vec::new(),
+            reads: DirectoryOperation::new(&self.vertices),
+            ancestry: AncestryOperation::new(self.ancestry_reader.as_ref()),
+        })
+    }
+
     /// Only freshly decoded canonical bytes enter the validity pipeline.
     /// `clock=None` is crate-private and reserved for authenticated local archive replay.
     pub(crate) fn decode_candidate(
@@ -1045,9 +1068,11 @@ impl<V: GraphEntry> GraphData<V> {
         budget: &JobBudget,
     ) -> Result<VerifiedVertex> {
         candidate.header.check_facts(&facts)?;
+        budget.phase(crate::budget::AdmissionPhase::Work);
         budget.check()?;
         work.verify(&candidate, &facts, g)?;
         budget.check()?;
+        budget.phase(crate::budget::AdmissionPhase::BodyCrypto);
         let mut envelopes = Vec::with_capacity(candidate.body.representations().len());
         let mut missing = Vec::new();
         let mut missing_indices = Vec::new();
@@ -1065,6 +1090,7 @@ impl<V: GraphEntry> GraphData<V> {
         for (i, v) in missing_indices.into_iter().zip(verified) {
             envelopes[i] = Some(v);
         }
+        budget.phase(crate::budget::AdmissionPhase::CandidateClosure);
         Ok(VerifiedVertex {
             info: GraphInfo {
                 id: candidate.id,
@@ -1200,6 +1226,55 @@ impl<V: GraphEntry> GraphData<V> {
 struct OrdinalInventory {
     ids: Vec<VertexId>,
     sorted: Vec<usize>,
+}
+/// Crate-private, borrowed from the receiver's immutable live graph only. No
+/// persisted constructor, imported IDs, negative cache or graph-wide payloads.
+pub(crate) struct AncestorQuery<'a, V> {
+    graph: &'a GraphData<V>,
+    budget: &'a JobBudget,
+    inventory: OrdinalInventory,
+    targets: Vec<(VertexId, Arc<V>)>,
+    reads: DirectoryOperation<'a, V>,
+    ancestry: AncestryOperation<'a>,
+}
+impl<V: GraphEntry> AncestorQuery<'_, V> {
+    fn position(&self, id: VertexId) -> Result<usize> {
+        self.budget.check()?;
+        let sorted = self
+            .inventory
+            .sorted
+            .binary_search_by_key(&id, |position| self.inventory.ids[*position])
+            .map_err(|_| Error::Unavailable("missing admitted vertex"))?;
+        Ok(self.inventory.sorted[sorted])
+    }
+    pub(crate) fn is_ancestor(&mut self, a: VertexId, b: VertexId) -> Result<bool> {
+        self.budget.probe()?;
+        let ai = self.position(a)?;
+        let bi = self.position(b)?;
+        let target = if let Some((_, vertex)) = self.targets.iter().find(|(id, _)| *id == b) {
+            vertex.clone()
+        } else {
+            let vertex = self.reads.load(bi, self.budget)?;
+            if vertex.graph_info().id != b.into_bytes() {
+                return Err(Error::Unavailable("ancestor query target identity"));
+            }
+            // Frontier has <=4 members; ordinary candidate parent set <=2.
+            // Keep a fixed small positive working set even on adversarial search.
+            if self.targets.len() == 4 {
+                self.targets.remove(0);
+            }
+            self.targets.push((b, vertex.clone()));
+            vertex
+        };
+        if self.inventory.ids.len() != self.graph.len() {
+            return Err(Error::Unavailable("ancestor query graph binding"));
+        }
+        let found = self
+            .ancestry
+            .contains(&target.graph_info().ancestors, ai, self.budget)?;
+        self.budget.check()?;
+        Ok(found)
+    }
 }
 struct View<'a, V> {
     graph: &'a GraphData<V>,
@@ -1414,6 +1489,130 @@ fn index_error(error: Error) -> Sg0Error {
 mod tests {
     use super::*;
     use crate::carriage::{Body, Header};
+
+    #[test]
+    fn ancestor_query_matches_original_branch_relations_and_strict_self_rules() {
+        let budget = JobBudget::checkpoint().unwrap();
+        let graph = diamond(&budget);
+        let mut query = graph.ancestor_query(&budget).unwrap();
+        for a in 1..=4 {
+            for b in 1..=4 {
+                assert_eq!(
+                    query.is_ancestor(id(a), id(b)).unwrap(),
+                    graph
+                        .is_ancestor_checked(id(a), id(b), Some(&budget))
+                        .unwrap()
+                );
+                assert!(query.targets.len() <= 4);
+            }
+        }
+        assert!(query.is_ancestor(id(5), id(4)).is_err());
+        assert!(query.is_ancestor(id(1), id(5)).is_err());
+        assert_eq!(query.targets.len(), 4);
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(graph.ancestor_query(&expired).is_err());
+    }
+
+    #[test]
+    fn ancestor_query_disk_frontier_reduces_checked_sources_and_is_operation_scoped() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let setup = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic ancestor-query fixture only")
+            .unwrap();
+        for label in 1..=65_u8 {
+            let parents = if label == 1 {
+                Vec::new()
+            } else {
+                vec![label - 1]
+            };
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, &parents), &setup)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            store
+                .commit(&[&record], b"synthetic query fixture head")
+                .unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            prepared
+                .retain_ancestry(&graph, &mut store, &setup)
+                .unwrap();
+            graph.publish_checked(prepared, &setup).unwrap();
+        }
+        let baseline = JobBudget::vertex().unwrap();
+        let expected = (1..=64)
+            .rev()
+            .map(|label| {
+                graph
+                    .is_ancestor_checked(id(label), id(65), Some(&baseline))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let baseline_sources = baseline.source_calls();
+        let mut optimized = JobBudget::vertex().unwrap();
+        let trace = optimized.track_admission();
+        optimized.phase(crate::budget::AdmissionPhase::ParentFrontierInventory);
+        let mut query = graph.ancestor_query(&optimized).unwrap();
+        optimized.phase(crate::budget::AdmissionPhase::ParentFrontier);
+        let actual = (1..=64)
+            .rev()
+            .map(|label| query.is_ancestor(id(label), id(65)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        let shared_sources = optimized.source_calls();
+        assert!(baseline_sources >= 4 * 64);
+        assert!(shared_sources <= 6);
+        assert!(baseline_sources > shared_sources * 20);
+        assert_eq!(trace.failure(), None);
+        println!(
+            "synthetic_parent_frontier_vertices=65; original_budget_cpu_seconds=2; baseline_checked_source_calls={baseline_sources}; operation_checked_source_calls={shared_sources}; native_work=0; proofs=0; historical_failure_attribution=false"
+        );
+        let weak = Arc::downgrade(&query.targets[0].1);
+        for b in (60..=64).rev() {
+            assert!(query.is_ancestor(id(1), id(b)).unwrap());
+            assert!(query.targets.len() <= 4);
+        }
+        // These are owned per-operation bytes, not a promise of rereading an
+        // already qualified page after the operator mutates the test fixture.
+        let late = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(graph.retained_directory_pages()[1])
+        ));
+        let held = late.with_extension("held");
+        std::fs::rename(&late, &held).unwrap();
+        assert!(graph.ancestor_query(&JobBudget::vertex().unwrap()).is_err());
+        drop(query);
+        assert!(weak.upgrade().is_none());
+        std::fs::rename(&held, &late).unwrap();
+        let fresh_budget = JobBudget::vertex().unwrap();
+        let mut fresh = graph.ancestor_query(&fresh_budget).unwrap();
+        assert!(fresh.is_ancestor(id(1), id(65)).unwrap());
+        assert!(!fresh.is_ancestor(id(65), id(65)).unwrap());
+        let target = fresh
+            .targets
+            .iter()
+            .find(|(id, _)| *id == super::tests::id(65))
+            .unwrap();
+        let ancestry = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(target.1.graph_info().ancestors.retained_ids()[0])
+        ));
+        let held_ancestry = ancestry.with_extension("held");
+        std::fs::rename(&ancestry, &held_ancestry).unwrap();
+        let cold_budget = JobBudget::vertex().unwrap();
+        let mut cold = graph.ancestor_query(&cold_budget).unwrap();
+        assert!(cold.is_ancestor(id(1), id(65)).is_err());
+        assert_eq!(cold.ancestry.loads(), 0);
+        std::fs::rename(&held_ancestry, &ancestry).unwrap();
+        assert!(cold.is_ancestor(id(1), id(65)).unwrap());
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(graph.ancestor_query(&expired).is_err());
+        assert_eq!(store.active_replay().unwrap().is_some(), true);
+    }
 
     #[test]
     fn incremental_directory_new_page_staging_cannot_credit_a_missing_immutable_prefix() {

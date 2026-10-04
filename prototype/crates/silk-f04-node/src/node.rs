@@ -63,6 +63,7 @@ pub struct Node {
     // Successful explicitly requested public snapshot ONLY. Core/caches keep
     // disk-backed ledger directories; an I/O failure is never cached as state.
     state_view: OnceLock<(Digest, BranchState)>,
+    admission_trace: Option<Arc<crate::budget::AdmissionTrace>>,
 }
 // Field order joins the worker before native timers are disarmed on every exit.
 struct PendingAdmission {
@@ -95,6 +96,7 @@ impl Node {
             recovered_previous: false,
             pending: None,
             state_view: OnceLock::new(),
+            admission_trace: None,
         };
         let data = genesis_material(&node.core.genesis);
         let budget = JobBudget::checkpoint()?;
@@ -278,6 +280,7 @@ impl Node {
             recovered_previous,
             pending: None,
             state_view: OnceLock::new(),
+            admission_trace: None,
         })
     }
 
@@ -445,6 +448,15 @@ impl Node {
     pub fn accounted_bytes(&self) -> u64 {
         self.store.accounted_bytes()
     }
+    /// Diagnostic for the last live admission's first cooperative expiration.
+    /// Readable after STOP; never grants health, validity, recovery or a retry.
+    /// None also covers native termination/cancellation/other failures, not success.
+    #[must_use]
+    pub fn admission_budget_failure(&self) -> Option<crate::budget::AdmissionBudgetFailure> {
+        self.admission_trace
+            .as_ref()
+            .and_then(|trace| trace.failure())
+    }
     /// Local reference-horizon bounds for participation/resource controls. This
     /// is read-only derived metadata, not a disk reservation or admission permit.
     /// # Errors
@@ -492,9 +504,11 @@ impl Node {
     pub fn begin_ingest(&mut self, bytes: &[u8]) -> Result<Ingress> {
         self.healthy()?;
         self.idle()?;
-        let budget = JobBudget::vertex()?;
+        let mut budget = JobBudget::vertex()?;
+        self.admission_trace = Some(budget.track_admission());
         self.core.clock.observe(system_wall()?)?;
         let c = Candidate::decode(bytes, &self.core.genesis)?;
+        budget.phase(crate::budget::AdmissionPhase::KnownLookup);
         if let Some(v) = self
             .core
             .graph
@@ -511,6 +525,7 @@ impl Node {
                 "existing vertex ID with different full bytes",
             ));
         }
+        budget.phase(crate::budget::AdmissionPhase::Preflight);
         if self.core.status != Status::Ready {
             return Err(Error::Paused("reconcile before new admission"));
         }
@@ -538,7 +553,9 @@ impl Node {
         marker.extend_from_slice(&nonce);
         marker.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         marker.extend_from_slice(bytes);
+        budget.phase(crate::budget::AdmissionPhase::AttemptFence);
         let job_id = self.begin_foreground_job(&marker)?;
+        budget.phase(crate::budget::AdmissionPhase::NativeDeadline);
         let guard = match NativeGuard::arm(&budget) {
             Ok(guard) => guard,
             Err(e) => return self.job_failed(job_id, e),
@@ -571,6 +588,7 @@ impl Node {
             Ok(Some(admission)) => {
                 let result = (|| {
                     let budget = self.publish_admission(admission)?;
+                    budget.phase(crate::budget::AdmissionPhase::TerminalClosure);
                     budget.check()?;
                     self.store.finish_job(pending.id, true)
                 })();
@@ -608,6 +626,8 @@ impl Node {
         Err(error)
     }
     fn publish_admission(&mut self, mut a: Admission) -> Result<JobBudget> {
+        a.budget
+            .phase(crate::budget::AdmissionPhase::DurableGeneration);
         a.budget.check()?;
         let data = a.vertex.vertex().retained_record()?;
         let order = order_bytes(&a.order);
@@ -620,8 +640,12 @@ impl Node {
             &a.budget,
         )?;
         if let Err(error) = (|| {
+            a.budget
+                .phase(crate::budget::AdmissionPhase::AncestryRetention);
             a.vertex
                 .retain_ancestry(&self.core.graph, &mut self.store, &a.budget)?;
+            a.budget
+                .phase(crate::budget::AdmissionPhase::OrderRetention);
             a.vertex.bind_retained_source(&data).and_then(|()| {
                 a.retained_order = Some(CoreOrder::retain(
                     &a.order,

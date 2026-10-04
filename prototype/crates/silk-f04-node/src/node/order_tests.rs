@@ -2,6 +2,38 @@
 use super::*;
 
 #[test]
+fn admission_diagnostic_is_readable_after_stop_without_health_or_retry_authority() {
+    let (temp, store) = crate::store::ancestry_test_store();
+    drop(store);
+    let margin = std::env::var_os("SILK_F04_HOST_MARGIN")
+        .map_or_else(|| temp.path().to_path_buf(), std::path::PathBuf::from);
+    let mut node = Node::create(
+        &temp.path().join("diagnostic"),
+        &margin,
+        crate::genesis::public_testnet_v1::genesis().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(node.admission_budget_failure(), None);
+    let head = node.local_head().unwrap();
+    let mut budget = JobBudget::new(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    node.admission_trace = Some(budget.track_admission());
+    budget.phase(crate::budget::AdmissionPhase::CoreDecode);
+    assert!(budget.check().is_err());
+    node.faulted = true; // synthetic STOP integration, no native ingress was run
+    let diagnostic = node.admission_budget_failure().unwrap();
+    assert_eq!(diagnostic.phase, crate::budget::AdmissionPhase::CoreDecode);
+    assert_eq!(diagnostic.cpu_expired, Some(true));
+    assert!(node.begin_ingest(&[]).is_err());
+    assert!(node.flush_clock().is_err());
+    assert_eq!(node.store.head(), Some(head));
+    assert_eq!(node.admission_budget_failure(), Some(diagnostic));
+}
+
+#[test]
 fn disk_order_created_node_reuses_original_empty_order_and_refuses_before_clock_write() {
     let (temp, store) = crate::store::ancestry_test_store();
     drop(store);
