@@ -1024,7 +1024,8 @@ impl<V: GraphEntry> GraphData<V> {
         let inventory = view
             .inventory
             .into_inner()
-            .ok_or(Error::Unavailable("ancestor query inventory absent"))?;
+            .ok_or(Error::Unavailable("ancestor query inventory absent"))?
+            .ordinals;
         Ok(AncestorQuery {
             graph: self,
             budget,
@@ -1227,6 +1228,22 @@ struct OrdinalInventory {
     ids: Vec<VertexId>,
     sorted: Vec<usize>,
 }
+// Only header facts already checked during this View's complete directory pass.
+// Parent vectors have at most two IDs; no payload, metadata or ancestry is kept.
+struct HeaderFacts {
+    parents: Sg0ParentSetV1,
+    work: u64,
+}
+struct ViewInventory {
+    ordinals: OrdinalInventory,
+    headers: Vec<HeaderFacts>,
+}
+impl std::ops::Deref for ViewInventory {
+    type Target = OrdinalInventory;
+    fn deref(&self) -> &Self::Target {
+        &self.ordinals
+    }
+}
 /// Crate-private, borrowed from the receiver's immutable live graph only. No
 /// persisted constructor, imported IDs, negative cache or graph-wide payloads.
 pub(crate) struct AncestorQuery<'a, V> {
@@ -1284,7 +1301,7 @@ struct View<'a, V> {
     reads: RefCell<DirectoryOperation<'a, V>>,
     index_reads: RefCell<IndexOperation<'a>>,
     ancestry_reads: RefCell<AncestryOperation<'a>>,
-    inventory: RefCell<Option<OrdinalInventory>>,
+    inventory: RefCell<Option<ViewInventory>>,
 }
 impl<'a, V> View<'a, V> {
     const fn new(
@@ -1318,7 +1335,7 @@ impl<V: GraphEntry> ViewEntry<'_, V> {
     }
 }
 impl<V: GraphEntry> View<'_, V> {
-    fn inventory(&self) -> std::result::Result<Ref<'_, OrdinalInventory>, Sg0Error> {
+    fn inventory(&self) -> std::result::Result<Ref<'_, ViewInventory>, Sg0Error> {
         self.budget.check().map_err(index_error)?;
         if self.inventory.borrow().is_none() {
             if self.graph.len() > crate::sync::HISTORY_LIMIT_V1 {
@@ -1332,6 +1349,7 @@ impl<V: GraphEntry> View<'_, V> {
             if inventory.ids.len() != self.graph.len() {
                 return Err(Sg0Error::Invariant);
             }
+            let mut headers = Vec::with_capacity(self.graph.len());
             // One sequential directory pass validates the complete ID/ordinal
             // permutation before any caller receives an inventory or callback.
             for i in 0..self.graph.len() {
@@ -1345,14 +1363,55 @@ impl<V: GraphEntry> View<'_, V> {
                 if inventory.ids[i] != id {
                     return Err(Sg0Error::Invariant);
                 }
+                let parents = vertex.graph_info().header.parents();
+                if parents.ordinary_parents().len() > silk_order::sg0_v1::SG0_V1_MAX_PARENTS {
+                    return Err(Sg0Error::InvalidParents);
+                }
+                headers.push(HeaderFacts {
+                    parents: parents.clone(),
+                    work: vertex.graph_info().header.work(),
+                });
             }
             self.budget.check().map_err(index_error)?;
             // Only the fully qualified owned snapshot is installed. No failed
             // or partial inventory escapes, nor survives this immutable View.
-            *self.inventory.borrow_mut() = Some(inventory);
+            *self.inventory.borrow_mut() = Some(ViewInventory {
+                ordinals: inventory,
+                headers,
+            });
         }
         self.budget.check().map_err(index_error)?;
         Ref::filter_map(self.inventory.borrow(), Option::as_ref).map_err(|_| Sg0Error::Invariant)
+    }
+    fn header_facts(
+        &self,
+        id: VertexId,
+    ) -> std::result::Result<Option<Ref<'_, HeaderFacts>>, Sg0Error> {
+        let inventory = self.inventory.borrow();
+        let Some(qualified) = inventory.as_ref() else {
+            return Ok(None);
+        };
+        // Keep the original per-query accounting even though owned checked
+        // bytes no longer reopen a directory page. Membership is still checked.
+        self.budget.graph_read()?;
+        let sorted = qualified
+            .sorted
+            .binary_search_by_key(&id, |position| qualified.ids[*position])
+            .map_err(|_| Sg0Error::MissingVertex)?;
+        let ordinal = qualified.sorted[sorted];
+        if let Some(bits) = self.members
+            && !self
+                .ancestry_reads
+                .borrow_mut()
+                .contains(bits, ordinal, self.budget)?
+        {
+            return Err(Sg0Error::MissingVertex);
+        }
+        Ref::filter_map(inventory, |owned| {
+            owned.as_ref().and_then(|view| view.headers.get(ordinal))
+        })
+        .map(Some)
+        .map_err(|_| Sg0Error::Invariant)
     }
     fn lookup(&self, id: VertexId) -> std::result::Result<ViewEntry<'_, V>, Sg0Error> {
         self.budget.graph_read()?;
@@ -1421,6 +1480,16 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         Ok(())
     }
     fn receiver_verified_contains(&self, id: VertexId) -> std::result::Result<bool, Sg0Error> {
+        if self.added.is_some_and(|added| added.id == id.into_bytes()) {
+            self.budget.graph_read()?;
+            return Ok(true);
+        }
+        match self.header_facts(id) {
+            Ok(Some(_)) => return Ok(true),
+            Err(Sg0Error::MissingVertex) => return Ok(false),
+            Err(error) => return Err(error),
+            Ok(None) => {}
+        }
         match self.lookup(id) {
             Ok(_) => Ok(true),
             Err(Sg0Error::MissingVertex) => Ok(false),
@@ -1428,9 +1497,23 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         }
     }
     fn parent_set(&self, id: VertexId) -> std::result::Result<Sg0ParentSetV1, Sg0Error> {
+        if let Some(added) = self.added.filter(|added| added.id == id.into_bytes()) {
+            self.budget.graph_read()?;
+            return Ok(added.header.parents().clone());
+        }
+        if let Some(header) = self.header_facts(id)? {
+            return Ok(header.parents.clone());
+        }
         Ok(self.lookup(id)?.info().header.parents().clone())
     }
     fn receiver_verified_work_be(&self, id: VertexId) -> std::result::Result<Digest, Sg0Error> {
+        if let Some(added) = self.added.filter(|added| added.id == id.into_bytes()) {
+            self.budget.graph_read()?;
+            return Ok(Uint256::from_u64(added.header.work()).to_be_bytes());
+        }
+        if let Some(header) = self.header_facts(id)? {
+            return Ok(Uint256::from_u64(header.work).to_be_bytes());
+        }
         Ok(Uint256::from_u64(self.lookup(id)?.info().header.work()).to_be_bytes())
     }
     fn vertex_data(&self, id: VertexId) -> std::result::Result<Option<Sg0VertexDataV1>, Sg0Error> {
@@ -1475,12 +1558,19 @@ impl<V: GraphEntry> ReceiverVerifiedSg0Graph for View<'_, V> {
         if self.added.is_some_and(|added| added.id == a.into_bytes()) {
             return Ok(false);
         }
-        let i = self
-            .index_reads
-            .borrow_mut()
-            .lookup(&a, self.budget)
-            .map_err(index_error)?
-            .ok_or(Sg0Error::Invariant)?;
+        let i = if let Some(inventory) = self.inventory.borrow().as_ref() {
+            let sorted = inventory
+                .sorted
+                .binary_search_by_key(&a, |position| inventory.ids[*position])
+                .map_err(|_| Sg0Error::Invariant)?;
+            inventory.sorted[sorted]
+        } else {
+            self.index_reads
+                .borrow_mut()
+                .lookup(&a, self.budget)
+                .map_err(index_error)?
+                .ok_or(Sg0Error::Invariant)?
+        };
         self.ancestry_reads
             .borrow_mut()
             .contains(&v.info().ancestors, i, self.budget)
@@ -1542,7 +1632,7 @@ mod tests {
         let sources = budget.source_calls();
         // One original metadata read per vertex; checked directory leaves
         // remain bounded and the commitment does not reopen those originals.
-        assert!(sources < 3 * 129, "checked sources={sources}");
+        assert!(sources < 2 * 129, "checked sources={sources}");
         println!(
             "synthetic_graph_order_vertices=129; checked_sources={sources}; exact_reference_snapshot=true; native_work=0; proofs=0; native_timeout_fix_unproven=true"
         );
@@ -1827,7 +1917,7 @@ mod tests {
             );
         }
         assert_eq!(view.index_reads.borrow().loads(), 0);
-        assert_eq!(view.reads.borrow().loads(), 3);
+        assert_eq!(view.reads.borrow().loads(), 2);
         assert!(view.receiver_verified_is_ancestor(id(1), id(64)).unwrap());
         assert_eq!(view.index_reads.borrow().loads(), 0);
         for label in 1..64 {

@@ -109,11 +109,39 @@ corrected script dispatched Clippy once.
 | `silk-f04-node/src/graph.rs` | `81e8172051176f2366a92ef0891011dac5a6dc009c4ae548e54eaa7dae210d3d` |
 | `silk-order/src/sg0_budgeted_v1.rs` | `3c637b83d0c37d831e6473c7d9f806e72715c4e2bba41619d93cd8a40a67013b` |
 
+## Subsequent corrected-source prefix: PASS (2026-10-04)
+
+ONE authorized execution of the exact corrected ELF passed the fresh 1,361-prefix
+gate through ordinary admission and finite checkpoint advancement: Ready,
+1,361 vertices, checkpoint 170, 1,360 executed and no active job. Fresh derived
+HEAD: `36d3a066d9bde4f9eb92dfee513e3db1e2c83da0f87b46c5c4a9fafd45d6892d`.
+The original 2s CPU/5s wall vertex and 10s checkpoint limits were unchanged.
+The outer 1,200s wall/1,000s CPU, 3GiB/no-swap, one-CPU/four-task limits held:
+test 652.70s, service 652.754s, CPU 584.663s, peak 753.7 MiB, swap zero.
+Its new filesystem was separately owned and capped; neither failed owner was
+opened or repaired. Unlike the previous preparation, formatting used nodiscard
+and retained physical allocation. No new work or payment proofs were generated.
+
+Prefix result SHA-256:
+`ca80e2ae224299b910e191dba1f0c98cb5f870869bccca288461f677cc51f4e5`.
+Prefix stdout SHA-256:
+`24bcd5869c5227e1b35b7c002f1f3b9cbdbbe31c34f27a4ed04307751ce2de35`.
+Prefix stderr SHA-256:
+`195e47ff130f1d0d5a74baa849bc43262ec6d3f75a81fa426b58331eb14ae34c`.
+Frozen corrected-source plan SHA-256:
+`2d2f1ffe3054df79c105fe8c17ae1416bf5275b1a328cf4cb004ba9307c3be5e`.
+
+This passes both former refusal points for this exact original public fixture
+and current source. It is not an all-input performance fix, a speed comparison,
+full 3,080-carrier acceptance, cold replay or whole-core completion.
+
 ## Remaining gate
 
-The corrected source has not been run through the native 1,361-prefix gate.
-That requires a newly pinned, separately authorized fresh owner and bounded
-execution decision, not reuse of either failed store or an automatic retry.
+Full 3,080 ingestion and a separately gated cold process are the next bounded
+native acceptance check; prefix success does not grant an unlimited retry loop.
+The subsequent full attempt FAILED at candidate2,449 with a CPU-only cumulative
+refusal detected at GraphOrder; cold replay did not start. See
+[the exact result and next directory-read correction](F04_GRAPH_HEADER_FACTS_V1.md).
 Full 3,080-carrier acceptance/cold replay, sustainable restart/reorg, isolated
 two-host disconnect/concurrent-branch recovery and whole-system privacy remain
 unmet integrated gates. No quota/horizon lift, consensus change, release-default
