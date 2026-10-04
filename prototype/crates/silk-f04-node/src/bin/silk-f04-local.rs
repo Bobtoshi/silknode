@@ -4,7 +4,9 @@ use silk_f04_node::{
     Digest, Error, Result,
     carriage::{Body, MAX_VERTEX_BYTES},
     genesis::Genesis,
+    history::PublicHistoryV1,
     node::{Node, NodeStatus},
+    sync::RANGE_LIMIT_V1,
 };
 use silk_sapling_f04::parameters::SaplingParameters;
 use std::{
@@ -13,11 +15,15 @@ use std::{
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::Path,
+    sync::Arc,
 };
 
 const HELP: &str = "silk-f04-local — PRIVATE VALUELESS RESEARCH ONLY
 Commands: init | reopen | ingest --vertex PATH | reconcile --max-steps 1..512
           export --index N --out NEW_FILE | mine-empty --reward-owner HEX32
+          history-resume --history-root PATH --expected-history-manifest HEX32
+          history-ingest --history-root PATH --expected-history-manifest HEX32
+            --range PATH --start N --count 1..32 --max-steps 1..512
 All commands require:
   --private-valueless --accept-genesis-trust --domain HEX32 --genesis PATH
   --store PATH --host-margin PATH
@@ -29,6 +35,13 @@ Expected domain and local head MUST come from independently retained operator
 records, never from the supplied bundle or directory. Imported archive vertices
 must enter via ingest. Reopen revalidates history and may finish a committed job;
 every successful command flushes the clock and prints a NEW local-head pin.
+Exception: history-resume reports a receiver-derived request position without
+flushing the clock. Both history commands require an independently pinned public
+manifest. history-ingest statically binds the whole bounded response before
+opening the store, then requires start to equal the receiver-derived prefix.
+Every member still uses ordinary native admission/reconciliation. A later native
+failure can retain earlier admissions; no atomic batch, automatic retry, saved
+cursor adoption or permission to reopen a failed owner is implied.
 Retain that pin outside imported inputs. A lost pin/interrupted local job needs
 explicit recovery authority; this interface never adopts an unknown head.
 Export is one full topologically indexed carrier, NOT canonical wallet order.
@@ -49,6 +62,15 @@ impl Options {
             "reconcile" => &["--max-steps"],
             "export" => &["--index", "--out"],
             "mine-empty" => &["--reward-owner"],
+            "history-resume" => &["--history-root", "--expected-history-manifest"],
+            "history-ingest" => &[
+                "--history-root",
+                "--expected-history-manifest",
+                "--range",
+                "--start",
+                "--count",
+                "--max-steps",
+            ],
             _ => return Err(Error::Invalid("unknown CLI command")),
         };
         let mut fields = BTreeMap::new();
@@ -117,7 +139,14 @@ impl Options {
         if command == "export" {
             options.number("--index", 0, 4095)?;
         }
-        if command == "reconcile" {
+        if matches!(command.as_str(), "history-resume" | "history-ingest") {
+            options.digest("--expected-history-manifest")?;
+        }
+        if command == "history-ingest" {
+            options.number("--start", 0, 4095)?;
+            options.number("--count", 1, RANGE_LIMIT_V1)?;
+        }
+        if matches!(command.as_str(), "reconcile" | "history-ingest") {
             options.number("--max-steps", 1, 512)?;
         }
         Ok(options)
@@ -262,6 +291,38 @@ fn run(options: Options) -> Result<()> {
     } else {
         None
     };
+    let history = if matches!(
+        options.command.as_str(),
+        "history-resume" | "history-ingest"
+    ) {
+        Some(PublicHistoryV1::open(
+            Path::new(options.get("--history-root")?),
+            options.digest("--expected-history-manifest")?,
+            Arc::new(genesis.clone()),
+        )?)
+    } else {
+        None
+    };
+    let response = if options.command == "history-ingest" {
+        Some(bounded_file(
+            Path::new(options.get("--range")?),
+            1 + RANGE_LIMIT_V1 * (4 + MAX_VERTEX_BYTES),
+        )?)
+    } else {
+        None
+    };
+    // Whole-response static refusal happens before parameter loading or opening
+    // any receiver store. This does NOT turn bytes into verified native work.
+    let range = response
+        .as_deref()
+        .map(|bytes| {
+            history.as_ref().expect("history input").decode_range(
+                bytes,
+                options.number("--start", 0, 4095)?,
+                options.number("--count", 1, RANGE_LIMIT_V1)?,
+            )
+        })
+        .transpose()?;
     let parameters = SaplingParameters::load(
         Path::new(options.get("--spend-params")?),
         Path::new(options.get("--output-params")?),
@@ -273,6 +334,15 @@ fn run(options: Options) -> Result<()> {
         &parameters,
         options.digest("--expected-local-head")?,
     )?;
+    if options.command == "history-resume" {
+        let history = history.as_ref().expect("history input");
+        println!(
+            "next_request_start={};source_total={};request_hint_only=true",
+            history.admitted_prefix(&node)?,
+            history.len()
+        );
+        return report(&node);
+    }
     let outcome = (|| -> Result<()> {
         match options.command.as_str() {
             "reopen" => {}
@@ -280,6 +350,31 @@ fn run(options: Options) -> Result<()> {
                 println!(
                     "ingress={:?}",
                     node.ingest(vertex.as_deref().expect("ingest input"), &parameters)?
+                );
+            }
+            "history-ingest" => {
+                let history = history.as_ref().expect("history input");
+                if history.admitted_prefix(&node)? != options.number("--start", 0, 4095)? {
+                    return Err(Error::Invalid(
+                        "history request is not receiver-derived prefix",
+                    ));
+                }
+                for carrier in range.as_ref().expect("history range").carriers() {
+                    println!("ingress={:?}", node.ingest(carrier, &parameters)?);
+                    for _ in 0..options.number("--max-steps", 1, 512)? {
+                        if node.status()? == NodeStatus::Ready {
+                            break;
+                        }
+                        node.advance()?;
+                    }
+                    if node.status()? != NodeStatus::Ready {
+                        return Err(Error::Paused("history receiver needs reconciliation"));
+                    }
+                }
+                println!(
+                    "next_request_start={};source_total={};request_hint_only=true",
+                    history.admitted_prefix(&node)?,
+                    history.len()
                 );
             }
             "reconcile" => {
@@ -347,8 +442,13 @@ fn main() {
 }
 
 #[cfg(test)]
+#[path = "../../tests/common/mod.rs"]
+mod common;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest as _, Sha256};
     fn init() -> Vec<String> {
         [
             "init",
@@ -385,6 +485,116 @@ mod tests {
         let mut a = init();
         a.push("--historical".into());
         assert!(Options::parse(&a).is_err());
+    }
+    fn history_options(command: &str) -> Vec<String> {
+        let mut args = init();
+        args[0] = command.into();
+        args.extend(
+            [
+                "--operator-retained-local",
+                "--expected-local-head",
+                &"34".repeat(32),
+                "--spend-params",
+                "missing-spend",
+                "--output-params",
+                "missing-output",
+                "--history-root",
+                "history",
+                "--expected-history-manifest",
+                &"56".repeat(32),
+            ]
+            .iter()
+            .map(|s| (*s).to_owned()),
+        );
+        if command == "history-ingest" {
+            args.extend(
+                [
+                    "--range",
+                    "response",
+                    "--start",
+                    "0",
+                    "--count",
+                    "4",
+                    "--max-steps",
+                    "386",
+                ]
+                .iter()
+                .map(|s| (*s).to_owned()),
+            );
+        }
+        args
+    }
+    #[test]
+    fn history_commands_require_pins_exact_bounds_and_no_peer_cursor() {
+        assert!(Options::parse(&history_options("history-resume")).is_ok());
+        assert!(Options::parse(&history_options("history-ingest")).is_ok());
+        for (key, value) in [
+            ("--start", "4096"),
+            ("--start", "00"),
+            ("--count", "0"),
+            ("--count", "33"),
+            ("--max-steps", "0"),
+        ] {
+            let mut args = history_options("history-ingest");
+            let at = args.iter().position(|a| a == key).unwrap();
+            args[at + 1] = value.into();
+            assert!(Options::parse(&args).is_err());
+        }
+        let mut args = history_options("history-resume");
+        args.extend(["--start".into(), "4".into()]);
+        assert!(Options::parse(&args).is_err());
+        let mut args = history_options("history-ingest");
+        args.extend(["--peer-cursor".into(), "4".into()]);
+        assert!(Options::parse(&args).is_err());
+    }
+    #[test]
+    fn history_partial_response_refuses_before_receiver_or_parameter_open() {
+        let temp = std::env::var_os("SILK_F04_ANCESTRY_TEST_PARENT").map_or_else(
+            || tempfile::tempdir().unwrap(),
+            |path| tempfile::tempdir_in(path).unwrap(),
+        );
+        let genesis = common::fixture(&[10]).genesis;
+        let mut manifest = Vec::from(b"SNF04HF1".as_slice());
+        manifest.extend_from_slice(&genesis.domain());
+        manifest.extend_from_slice(&Sha256::digest(genesis.local_bundle()));
+        manifest.extend_from_slice(&[0; 96]);
+        manifest.extend_from_slice(&1_u32.to_le_bytes());
+        manifest.extend_from_slice(&[0; 4]);
+        manifest.extend_from_slice(&[1; 32]);
+        manifest.extend_from_slice(&[2; 32]);
+        manifest.extend_from_slice(&720_u32.to_be_bytes());
+        std::fs::write(temp.path().join("history.manifest"), &manifest).unwrap();
+        std::fs::write(temp.path().join("genesis.bundle"), genesis.local_bundle()).unwrap();
+        std::fs::write(temp.path().join("response"), [1, 0, 0, 2, 208]).unwrap();
+        let mut options = Options::parse(&history_options("history-ingest")).unwrap();
+        for (key, value) in [
+            ("--domain", hex::encode(genesis.domain())),
+            (
+                "--expected-history-manifest",
+                hex::encode(Sha256::digest(&manifest)),
+            ),
+            ("--history-root", temp.path().display().to_string()),
+            (
+                "--genesis",
+                temp.path().join("genesis.bundle").display().to_string(),
+            ),
+            (
+                "--range",
+                temp.path().join("response").display().to_string(),
+            ),
+            (
+                "--store",
+                temp.path().join("never-opened").display().to_string(),
+            ),
+        ] {
+            options.fields.insert(key.into(), value);
+        }
+        let outcome = run(options);
+        assert!(
+            matches!(outcome, Err(Error::Invalid("sync range truncated"))),
+            "{outcome:?}"
+        );
+        assert!(!temp.path().join("never-opened").exists());
     }
     #[test]
     fn bounded_input_and_create_new_output_refuse_aliases_or_overwrite() {
