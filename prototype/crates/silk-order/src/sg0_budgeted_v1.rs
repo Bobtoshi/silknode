@@ -57,12 +57,16 @@ pub fn derive_virtual_order_chain_fast_v1(
     let mut cursor = Some(root);
     let mut selected_parent = Sg0SelectedParentV1::Anchor;
     let mut eligible_work = Uint256::ZERO;
+    // Only compact, freshly recurrence-checked chain facts survive this walk.
+    // No payloads, merge lists, imported metadata or cross-operation authority.
+    let mut facts = Vec::with_capacity(vertices.len());
     while let Some(vertex) = cursor {
         if eligible_order.len() == vertices.len() {
             return Err(Sg0Error::Cycle);
         }
+        let vertex_work = work(graph, vertex)?;
         eligible_work = eligible_work
-            .checked_add(work(graph, vertex)?)
+            .checked_add(vertex_work)
             .ok_or(Sg0Error::WorkOverflow)?;
         let data = metadata(graph, vertex)?;
         let score = u128::try_from(eligible_order.len())
@@ -78,6 +82,14 @@ pub fn derive_virtual_order_chain_fast_v1(
         {
             return Err(Sg0Error::Invariant);
         }
+        facts.push(ChainCommitmentFact {
+            id: vertex,
+            parent: selected_parent,
+            work: vertex_work,
+            merge: data.merge_order_commitment,
+            score: data.blue_score,
+            blue_work: data.blue_work,
+        });
         eligible_order.push(vertex);
         selected_parent = Sg0SelectedParentV1::Vertex(vertex);
         cursor = children.remove(&vertex);
@@ -90,8 +102,9 @@ pub fn derive_virtual_order_chain_fast_v1(
         .iter()
         .map(|id| (*id, Sg0Color::Blue))
         .collect();
+    facts.sort_unstable_by_key(|fact| fact.id);
     Ok(Sg0OrderSnapshotV1 {
-        graph_commitment: graph_commitment(graph, &vertices)?,
+        graph_commitment: chain_graph_commitment(&facts)?,
         selected_tip: eligible_order.last().copied(),
         total_order_commitment: colored_commitment(TOTAL_ORDER_COMMITMENT_DOMAIN, &colored)?,
         eligible_order_commitment: ids_commitment(
@@ -108,6 +121,46 @@ pub fn derive_virtual_order_chain_fast_v1(
         eligible_order,
         eligible_work,
     })
+}
+
+// Parent edges were fully checked before the walk; each ordinary single parent
+// equals the recurrence's selected parent. Thus these fields reproduce exactly
+// the reference graph_commitment encoding without rereading verified sources.
+struct ChainCommitmentFact {
+    id: VertexId,
+    parent: Sg0SelectedParentV1,
+    work: Uint256,
+    merge: Hash32,
+    score: u128,
+    blue_work: Uint256,
+}
+fn chain_graph_commitment(facts: &[ChainCommitmentFact]) -> Result<Hash32, Sg0Error> {
+    let mut hash = Sha256::new();
+    hash.update(GRAPH_COMMITMENT_DOMAIN);
+    update_len(&mut hash, facts.len())?;
+    for fact in facts {
+        hash.update(fact.id.as_bytes());
+        match fact.parent {
+            Sg0SelectedParentV1::Anchor => hash.update([0]),
+            Sg0SelectedParentV1::Vertex(parent) => {
+                hash.update([1]);
+                update_len(&mut hash, 1)?;
+                hash.update(parent.as_bytes());
+            }
+        }
+        hash.update(fact.work.to_be_bytes());
+        match fact.parent {
+            Sg0SelectedParentV1::Anchor => hash.update([0]),
+            Sg0SelectedParentV1::Vertex(parent) => {
+                hash.update([1]);
+                hash.update(parent.as_bytes());
+            }
+        }
+        hash.update(fact.merge.as_bytes());
+        hash.update(fact.score.to_le_bytes());
+        hash.update(fact.blue_work.to_be_bytes());
+    }
+    Ok(Hash32::new(hash.finalize().into()))
 }
 
 /// Indexed receiver adapter whose individual reads are independently bounded.

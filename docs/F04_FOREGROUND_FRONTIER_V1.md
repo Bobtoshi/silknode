@@ -144,8 +144,11 @@ No full 3,080-carrier comparison or second cold process followed that failure.
 
 The new ignored test
 `node::historical_tests::historical_foreground_diagnostic_prefix_1361_fresh_node`
-is **compiled only, NOT executed**. It needs an independently reviewed outer
-execution decision, not merely a flag or source review. It proposes ingesting
+was initially compiled only. ONE separately authorized execution subsequently
+FAILED at candidate 1,233 with a CPU-only cumulative refusal detected at
+`GraphOrder`; see [the exact result and subsequent source correction](F04_GRAPH_ORDER_FACTS_V1.md).
+The following describes its original scope, not authorization for another run.
+It attempts ingesting
 ONLY the first 1,361 exact public carriers into an independently owned fresh
 node through ordinary admission and bounded checkpoint advancement. It never
 opens the failed store or uses historical saved validity. On refusal it prints
@@ -153,13 +156,13 @@ ordinal, carrier SHA, original error and any first cooperative failure report.
 On success it requires Ready, 1,361 vertices, checkpoint 170, 1,360 executed and
 no active job; the fresh HEAD is an observation, not imported pin authority.
 
-The proposed outer contract is ONE new capped 1 GiB filesystem; one sequential
+The executed outer contract was ONE new capped 1 GiB filesystem; one sequential
 UID1000 test child; 3 GiB RAM, no swap, one-CPU quota, four tasks; shared 1,200s
 wall and 1,000s child CPU ceilings; no restart, network or listeners; read-only
 exact pinned public corpus/parameters/ELF; only that new filesystem writable;
 the original separate host reserve and all per-job limits unchanged. No volume
-creation or native dispatch follows from this proposal. Exact source, launcher,
-input, parameter and ELF pins must be bound before approval. Failure preserves
+creation or further native dispatch follows from this description. Exact source,
+launcher, input, parameter and ELF pins were bound before approval. Failure preserves
 the new owner and evidence with no retry. This is materially expanded native
 verification, not one of the seventeen minimal source checks.
 

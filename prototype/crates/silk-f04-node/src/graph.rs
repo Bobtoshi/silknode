@@ -1359,12 +1359,22 @@ impl<V: GraphEntry> View<'_, V> {
         if let Some(v) = self.added.filter(|v| v.id == id.into_bytes()) {
             return Ok(ViewEntry::Added(v));
         }
-        let i = self
-            .index_reads
-            .borrow_mut()
-            .lookup(&id, self.budget)
-            .map_err(index_error)?
-            .ok_or(Sg0Error::MissingVertex)?;
+        let i = if let Some(inventory) = self.inventory.borrow().as_ref() {
+            // Only installed after whole index/directory qualification. Owned
+            // immutable operation bytes replace redundant index leaf reads.
+            let position = inventory
+                .sorted
+                .binary_search_by_key(&id, |position| inventory.ids[*position])
+                .map_err(|_| Sg0Error::MissingVertex)?;
+            inventory.sorted[position]
+        } else {
+            // Incremental sealing may query before inventory is requested.
+            self.index_reads
+                .borrow_mut()
+                .lookup(&id, self.budget)
+                .map_err(index_error)?
+                .ok_or(Sg0Error::MissingVertex)?
+        };
         let vertex = self
             .reads
             .borrow_mut()
@@ -1489,6 +1499,92 @@ fn index_error(error: Error) -> Sg0Error {
 mod tests {
     use super::*;
     use crate::carriage::{Body, Header};
+
+    #[test]
+    fn graph_order_scoped_chain_facts_match_reference_and_refuse_fresh_damage() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let setup = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic shuffled chain facts")
+            .unwrap();
+        let mut previous = None;
+        let mut expected = Vec::new();
+        // ID order deliberately differs from append/ancestry order across
+        // three directory leaves; there is no native work or proof generation.
+        for position in 0..129_u16 {
+            let label = u8::try_from((position * 53) % 129 + 1).unwrap();
+            let parents = previous.into_iter().collect::<Vec<_>>();
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, &parents), &setup)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            store.commit(&[&record], b"synthetic chain head").unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            prepared
+                .retain_ancestry(&graph, &mut store, &setup)
+                .unwrap();
+            graph.publish_checked(prepared, &setup).unwrap();
+            expected.push(id(label));
+            previous = Some(label);
+        }
+        let original = JobBudget::checkpoint().unwrap();
+        let reference =
+            silk_order::sg0_v1::derive_virtual_order(&View::new(&graph, None, None, &original))
+                .unwrap();
+        let budget = JobBudget::vertex().unwrap();
+        let actual = graph.order(&budget).unwrap();
+        assert_eq!(actual, reference);
+        assert_eq!(actual.eligible_order(), expected);
+        let sources = budget.source_calls();
+        // One original metadata read per vertex; checked directory leaves
+        // remain bounded and the commitment does not reopen those originals.
+        assert!(sources < 3 * 129, "checked sources={sources}");
+        println!(
+            "synthetic_graph_order_vertices=129; checked_sources={sources}; exact_reference_snapshot=true; native_work=0; proofs=0; native_timeout_fix_unproven=true"
+        );
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(graph.order(&expired).is_err());
+        let target = graph.get_owned(expected[128], None).unwrap();
+        let source = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(target.info.retained_source.as_ref().unwrap().id)
+        ));
+        let held = source.with_extension("held");
+        std::fs::rename(&source, &held).unwrap();
+        assert!(graph.order(&JobBudget::checkpoint().unwrap()).is_err());
+        std::fs::rename(&held, &source).unwrap();
+        let branch_budget = JobBudget::checkpoint().unwrap();
+        let branch = diamond(&branch_budget);
+        assert_eq!(
+            branch.order(&branch_budget).unwrap(),
+            silk_order::sg0_v1::derive_virtual_order(&View::new(
+                &branch,
+                None,
+                None,
+                &branch_budget,
+            ))
+            .unwrap()
+        );
+        // Exact staged order includes the freshly sealed vertex as before.
+        let prepared = graph
+            .seal(synthetic_vertex(&graph, 200, &[previous.unwrap()]), &setup)
+            .unwrap();
+        let staged = graph.order_with(&prepared, &setup).unwrap();
+        assert_eq!(
+            staged,
+            silk_order::sg0_v1::derive_virtual_order(&View::new(
+                &graph,
+                Some(&prepared.vertex().info),
+                None,
+                &setup,
+            ))
+            .unwrap()
+        );
+    }
 
     #[test]
     fn ancestor_query_matches_original_branch_relations_and_strict_self_rules() {
@@ -1730,10 +1826,10 @@ mod tests {
                 Uint256::from_u64(1).to_be_bytes()
             );
         }
-        assert_eq!(view.index_reads.borrow().loads(), 2);
+        assert_eq!(view.index_reads.borrow().loads(), 0);
         assert_eq!(view.reads.borrow().loads(), 3);
         assert!(view.receiver_verified_is_ancestor(id(1), id(64)).unwrap());
-        assert_eq!(view.index_reads.borrow().loads(), 2);
+        assert_eq!(view.index_reads.borrow().loads(), 0);
         for label in 1..64 {
             assert!(
                 view.receiver_verified_is_ancestor(id(label), id(64))
