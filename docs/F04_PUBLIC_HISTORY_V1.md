@@ -4,12 +4,15 @@ Received transport responses can now use `PublicHistoryV1::decode_range` to
 bind every unverified carrier to the exact requested window of this pinned
 manifest before ordinary node ingestion. Bare `RangeBatchV1::decode` remains
 framing-only. See [the receive binding](F04_PINNED_RANGE_RECEIVE_V1.md) for the
-implemented boundary, focused evidence and still-unproven two-host gate.
+implemented boundary, focused evidence and still-unproven native-peer gate.
 
 `PublicHistoryV1::admitted_prefix(&Node)` derives a read-only request position
 from the receiver's freshly checked retained membership and original bytes,
 not a saved cursor or peer count. See [the receiver-prefix slice](F04_RECEIVER_RESUME_PREFIX_V1.md)
 for its bounded four-carrier/cold-query evidence and remaining transport gates.
+The [private operator integration](F04_HISTORY_OPERATOR_V1.md) subsequently
+passed eight-carrier interrupted SSH static delivery, receiver-derived resumed
+admission and fresh cold checkpoint/state parity, not P2P/competing-peer acceptance.
 
 `silk_f04_node::history::PublicHistoryV1` distributes full public carrier bytes
 through the existing range codec. It is not a node-store importer, a verified

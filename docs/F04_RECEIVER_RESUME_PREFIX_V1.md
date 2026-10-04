@@ -103,9 +103,11 @@ identity or independent review.
 
 ## Remaining boundaries
 
-This proves only a bounded four-carrier local receiver/cold-query mechanism,
-not transport interruption or continuation over two hosts. Full3080 prefix
-query cost under the unchanged allowance, subsequent resumed native ingestion,
+This source32 result proves only a bounded four-carrier local receiver/cold-query
+mechanism. Later [operator integration](F04_HISTORY_OPERATOR_V1.md) separately
+passed interrupted SSH static-source delivery, resumed ordinary ingestion to8
+and cold checkpoint/state parity. It does not prove native P2P/competing peers.
+Full3080 prefix query cost under the unchanged allowance, native peer transport,
 network churn/preferred-branch convergence and sustainable operation beyond4096
 remain UNPROVEN. The previous full3080/cold evidence belongs to its exact earlier
 ELF, not this new source. See [that report](F04_NATIVE_HISTORY_RESTART_V1.md).

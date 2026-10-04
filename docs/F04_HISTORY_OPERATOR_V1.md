@@ -71,10 +71,11 @@ corrected partial-case receipt SHA:
 production-span lint receipt SHA:
 `0e89a7bf911278c4cfef3df99852093efa6f59d4a76290eab4c855e105a14991`.
 
-## Concrete unmet integration gate
+## Frozen SSH integration plan
 
 Native execution of these new commands and host-separated interrupted delivery
-remain pending at this source milestone. The frozen next check uses only eight
+were pending at source milestone `a4dc0c1`; the subsequent result is below.
+The frozen check uses only eight
 existing public carriers in two four-carrier frames, not another3080 replay.
 The static public source is `/var/tmp/silknode-public-range-source.TYUMUg` on
 existing host `v2202607383485485163`; it serves bytes through existing authenticated
@@ -111,3 +112,69 @@ SSH/static distribution can demonstrate this limited core receiving path, not
 native P2P transport acceptance, two independently operating consensus peers,
 concurrent branches/churn, sustainable operation beyond4096, privacy/speed,
 wallet recovery or production/release readiness.
+
+## Completed bounded SSH/operator sequence
+
+The exact published source `a4dc0c105cb1cd1898a2a9919740f951a53b192f` and frozen
+production ELF above PASSED the one planned eight-phase sequence. This is an
+actual host-separated SSH static-source/operator receiving path, not two native
+consensus peers or P2P acceptance. The source and receiver host names differed;
+all native work remained on the isolated research receiver. No new listener,
+service, spend, mining, payment proof generation or secret transfer occurred.
+
+The manifest and both full frames were delivered from the static source host
+through existing SSH. After ordinary first-batch admission, the receiver was
+Ready with four records and external HEAD
+`6f956cb1128db732f57e2f1b16b5847ad0efc1de067ad592a186bf2a28922c84`.
+The second stream was cut by terminating the exact owned SSH client only after
+the receiver confirmed1448 bytes. SSH exited255; the bounded byte collector
+preserved those bytes and exited0, NOT native acceptance. Incomplete SHA:
+`6d14bb5efd8c66441fe3ca3424f6a7f0980430ff301e80a146897ebc1a852714`.
+The CLI rejected it as truncated before parameters/store opening. An external
+before/after digest inventory confirmed every receiver-store file byte unchanged.
+No failed native job was created or retried.
+
+A fresh pinned process derived4 without previous recovery or clock flush. A
+start0 replay request was then rejected because it was not the receiver-derived
+prefix; no duplicate admission or new HEAD followed. A separately delivered
+complete second frame used a new file, preserving the incomplete evidence.
+Four more ordinary admissions/reconciliations produced Ready8 and one checkpoint.
+A final fresh pinned process again derived8 and reproduced the same semantic
+report and HEAD, without previous recovery:
+
+- HEAD: `a516d0e9114aaeb3f069ae9322b85d2e9012f26453b2c8a377098e67b946b9f1`.
+- Checkpoint1: `3caf1cfe23125f98eafb5ac8d7f0b89331e20ad1d077c4517dfb8b204c66ae96`.
+- State digest: `eb187fc8220b31814c44c0b9fe7f77fc5920a13214aadc2b4dbf49fd75bcdd38`.
+- Public report: leaves4/pool299/burned1/eligible-cut0, equal before/after cold
+  reopening. These are valueless fixture results, not production monetary rules.
+
+All eight phase checks passed; two nonzero CLI exits were the expected truncated
+and wrong-prefix refusals. Combined systemd service CPU15.258s/wall15.497s;
+reported peak at most324.2M and swap zero. These sums exclude SSH orchestration
+and transfer time, and are not a network throughput or privacy benchmark.
+The unchanged phase/per-vertex/checkpoint bounds were respected. No full3080
+replay was repeated or earlier full-history result transferred to this ELF.
+
+Read-only closeout confirmed UID1000 processes reaped, all eight outer intents
+closed, no receiver ACTIVE_JOB/ACTIVE_REPLAY, four earlier failed64-byte markers
+preserved, protected original image size/blocks/mtime/ctime unchanged, and only
+the original SSH listeners on the research host. The exact owned local SSH
+clients and source transfer command were also reaped. New successful receiver,
+static source and incomplete public response remain preserved; no repair or
+adoption of any failed historical owner occurred.
+
+Combined result/closeout receipt SHA:
+`e7e59a32c691e176a632eece1de7a250ac1d8f110ee9439fb45ac967afdabf34`.
+Final cold phase receipt SHA:
+`db52951bf78a5625946cd281e4a39f01c68dd995e8b475a2eb828ee536596d9c`.
+Partial refusal receipt SHA:
+`a4bfb1303d51aa19ce4bdcff7520caab4df035f46353757215f016abeca87298`.
+Interrupted transfer receipt SHA:
+`b4c6be258f065a8bf606e324e1a0597b949b02b090674c1b918fa7d746f6b131`.
+Mac public-byte FIFO orchestration script SHA:
+`a66076efc6851b287dbc445ddb83de6189e601c5b54382b638a4fc97e67238fb`.
+
+Native P2P transport, continuous competing peers/branches/churn, full3080 prefix
+cost, sustainable history beyond4096, wallet recovery, practical speed/privacy
+and whole-core/security/release acceptance remain UNPROVEN. Source-only review
+or this bounded receipt does not independently establish those claims.

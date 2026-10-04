@@ -89,8 +89,10 @@ See [the receiver-prefix evidence](F04_RECEIVER_RESUME_PREFIX_V1.md). This does
 not establish two-host transport or resumed native continuation.
 
 The source/window binding primitive is implemented for independently written
-transport modules. Actual isolated two-host interruption, receiver restart/resume,
-preferred-branch convergence and churn remain UNPROVEN. Sustainable operation
+transport modules. Later [operator integration](F04_HISTORY_OPERATOR_V1.md)
+passed a bounded interrupted SSH static-source/eight-carrier receiving sequence
+and fresh cold continuation/state parity. Native P2P/independently operating
+peers, preferred-branch convergence and churn remain UNPROVEN. Sustainable operation
 beyond4096, privacy/practical speed, wallet-key recovery and whole-core/security/
 release readiness are also not established. No profile is activated or higher
 horizon supported merely because this static slice passed.
