@@ -1,5 +1,9 @@
 # F0.4 qualified operation-owned graph header facts
 
+This is the original source-slice report. Later native execution evidence is
+recorded separately in [the history/restart report](F04_NATIVE_HISTORY_RESTART_V1.md);
+the historical failures and source-slice-only claims below are preserved.
+
 This source slice removes another repeated checked-directory read path during
 ordering. It preserves canonical fields and mandatory validation, but does not
 yet prove the failed full-history native gate is fixed.

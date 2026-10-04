@@ -1,5 +1,9 @@
 # F0.4 operation-owned chain commitment facts
 
+Later execution of the header-facts correction is recorded separately in
+[the history/restart report](F04_NATIVE_HISTORY_RESTART_V1.md). The original
+source-slice and preceding execution evidence below remain historical records.
+
 This slice removes duplicate checked reads in graph ordering. It follows a
 failed native foreground diagnostic; it does not prove that failure is fixed.
 
