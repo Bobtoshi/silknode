@@ -1,6 +1,8 @@
 //! Bounded genuine valueless fork over isolated copies, not default activation.
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, path::PathBuf};
+static RETAINED_ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
 
 fn fixture_digest(name: &str) -> Digest {
     hex::decode(std::env::var(name).unwrap())
@@ -13,6 +15,17 @@ fn reconcile(node: &mut Node) {
     for _ in 0..8 {
         if node.status().unwrap() == Status::Ready {
             return;
+        }
+        if std::env::var("SILK_F04_RETAINED_MUTATION_GATE").as_deref() == Ok("1") {
+            let step = node
+                .core
+                .prepare_step(&JobBudget::checkpoint().unwrap())
+                .unwrap();
+            if step.rollback && step.state.checkpoint_index() > 0 {
+                assert_eq!(step.state.retained_payload_layout(), [true; 6]);
+                assert_eq!(step.state.staged_payload_counts(), [0; 6]);
+                RETAINED_ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+            }
         }
         node.advance().unwrap();
     }
@@ -117,6 +130,29 @@ fn parent_preparation_and_existing_work_profile() {
 }
 
 #[test]
+#[ignore = "new retained mutation/rollback gate; authenticated saved public fork carriers only, no mining/proof generation"]
+fn retained_payment_mutation_and_real_fork_rollback_saved_carriers() {
+    assert_eq!(
+        std::env::var("SILK_F04_RETAINED_MUTATION_GATE").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::env::var("SILK_F04_REUSE_SAVED_SIBLING").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::env::var("SILK_F04_REUSE_SAVED_MERGE").as_deref(),
+        Ok("1")
+    );
+    RETAINED_ROLLBACKS.store(0, Ordering::SeqCst);
+    genuine_fork_merge_reorganises_checkpoint_and_reopens_identically();
+    assert!(RETAINED_ROLLBACKS.load(Ordering::SeqCst) > 0);
+    println!(
+        "retained_payment_mutation=true; retained_real_fork_rollback=true; rollback_original_payloads_materialized=false; authenticated_existing_carriers_only=true; newly_mined=0; newly_generated_proofs=0; two_receivers_same_host=true; same_process_cold_reopen=true; separate_process_cold_success=false"
+    );
+}
+
+#[test]
 #[ignore = "isolated authenticated 16/15-vertex copies; two new empty-body vertices, externally enforced remaining original 120s/3GB bound"]
 fn genuine_fork_merge_reorganises_checkpoint_and_reopens_identically() {
     assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
@@ -156,6 +192,47 @@ fn genuine_fork_merge_reorganises_checkpoint_and_reopens_identically() {
     assert_eq!(a.core.state.checkpoint_id(), old_checkpoint);
     assert_eq!(b.vertex_count(), 15);
     assert_eq!(b.core.state.checkpoint_index(), 1);
+    if std::env::var("SILK_F04_RETAINED_MUTATION_GATE").as_deref() == Ok("1") {
+        let prior = a
+            .core
+            .retained_history_for_test()
+            .find(|state| state.checkpoint_index() == 1)
+            .unwrap()
+            .clone();
+        let bodies = original[8..16]
+            .iter()
+            .map(|id| {
+                a.core
+                    .graph
+                    .load_for_execution(*id, &genesis, &JobBudget::checkpoint().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let batch = bodies
+            .iter()
+            .map(Arc::as_ref)
+            .collect::<Vec<_>>()
+            .try_into()
+            .ok()
+            .unwrap();
+        let scratch = prior
+            .execute(batch, &JobBudget::checkpoint().unwrap())
+            .unwrap();
+        let accepted = scratch
+            .outcomes
+            .iter()
+            .filter(|outcome| **outcome == crate::state::EffectOutcome::Accepted)
+            .count();
+        assert_eq!(scratch.state.manifest(), a.core.state.manifest());
+        assert_eq!(scratch.state.retained_payload_layout(), [true; 6]);
+        assert_eq!(
+            &scratch.state.staged_payload_counts()[2..],
+            &[accepted * 2, accepted, 8, 8]
+        );
+        prior
+            .qualify_ledger_checked(&JobBudget::checkpoint().unwrap())
+            .unwrap();
+    }
     let second = Candidate::decode(&a.export_range(15, 1).unwrap()[0], &genesis).unwrap();
     assert_eq!(VertexId::from_bytes(second.id), original[15]);
     let parents = Sg0ParentSetV1::vertices(vec![original[14]]).unwrap();

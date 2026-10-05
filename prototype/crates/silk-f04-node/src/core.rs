@@ -302,7 +302,7 @@ impl Core {
             let state = selected.unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
             // A cached reversible snapshot is not permission to publish a
             // rollback whose original ledger pages are now unreadable.
-            let state = Arc::new(state.materialize_ledger(Some(budget))?);
+            state.qualify_ledger_checked(budget)?;
             let derived_status =
                 status_from_prefix(state.executed_len(), state.executed_len(), inspection.count);
             let status = if derived_status == Status::Ready {

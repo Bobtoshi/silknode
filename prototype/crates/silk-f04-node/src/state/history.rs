@@ -17,11 +17,107 @@ pub(super) trait Item: Clone {
     const WIDTH: usize;
     fn encode(&self, bytes: &mut Vec<u8>);
     fn decode(bytes: &[u8]) -> Result<Self>;
+    fn retain_page(store: &mut Store, bytes: &[u8]) -> Result<Digest> {
+        store.retain_ledger_history_page(bytes)
+    }
+    fn validate_encoded(bytes: &[u8]) -> Result<()> {
+        Self::decode(bytes).map(drop)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_appends_match_literal_pages_for_all_four_codecs_and_refuse_old_tail() {
+        fn check<T: Item + PartialEq>(rows: Vec<T>) {
+            let (temp, mut store) = crate::store::ancestry_test_store();
+            let budget = JobBudget::checkpoint().unwrap();
+            store.begin_replay(b"synthetic retained append").unwrap();
+            let mut literal = LedgerHistory::new(256);
+            for row in &rows[..129] {
+                literal.push(row.clone()).unwrap();
+            }
+            let base = literal.retain(&mut store, [19; 32], &budget).unwrap();
+            let ids = base.retained_ids();
+            let mut staged = base.clone();
+            for row in &rows[129..] {
+                staged.push(row.clone()).unwrap();
+                literal.push(row.clone()).unwrap();
+            }
+            assert_eq!(staged.retained_ids(), ids);
+            assert_eq!(base.len(), 129);
+            assert!(!staged.is_materialized());
+            assert!(
+                staged
+                    .materialize(Some(&budget))
+                    .unwrap()
+                    .iter()
+                    .eq(literal.iter())
+            );
+            let stored = staged.retain(&mut store, [19; 32], &budget).unwrap();
+            let oracle = literal.retain(&mut store, [19; 32], &budget).unwrap();
+            assert_eq!(stored.retained_ids(), oracle.retained_ids());
+            assert_eq!(&stored.retained_ids()[..2], &ids[..2]);
+            assert_ne!(stored.retained_ids()[2], ids[2]);
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(ids[2])));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(staged.materialize(Some(&budget)).is_err());
+            assert!(staged.retain(&mut store, [19; 32], &budget).is_err());
+            std::fs::rename(&held, &path).unwrap();
+            assert_eq!(
+                staged
+                    .retain(&mut store, [19; 32], &budget)
+                    .unwrap()
+                    .retained_ids(),
+                oracle.retained_ids()
+            );
+            assert!(staged.retain(&mut store, [20; 32], &budget).is_err());
+            assert_eq!(store.head(), None);
+        }
+        check(
+            (0..193_u16)
+                .map(|index| {
+                    let mut id = [0; 32];
+                    id[..2].copy_from_slice(&index.to_le_bytes());
+                    VertexId::from_bytes(id)
+                })
+                .collect(),
+        );
+        check(
+            (0..193_u16)
+                .map(|index| {
+                    let mut row = [0; 112];
+                    row[..2].copy_from_slice(&index.to_le_bytes());
+                    row
+                })
+                .collect(),
+        );
+        check(
+            (0..193_u16)
+                .map(|index| {
+                    Arc::new(AcceptedOutputs {
+                        effect: [index as u8; 32],
+                        first_position: u64::from(index) * 2,
+                        commitments: [[1; 32], [2; 32]],
+                    })
+                })
+                .collect(),
+        );
+        check(
+            (0..193_u16)
+                .map(|index| {
+                    let mut row = [0; silk_sapling_f04::codec::RECOVERY_BYTES];
+                    row[..2].copy_from_slice(&index.to_le_bytes());
+                    Arc::new(row)
+                })
+                .collect(),
+        );
+    }
     fn links(count: usize) -> LedgerHistory<Arc<AcceptedOutputs>> {
         // Synthetic storage rows ONLY, not accepted economic effects.
         let mut rows = LedgerHistory::new(256);
@@ -283,6 +379,8 @@ pub(super) struct Retained<T> {
     domain: Digest,
     reader: Arc<ObjectReader>,
     item: PhantomData<T>,
+    // Only newly derived rows live here; immutable historical payloads stay on disk.
+    appended: PagedSequence<T>,
 }
 #[derive(Clone)]
 pub(super) enum LedgerHistory<T: Item> {
@@ -308,6 +406,13 @@ impl<T: Item + PartialEq> PrefixComparison<'_, T> {
                 .cloned()
                 .ok_or(Error::Unavailable("ledger comparison ordinal")),
             LedgerHistory::Retained(rows) => {
+                if position >= rows.len {
+                    return rows
+                        .appended
+                        .get(position - rows.len)
+                        .cloned()
+                        .ok_or(Error::Unavailable("ledger comparison ordinal"));
+                }
                 let ordinal = position / ITEMS;
                 if self
                     .page
@@ -380,7 +485,7 @@ impl<T: Item + PartialEq> PrefixComparison<'_, T> {
             self.load(position, budget)?;
         }
         if let LedgerHistory::Retained(rows) = self.history
-            && (rows.len > rows.limit || rows.pages.len() != rows.len.div_ceil(ITEMS))
+            && (self.history.len() > rows.limit || rows.pages.len() != rows.len.div_ceil(ITEMS))
         {
             return Err(Error::Unavailable("retained history directory length"));
         }
@@ -405,10 +510,10 @@ impl<T: Item> LedgerHistory<T> {
     pub(super) const fn len(&self) -> usize {
         match self {
             Self::Resident(rows) => rows.len(),
-            Self::Retained(rows) => rows.len,
+            Self::Retained(rows) => rows.len + rows.appended.len(),
         }
     }
-    fn resident(&self) -> &PagedSequence<T> {
+    pub(super) fn resident(&self) -> &PagedSequence<T> {
         match self {
             Self::Resident(rows) => rows,
             Self::Retained(_) => panic!("borrowed history access requires materialized snapshot"),
@@ -416,6 +521,9 @@ impl<T: Item> LedgerHistory<T> {
     }
     pub(super) fn iter(&self) -> impl Iterator<Item = &T> {
         self.resident().iter()
+    }
+    pub(super) fn get(&self, index: usize) -> Option<&T> {
+        self.resident().get(index)
     }
     pub(super) fn iter_from(&self, start: usize) -> Result<impl Iterator<Item = &T>> {
         self.resident().iter_from(start)
@@ -435,9 +543,7 @@ impl<T: Item> LedgerHistory<T> {
     pub(super) fn push(&mut self, value: T) -> Result<()> {
         match self {
             Self::Resident(rows) => rows.push(value),
-            Self::Retained(_) => Err(Error::Unavailable(
-                "materialize history before reducer mutation",
-            )),
+            Self::Retained(rows) => rows.appended.push(value),
         }
     }
     pub(super) const fn cache_charge(&self) -> usize {
@@ -445,8 +551,9 @@ impl<T: Item> LedgerHistory<T> {
             Self::Resident(rows) => rows.cache_charge(),
             // Keep the original full payload/view charge, not a larger cache cap.
             Self::Retained(rows) => {
-                rows.len.div_ceil(ITEMS) * (ITEMS * std::mem::size_of::<T>() + 128)
-                    + rows.len * std::mem::size_of::<T>()
+                let len = rows.len + rows.appended.len();
+                len.div_ceil(ITEMS) * (ITEMS * std::mem::size_of::<T>() + 128)
+                    + len * std::mem::size_of::<T>()
             }
         }
     }
@@ -455,31 +562,8 @@ impl<T: Item> LedgerHistory<T> {
             return Ok(self.clone());
         };
         let mut result = PagedSequence::new(rows.limit);
-        for (ordinal, page) in rows.pages.iter().enumerate() {
-            if !(1..=ITEMS).contains(&page.count)
-                || ordinal + 1 < rows.pages.len() && page.count != ITEMS
-            {
-                return Err(Error::Unavailable("retained history page count"));
-            }
-            if let Some(budget) = budget {
-                budget.check()?;
-                budget.source()?;
-            }
-            let size = HEADER + page.count * T::WIDTH;
-            let bytes = rows.reader.object(page.id, size)?;
-            if bytes.len() != size
-                || bytes.get(..8) != Some(T::MAGIC.as_slice())
-                || bytes[8..40] != rows.domain
-                || u64le(&bytes, 40)? != ordinal as u64
-                || u32le(&bytes, 48)? as usize != page.count
-            {
-                return Err(Error::Unavailable("retained history page binding"));
-            }
-            for bytes in bytes[HEADER..].chunks_exact(T::WIDTH) {
-                result.push(T::decode(bytes)?)?;
-            }
-        }
-        if result.len() != rows.len {
+        self.visit_encoded(budget, &mut |row| result.push(T::decode(row)?))?;
+        if result.len() != self.len() {
             return Err(Error::Unavailable("retained history directory length"));
         }
         if let Some(budget) = budget {
@@ -511,7 +595,7 @@ impl<T: Item> LedgerHistory<T> {
             }
             return check();
         };
-        if rows.len > rows.limit || rows.pages.len() != rows.len.div_ceil(ITEMS) {
+        if self.len() > rows.limit || rows.pages.len() != rows.len.div_ceil(ITEMS) {
             return Err(Error::Unavailable("retained history directory length"));
         }
         for (ordinal, page) in rows.pages.iter().enumerate() {
@@ -533,9 +617,21 @@ impl<T: Item> LedgerHistory<T> {
                 return Err(Error::Unavailable("retained history page binding"));
             }
             for row in bytes[HEADER..].chunks_exact(T::WIDTH) {
-                let _typed = T::decode(row)?;
+                T::validate_encoded(row)?;
                 visit(row)?;
             }
+        }
+        let mut encoded = Vec::with_capacity(T::WIDTH);
+        for (position, row) in rows.appended.iter().enumerate() {
+            if position % ITEMS == 0 {
+                check()?;
+            }
+            encoded.clear();
+            row.encode(&mut encoded);
+            if encoded.len() != T::WIDTH {
+                return Err(Error::Unavailable("encoded history item width"));
+            }
+            visit(&encoded)?;
         }
         check()
     }
@@ -549,46 +645,60 @@ impl<T: Item> LedgerHistory<T> {
             if rows.domain != domain {
                 return Err(Error::Unavailable("retained history context"));
             }
-            return Ok(self.clone());
-        }
-        let rows = self.resident();
-        let mut pages = Vec::with_capacity(rows.len().div_ceil(ITEMS));
-        let mut values = rows.iter();
-        while pages.len() * ITEMS < rows.len() {
-            budget.check()?;
-            let count = (rows.len() - pages.len() * ITEMS).min(ITEMS);
-            let mut bytes = Vec::with_capacity(HEADER + count * T::WIDTH);
-            bytes.extend_from_slice(&T::MAGIC);
-            bytes.extend_from_slice(&domain);
-            bytes.extend_from_slice(&(pages.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(
-                &u32::try_from(count)
-                    .map_err(|_| Error::Unavailable("derived history page count"))?
-                    .to_le_bytes(),
-            );
-            for _ in 0..count {
-                values
-                    .next()
-                    .ok_or(Error::Unavailable("derived history length"))?
-                    .encode(&mut bytes);
+            if rows.appended.len() == 0 {
+                return Ok(self.clone());
             }
+        }
+        let len = self.len();
+        let limit = match self {
+            Self::Resident(rows) => rows.limit(),
+            Self::Retained(rows) => rows.limit,
+        };
+        let mut pages = Vec::with_capacity(len.div_ceil(ITEMS));
+        let mut bytes = Vec::with_capacity(HEADER + ITEMS * T::WIDTH);
+        let mut count = 0;
+        self.visit_encoded(Some(budget), &mut |row| {
+            if count == 0 {
+                bytes.extend_from_slice(&T::MAGIC);
+                bytes.extend_from_slice(&domain);
+                bytes.extend_from_slice(&(pages.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(&0_u32.to_le_bytes());
+            }
+            bytes.extend_from_slice(row);
+            count += 1;
+            if count == ITEMS {
+                bytes[48..52].copy_from_slice(&(count as u32).to_le_bytes());
+                budget.source()?;
+                pages.push(Page {
+                    id: T::retain_page(store, &bytes)?,
+                    count,
+                });
+                bytes.clear();
+                count = 0;
+            }
+            Ok(())
+        })?;
+        if count > 0 {
+            bytes[48..52].copy_from_slice(&(count as u32).to_le_bytes());
             budget.source()?;
             pages.push(Page {
-                id: store.retain_ledger_history_page(&bytes)?,
+                id: T::retain_page(store, &bytes)?,
                 count,
             });
-        }
-        if values.next().is_some() {
-            return Err(Error::Unavailable("derived history length"));
         }
         budget.check()?;
         Ok(Self::Retained(Retained {
             pages: Arc::new(pages),
-            len: rows.len(),
-            limit: rows.limit(),
+            len,
+            limit,
             domain,
             reader: store.object_reader()?,
             item: PhantomData,
+            appended: PagedSequence::new(
+                limit
+                    .checked_sub(len)
+                    .ok_or(Error::Unavailable("derived history horizon"))?,
+            ),
         }))
     }
     #[cfg(test)]
@@ -597,6 +707,17 @@ impl<T: Item> LedgerHistory<T> {
             Self::Resident(rows) => rows.is_materialized(),
             Self::Retained(_) => false,
         }
+    }
+    #[cfg(test)]
+    pub(super) fn staged_rows(&self) -> usize {
+        match self {
+            Self::Resident(rows) => rows.len(),
+            Self::Retained(rows) => rows.appended.len(),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn has_retained_prefix(&self) -> bool {
+        matches!(self, Self::Retained(_))
     }
     #[cfg(test)]
     pub(super) fn retained_ids(&self) -> Vec<Digest> {

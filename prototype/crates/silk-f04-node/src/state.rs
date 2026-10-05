@@ -215,11 +215,9 @@ impl BranchState {
         budget: &crate::budget::JobBudget,
     ) -> Result<CheckpointTransition> {
         budget.check()?;
-        // Empty admitted bodies cannot mutate any private collection. Preserve
-        // their immutable retained pages, but never treat them as validated:
-        // complete hashing/invariant reads must finish before returning a state.
-        let has_effects = batch.iter().any(|vertex| !vertex.envelopes().is_empty());
-        let mut next = self.prepare_ledger_mutation(has_effects, budget)?;
+        // Clone live metadata only. Historical payloads stay retained; appends
+        // and leaf edits remain private until complete hash/invariant checks.
+        let mut next = self.prepare_ledger_mutation(budget)?;
         let j = self
             .checkpoint_index
             .checked_add(1)
@@ -235,7 +233,7 @@ impl BranchState {
             }
             for e in v.envelopes() {
                 budget.check()?;
-                outcomes.push(next.execute_envelope(e, j)?);
+                outcomes.push(next.execute_envelope(e, j, budget)?);
             }
             next.append_position(v)?;
         }
@@ -280,7 +278,12 @@ impl BranchState {
         })
     }
 
-    fn execute_envelope(&mut self, verified: &VerifiedEnvelope, j: u64) -> Result<EffectOutcome> {
+    fn execute_envelope(
+        &mut self,
+        verified: &VerifiedEnvelope,
+        j: u64,
+        budget: &crate::budget::JobBudget,
+    ) -> Result<EffectOutcome> {
         let e = verified.envelope();
         if e.domain() != self.domain {
             return Err(Error::Unavailable("reducer foreign envelope"));
@@ -294,12 +297,14 @@ impl BranchState {
             return Ok(EffectOutcome::IneligibleCut);
         }
         let effect = e.effect_id();
-        if self.effects.contains(&effect) {
+        if self.effects.contains_checked(&effect, Some(budget))? {
             return Ok(EffectOutcome::Duplicate);
         }
         let nfs = e.nullifiers();
-        if nfs.iter().any(|nf| self.nullifiers.contains(nf)) {
-            return Ok(EffectOutcome::Conflict);
+        for nf in &nfs {
+            if self.nullifiers.contains_checked(nf, Some(budget))? {
+                return Ok(EffectOutcome::Conflict);
+            }
         }
         if self.effects.len() >= 50_000 {
             return Err(Error::Paused("accepted-effect reference horizon"));
@@ -331,9 +336,9 @@ impl BranchState {
         }
         self.tree = tree;
         for nf in nfs {
-            self.nullifiers.insert(nf)?;
+            self.nullifiers.insert_checked(nf, Some(budget))?;
         }
-        self.effects.insert(effect)?;
+        self.effects.insert_checked(effect, Some(budget))?;
         for entry in entries {
             self.recovery.push(Arc::new(entry))?;
         }
@@ -693,22 +698,18 @@ impl BranchState {
         state.executed = self.executed.materialize(budget)?;
         Ok(state)
     }
-    /// Private scratch only. The caller derives `has_effects` from the admitted
-    /// batch; no peer flag selects this path or bypasses complete qualification.
-    fn prepare_ledger_mutation(
-        &self,
-        has_effects: bool,
-        budget: &crate::budget::JobBudget,
-    ) -> Result<Self> {
-        if has_effects {
-            return self.materialize_ledger(Some(budget));
+    /// Private metadata clone only; append payloads and edited leaves are local
+    /// staging, not a validity receipt. Completed transitions qualify all rows.
+    fn prepare_ledger_mutation(&self, budget: &crate::budget::JobBudget) -> Result<Self> {
+        budget.check()?;
+        Ok(self.clone())
+    }
+    pub(crate) fn qualify_ledger_checked(&self, budget: &crate::budget::JobBudget) -> Result<()> {
+        if self.hash_state_checked(Some(budget))? != self.state_digest {
+            return Err(Error::Unavailable("retained state digest mismatch"));
         }
-        budget.check()?;
-        let mut state = self.clone();
-        state.executed = self.executed.materialize(Some(budget))?;
-        state.rewards = self.rewards.materialize(Some(budget))?;
-        budget.check()?;
-        Ok(state)
+        self.check_invariants_checked(Some(budget))?;
+        budget.check()
     }
     pub(crate) fn retain_ledger(
         &self,
@@ -743,6 +744,28 @@ impl BranchState {
     #[cfg(test)]
     pub(crate) fn retained_recovery_pages(&self) -> Vec<Digest> {
         self.recovery.retained_ids()
+    }
+    #[cfg(test)]
+    pub(crate) fn staged_payload_counts(&self) -> [usize; 6] {
+        [
+            self.nullifiers.staged_keys(),
+            self.effects.staged_keys(),
+            self.recovery.staged_rows(),
+            self.accepted_outputs.staged_rows(),
+            self.rewards.staged_rows(),
+            self.executed.staged_rows(),
+        ]
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_payload_layout(&self) -> [bool; 6] {
+        [
+            self.nullifiers.has_retained_prefix(),
+            self.effects.has_retained_prefix(),
+            self.recovery.has_retained_prefix(),
+            self.accepted_outputs.has_retained_prefix(),
+            self.rewards.has_retained_prefix(),
+            self.executed.has_retained_prefix(),
+        ]
     }
     /// Canonical next-checkpoint maturity (not finality).
     #[must_use]
@@ -1425,7 +1448,91 @@ mod tests {
     }
 
     #[test]
-    fn empty_batch_preparation_retains_private_pages_and_checks_complete_invariants() {
+    fn retained_payment_model_and_rollback_qualification_match_literal_state_and_delta() {
+        // Synthetic accepted-row model, NOT cryptographic/payment acceptance.
+        let prior = recovery_fixture(70);
+        let mut literal = prior.clone();
+        let (ordered, _, _) = ordered_fixture(72);
+        for row in ordered.executed.iter_from(64).unwrap() {
+            literal.executed.push(*row).unwrap();
+        }
+        for row in ordered.rewards.iter_from(64).unwrap() {
+            literal.rewards.push(*row).unwrap();
+        }
+        literal.issued = ordered.issued;
+        literal.checkpoint_index = ordered.checkpoint_index;
+        append_recovery_rows(&mut literal, 71..=74);
+        literal.state_digest = literal.hash_state();
+        literal.check_invariants().unwrap();
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic retained mutation and rollback")
+            .unwrap();
+        let base = prior.retain_ledger(&mut store, &budget).unwrap();
+        base.qualify_ledger_checked(&budget).unwrap();
+        let mut staged = base.prepare_ledger_mutation(&budget).unwrap();
+        for row in ordered.executed.iter_from(64).unwrap() {
+            staged.executed.push(*row).unwrap();
+        }
+        for row in ordered.rewards.iter_from(64).unwrap() {
+            staged.rewards.push(*row).unwrap();
+        }
+        staged.issued = ordered.issued;
+        staged.checkpoint_index = ordered.checkpoint_index;
+        append_recovery_rows(&mut staged, 71..=74);
+        staged.state_digest = staged.hash_state_checked(Some(&budget)).unwrap();
+        staged.qualify_ledger_checked(&budget).unwrap();
+        let counts = staged.staged_payload_counts();
+        assert!(counts[0] <= 128 && counts[1] <= 128);
+        assert_eq!(&counts[2..], &[8, 4, 8, 8]);
+        assert_eq!(staged.manifest(), literal.manifest());
+        assert_eq!(base.manifest(), prior.manifest());
+        let outcomes = [EffectOutcome::Accepted; 4];
+        assert_eq!(
+            staged
+                .delta_checked(&base, &outcomes, false, Some(&budget))
+                .unwrap(),
+            literal.delta(&prior, &outcomes, false).unwrap()
+        );
+        assert_eq!(
+            base.delta_checked(&staged, &[], true, Some(&budget))
+                .unwrap(),
+            prior.delta(&literal, &[], true).unwrap()
+        );
+        let retained = staged.retain_ledger(&mut store, &budget).unwrap();
+        let expected = literal.retain_ledger(&mut store, &budget).unwrap();
+        assert_eq!(retained.retained_set_pages(), expected.retained_set_pages());
+        assert_eq!(
+            retained.retained_history_pages(),
+            expected.retained_history_pages()
+        );
+        assert_eq!(
+            retained.retained_recovery_pages(),
+            expected.retained_recovery_pages()
+        );
+        assert_eq!(retained.staged_payload_counts(), [0; 6]);
+        let mut pages = base.retained_set_pages().to_vec();
+        pages.push(base.retained_recovery_pages());
+        pages.extend(base.retained_history_pages());
+        for ids in pages {
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(ids[0])));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(base.qualify_ledger_checked(&budget).is_err());
+            assert!(staged.qualify_ledger_checked(&budget).is_err());
+            std::fs::rename(&held, &path).unwrap();
+        }
+        assert_eq!(base.manifest(), prior.manifest());
+        assert_eq!(staged.manifest(), literal.manifest());
+        assert_eq!(store.head(), None);
+    }
+
+    #[test]
+    fn mutation_preparation_retains_all_pages_and_checks_complete_invariants() {
         // Synthetic state only; selection from admitted bodies is covered by
         // native execution, not by this private preparation adapter fixture.
         let (mut state, _, _) = ordered_fixture(136);
@@ -1440,7 +1547,7 @@ mod tests {
         let stored = state.retain_ledger(&mut store, &budget).unwrap();
         let before = stored.manifest();
         stored.check_invariants_checked(Some(&budget)).unwrap();
-        let sparse = stored.prepare_ledger_mutation(false, &budget).unwrap();
+        let sparse = stored.prepare_ledger_mutation(&budget).unwrap();
         assert_eq!(sparse.retained_set_pages(), stored.retained_set_pages());
         assert_eq!(
             sparse.retained_recovery_pages(),
@@ -1450,14 +1557,16 @@ mod tests {
             sparse.retained_history_pages()[0],
             stored.retained_history_pages()[0]
         );
-        assert!(sparse.retained_history_pages()[1].is_empty());
-        assert!(sparse.retained_history_pages()[2].is_empty());
+        assert_eq!(
+            sparse.retained_history_pages(),
+            stored.retained_history_pages()
+        );
         sparse.check_invariants_checked(Some(&budget)).unwrap();
         assert_eq!(
             sparse.hash_state_checked(Some(&budget)).unwrap(),
             state.hash_state()
         );
-        let full = stored.prepare_ledger_mutation(true, &budget).unwrap();
+        let full = stored.materialize_ledger(Some(&budget)).unwrap();
         assert!(full.retained_set_pages().iter().all(Vec::is_empty));
         assert!(full.retained_recovery_pages().is_empty());
         assert!(full.retained_history_pages().iter().all(Vec::is_empty));
@@ -1486,7 +1595,7 @@ mod tests {
             std::fs::rename(&held, &path).unwrap();
         }
         let expired = crate::budget::JobBudget::testing(std::time::Duration::ZERO).unwrap();
-        assert!(stored.prepare_ledger_mutation(false, &expired).is_err());
+        assert!(stored.prepare_ledger_mutation(&expired).is_err());
         assert!(stored.check_invariants_checked(Some(&expired)).is_err());
         assert_eq!(stored.manifest(), before);
         assert_eq!(store.head(), None);

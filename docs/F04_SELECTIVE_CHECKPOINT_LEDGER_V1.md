@@ -6,6 +6,10 @@ It materializes only executed/reward histories, which it actually appends.
 A batch containing any envelope still follows the complete-materialization
 mutation path, including duplicates/conflicts. No peer flag selects this path.
 
+This describes the frozen selective-preparation revision below. The later
+[retained mutation and rollback milestone](F04_RETAINED_LEDGER_MUTATION_V1.md)
+replaces that remaining materialization path; its evidence is recorded separately.
+
 This required replacing borrowed resident invariant reads with checked streams:
 the same economic count/conservation and reward-row rules are shared with the
 existing public validator. Complete reward rows are checked against complete

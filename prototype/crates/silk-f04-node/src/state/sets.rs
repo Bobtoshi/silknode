@@ -14,6 +14,8 @@ const HEADER: usize = 52;
 struct PageRef {
     id: Digest,
     count: usize,
+    source_ordinal: usize,
+    edited: Option<Arc<[Digest]>>,
 }
 #[derive(Clone)]
 struct Retained {
@@ -21,6 +23,52 @@ struct Retained {
     reader: Arc<ObjectReader>,
     domain: Digest,
     magic: [u8; 8],
+}
+
+fn load_leaf(
+    retained: &Retained,
+    page: &PageRef,
+    budget: Option<&JobBudget>,
+) -> Result<Arc<[Digest]>> {
+    if let Some(budget) = budget {
+        budget.check()?;
+    }
+    if !(1..=PAGE_KEYS).contains(&page.count) {
+        return Err(Error::Unavailable("retained ledger set page count"));
+    }
+    let keys = if let Some(keys) = &page.edited {
+        if keys.len() != page.count {
+            return Err(Error::Unavailable("edited ledger set page count"));
+        }
+        keys.clone()
+    } else {
+        if let Some(budget) = budget {
+            budget.source()?;
+        }
+        let size = HEADER + page.count * 32;
+        let bytes = retained.reader.object(page.id, size)?;
+        if bytes.len() != size
+            || bytes.get(..8) != Some(retained.magic.as_slice())
+            || bytes[8..40] != retained.domain
+            || u64le(&bytes, 40)? != page.source_ordinal as u64
+            || u32le(&bytes, 48)? as usize != page.count
+        {
+            return Err(Error::Unavailable("retained ledger set page binding"));
+        }
+        Arc::from(
+            bytes[HEADER..]
+                .chunks_exact(32)
+                .map(|key| {
+                    key.try_into()
+                        .map_err(|_| Error::Unavailable("retained ledger set key"))
+                })
+                .collect::<Result<Vec<Digest>>>()?,
+        )
+    };
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::Unavailable("retained ledger set order"));
+    }
+    Ok(keys)
 }
 
 #[derive(Clone)]
@@ -62,28 +110,8 @@ impl<'a> DifferenceCursor<'a> {
             self.offset = 0;
             if let Some(retained) = &self.set.retained {
                 if let Some(page) = retained.pages.get(self.ordinal) {
-                    if !(1..=PAGE_KEYS).contains(&page.count) {
-                        return Err(Error::Unavailable("retained ledger set page count"));
-                    }
-                    if let Some(budget) = budget {
-                        budget.source()?;
-                    }
-                    let size = HEADER + page.count * 32;
-                    let bytes = retained.reader.object(page.id, size)?;
-                    if bytes.len() != size
-                        || bytes.get(..8) != Some(retained.magic.as_slice())
-                        || bytes[8..40] != retained.domain
-                        || u64le(&bytes, 40)? != self.ordinal as u64
-                        || u32le(&bytes, 48)? as usize != page.count
-                    {
-                        return Err(Error::Unavailable("retained ledger set page binding"));
-                    }
-                    for row in bytes[HEADER..].chunks_exact(32) {
-                        self.page.push(
-                            row.try_into()
-                                .map_err(|_| Error::Unavailable("retained ledger set key"))?,
-                        );
-                    }
+                    self.page
+                        .extend_from_slice(&load_leaf(retained, page, budget)?);
                 }
             } else if let Some(page) = self.set.pages.get(self.ordinal) {
                 if !(1..=PAGE_KEYS).contains(&page.len()) {
@@ -139,7 +167,7 @@ impl PagedLedgerSet {
     }
     pub(super) fn insert(&mut self, key: Digest) -> Result<bool> {
         if self.retained.is_some() {
-            return Err(Error::Unavailable("materialize ledger set before mutation"));
+            return self.insert_checked(key, None);
         }
         if self.contains(&key) {
             return Ok(false);
@@ -184,6 +212,110 @@ impl PagedLedgerSet {
         );
         self.pages.iter().flat_map(|page| page.iter())
     }
+    // Membership observations remain provisional until complete reducer hashing.
+    fn retained_position(&self, key: &Digest, budget: Option<&JobBudget>) -> Result<usize> {
+        let retained = self
+            .retained
+            .as_ref()
+            .ok_or(Error::Unavailable("retained ledger set mutation context"))?;
+        let mut low = 0;
+        let mut high = retained.pages.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let page = load_leaf(retained, &retained.pages[mid], budget)?;
+            if page.last().expect("checked nonempty leaf") < key {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
+    }
+    pub(super) fn contains_checked(
+        &self,
+        key: &Digest,
+        budget: Option<&JobBudget>,
+    ) -> Result<bool> {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        let Some(retained) = &self.retained else {
+            return Ok(self.contains(key));
+        };
+        let ordinal = self.retained_position(key, budget)?;
+        let Some(page) = retained.pages.get(ordinal) else {
+            return Ok(false);
+        };
+        Ok(load_leaf(retained, page, budget)?
+            .binary_search(key)
+            .is_ok())
+    }
+    pub(super) fn insert_checked(
+        &mut self,
+        key: Digest,
+        budget: Option<&JobBudget>,
+    ) -> Result<bool> {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        if self.retained.is_none() {
+            return self.insert(key);
+        }
+        let ordinal = self.retained_position(&key, budget)?;
+        let retained = self.retained.as_ref().expect("selected retained leaf");
+        let length = retained.pages.len();
+        let target = ordinal.min(length.saturating_sub(1));
+        let old: Arc<[Digest]> = if length == 0 {
+            Arc::from([])
+        } else {
+            load_leaf(retained, &retained.pages[target], budget)?
+        };
+        if old.binary_search(&key).is_ok() {
+            return Ok(false);
+        }
+        if self.len >= self.limit {
+            return Err(Error::Paused("paged ledger set reference horizon"));
+        }
+        let make = |keys: Arc<[Digest]>| PageRef {
+            id: [0; 32],
+            count: keys.len(),
+            source_ordinal: 0,
+            edited: Some(keys),
+        };
+        let mut staged = Vec::with_capacity(2);
+        let append = length == 0 || ordinal == length && old.len() == PAGE_KEYS;
+        if append {
+            staged.push(make(Arc::from([key])));
+        } else {
+            let position = old.binary_search(&key).expect_err("absent derived key");
+            let mut changed = Vec::with_capacity(old.len() + 1);
+            changed.extend_from_slice(&old);
+            changed.insert(position, key);
+            if changed.len() > PAGE_KEYS {
+                staged.push(make(Arc::from(&changed[..PAGE_KEYS / 2])));
+                staged.push(make(Arc::from(&changed[PAGE_KEYS / 2..])));
+            } else {
+                staged.push(make(Arc::from(changed)));
+            }
+        }
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        let pages = Arc::make_mut(
+            &mut self
+                .retained
+                .as_mut()
+                .expect("selected retained leaf")
+                .pages,
+        );
+        if append {
+            pages.extend(staged);
+        } else {
+            pages.splice(target..target + 1, staged);
+        }
+        self.len += 1;
+        Ok(true)
+    }
     /// Private staging visitor: observations are provisional until ALL sorted
     /// pages and the exact directory length pass. Owns one page and one key.
     pub(super) fn visit_encoded(
@@ -207,37 +339,18 @@ impl PagedLedgerSet {
         };
         let mut seen = 0;
         let mut last: Option<Digest> = None;
-        for (ordinal, page) in retained.pages.iter().enumerate() {
-            check()?;
-            if !(1..=PAGE_KEYS).contains(&page.count) {
-                return Err(Error::Unavailable("retained ledger set page count"));
-            }
-            if let Some(budget) = budget {
-                budget.source()?;
-            }
-            let size = HEADER + page.count * 32;
-            let bytes = retained.reader.object(page.id, size)?;
-            if bytes.len() != size
-                || bytes.get(..8) != Some(retained.magic.as_slice())
-                || bytes[8..40] != retained.domain
-                || u64le(&bytes, 40)? != ordinal as u64
-                || u32le(&bytes, 48)? as usize != page.count
-            {
-                return Err(Error::Unavailable("retained ledger set page binding"));
-            }
-            for row in bytes[HEADER..].chunks_exact(32) {
-                let key: Digest = row
-                    .try_into()
-                    .map_err(|_| Error::Unavailable("retained ledger set key"))?;
-                if last.is_some_and(|last| last >= key) {
+        for page in retained.pages.iter() {
+            let keys = load_leaf(retained, page, budget)?;
+            for key in keys.iter() {
+                if last.is_some_and(|last| last >= *key) {
                     return Err(Error::Unavailable("retained ledger set order"));
                 }
-                last = Some(key);
+                last = Some(*key);
                 seen += 1;
                 if seen > self.len {
                     return Err(Error::Unavailable("retained ledger set directory length"));
                 }
-                visit(row)?;
+                visit(key)?;
             }
         }
         if seen != self.len {
@@ -252,34 +365,9 @@ impl PagedLedgerSet {
         let mut pages = Vec::with_capacity(retained.pages.len());
         let mut len = 0;
         let mut last = None;
-        for (ordinal, page) in retained.pages.iter().enumerate() {
-            if !(1..=PAGE_KEYS).contains(&page.count) {
-                return Err(Error::Unavailable("retained ledger set page count"));
-            }
-            if let Some(budget) = budget {
-                budget.check()?;
-                budget.source()?;
-            }
-            let size = HEADER + page.count * 32;
-            let bytes = retained.reader.object(page.id, size)?;
-            if bytes.len() != size
-                || bytes.get(..8) != Some(retained.magic.as_slice())
-                || bytes[8..40] != retained.domain
-                || u64le(&bytes, 40)? != ordinal as u64
-                || u32le(&bytes, 48)? as usize != page.count
-            {
-                return Err(Error::Unavailable("retained ledger set page binding"));
-            }
-            let keys = bytes[HEADER..]
-                .chunks_exact(32)
-                .map(|key| {
-                    key.try_into()
-                        .map_err(|_| Error::Unavailable("retained ledger set key"))
-                })
-                .collect::<Result<Vec<Digest>>>()?;
-            if keys.windows(2).any(|pair| pair[0] >= pair[1])
-                || last.is_some_and(|last| last >= keys[0])
-            {
+        for page in retained.pages.iter() {
+            let keys = load_leaf(retained, page, budget)?;
+            if last.is_some_and(|last| last >= keys[0]) {
                 return Err(Error::Unavailable("retained ledger set order"));
             }
             last = keys.last().copied();
@@ -287,7 +375,7 @@ impl PagedLedgerSet {
             if len > self.limit {
                 return Err(Error::Unavailable("retained ledger set horizon"));
             }
-            pages.push(Arc::from(keys));
+            pages.push(keys);
         }
         if len != self.len {
             return Err(Error::Unavailable("retained ledger set directory length"));
@@ -337,24 +425,48 @@ impl PagedLedgerSet {
             if retained.domain != domain || retained.magic != magic {
                 return Err(Error::Unavailable("retained ledger set context"));
             }
-            return Ok(self.clone());
+            if retained
+                .pages
+                .iter()
+                .enumerate()
+                .all(|(ordinal, page)| page.edited.is_none() && page.source_ordinal == ordinal)
+            {
+                return Ok(self.clone());
+            }
         }
         if ![b"SNF04NP1", b"SNF04EP1"].contains(&&magic) {
             return Err(Error::Unavailable("retained ledger set kind"));
         }
-        let mut pages = Vec::with_capacity(self.pages.len());
-        for (ordinal, page) in self.pages.iter().enumerate() {
+        let length = self
+            .retained
+            .as_ref()
+            .map_or(self.pages.len(), |rows| rows.pages.len());
+        let mut pages = Vec::with_capacity(length);
+        let mut seen = 0;
+        let mut last: Option<Digest> = None;
+        for ordinal in 0..length {
             budget.check()?;
-            if !(1..=PAGE_KEYS).contains(&page.len()) {
-                return Err(Error::Unavailable("derived ledger set page count"));
+            let page = if let Some(retained) = &self.retained {
+                load_leaf(retained, &retained.pages[ordinal], Some(budget))?
+            } else {
+                self.pages[ordinal].clone()
+            };
+            if !(1..=PAGE_KEYS).contains(&page.len())
+                || page.windows(2).any(|pair| pair[0] >= pair[1])
+                || last.is_some_and(|last| last >= page[0])
+            {
+                return Err(Error::Unavailable("derived ledger set order/count"));
+            }
+            last = page.last().copied();
+            seen += page.len();
+            if seen > self.len || seen > self.limit {
+                return Err(Error::Unavailable("retained ledger set horizon"));
             }
             let mut bytes = Vec::with_capacity(HEADER + page.len() * 32);
             bytes.extend_from_slice(&magic);
             bytes.extend_from_slice(&domain);
             bytes.extend_from_slice(&(ordinal as u64).to_le_bytes());
-            let count = u32::try_from(page.len())
-                .map_err(|_| Error::Unavailable("derived ledger set page count"))?;
-            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.extend_from_slice(&(page.len() as u32).to_le_bytes());
             for key in page.iter() {
                 bytes.extend_from_slice(key);
             }
@@ -362,7 +474,12 @@ impl PagedLedgerSet {
             pages.push(PageRef {
                 id: store.retain_ledger_set_page(&bytes)?,
                 count: page.len(),
+                source_ordinal: ordinal,
+                edited: None,
             });
+        }
+        if seen != self.len {
+            return Err(Error::Unavailable("retained ledger set directory length"));
         }
         budget.check()?;
         Ok(Self {
@@ -380,8 +497,27 @@ impl PagedLedgerSet {
     #[cfg(test)]
     pub(super) fn retained_ids(&self) -> Vec<Digest> {
         self.retained.as_ref().map_or_else(Vec::new, |retained| {
-            retained.pages.iter().map(|page| page.id).collect()
+            retained
+                .pages
+                .iter()
+                .filter(|page| page.edited.is_none())
+                .map(|page| page.id)
+                .collect()
         })
+    }
+    #[cfg(test)]
+    pub(super) fn staged_keys(&self) -> usize {
+        self.retained.as_ref().map_or(self.len, |rows| {
+            rows.pages
+                .iter()
+                .filter(|page| page.edited.is_some())
+                .map(|page| page.count)
+                .sum()
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn has_retained_prefix(&self) -> bool {
+        self.retained.is_some()
     }
     pub(super) fn difference<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = &'a Digest> {
         let mut left = self.iter();
@@ -404,6 +540,68 @@ impl PagedLedgerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_leaf_edits_match_literal_split_geometry_and_preserve_forks() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        store.begin_replay(b"synthetic staged leaf edits").unwrap();
+        let mut literal = PagedLedgerSet::new(512);
+        for index in 0..129 {
+            literal.insert(key(index * 2)).unwrap();
+        }
+        let base = literal
+            .retain(&mut store, [19; 32], *b"SNF04NP1", &budget)
+            .unwrap();
+        let mut staged = base.clone();
+        for index in [1, 3, 63, 65, 127, 129, 191, 255, 259, 300, 301, 302] {
+            assert_eq!(
+                staged.insert_checked(key(index), Some(&budget)).unwrap(),
+                literal.insert(key(index)).unwrap()
+            );
+            assert!(staged.contains_checked(&key(index), Some(&budget)).unwrap());
+        }
+        assert!(staged.pages.is_empty());
+        assert_eq!(base.len(), 129);
+        assert!(!staged.insert_checked(key(63), Some(&budget)).unwrap());
+        assert!(
+            staged
+                .materialize(Some(&budget))
+                .unwrap()
+                .iter()
+                .eq(literal.iter())
+        );
+        let stored = staged
+            .retain(&mut store, [19; 32], *b"SNF04NP1", &budget)
+            .unwrap();
+        assert_eq!(
+            stored.retained_ids(),
+            literal
+                .retain(&mut store, [19; 32], *b"SNF04NP1", &budget)
+                .unwrap()
+                .retained_ids()
+        );
+        let mut fork = base.clone();
+        fork.insert_checked(key(311), Some(&budget)).unwrap();
+        assert!(!staged.contains_checked(&key(311), Some(&budget)).unwrap());
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(base.retained_ids()[0])));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(base.contains_checked(&key(0), Some(&budget)).is_err());
+        assert!(base.clone().insert_checked(key(1), Some(&budget)).is_err());
+        assert!(fork.materialize(Some(&budget)).is_err());
+        std::fs::rename(&held, &path).unwrap();
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(
+            base.clone()
+                .insert_checked(key(17), Some(&expired))
+                .is_err()
+        );
+        assert_eq!(base.len(), 129);
+        assert_eq!(store.head(), None);
+    }
     #[test]
     fn streamed_difference_drains_previous_suffix_and_refuses_bad_bindings() {
         let (temp, mut store) = crate::store::ancestry_test_store();

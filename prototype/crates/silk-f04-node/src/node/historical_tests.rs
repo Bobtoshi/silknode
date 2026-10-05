@@ -168,12 +168,14 @@ fn selective_empty_checkpoint_native_24_retains_private_pages() {
         replayed.state.retained_history_pages()[0],
         prior.retained_history_pages()[0]
     );
-    assert!(replayed.state.retained_history_pages()[1].is_empty());
-    assert!(replayed.state.retained_history_pages()[2].is_empty());
+    assert_eq!(
+        replayed.state.retained_history_pages(),
+        prior.retained_history_pages()
+    );
     assert!(!root.join("node/ACTIVE_JOB").exists());
     assert!(!root.join("node/ACTIVE_REPLAY").exists());
     println!(
-        "selective_empty_checkpoint_native=true; vertices=24; checkpoints=3; admitted_empty_batch=true; exact_original_manifest=true; private_payload_pages_remain_retained=true; mutable_executed_reward_histories_still_materialized=true; new_work=0; new_proofs=0; separate_cold_success=false; native_reorg=false"
+        "selective_empty_checkpoint_native=true; vertices=24; checkpoints=3; admitted_empty_batch=true; exact_original_manifest=true; all_payload_prefix_pages_remain_retained=true; newly_derived_rows_staged=true; new_work=0; new_proofs=0; separate_cold_success=false; native_reorg=false"
     );
 }
 
