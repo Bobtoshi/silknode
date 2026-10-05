@@ -787,6 +787,29 @@ mod tests {
         let reader = context(&store);
         let budget = JobBudget::checkpoint().unwrap();
         let horizon = 1_048_576;
+        for first in [4095, 4096, 32768, 65536, horizon - 1] {
+            let mut sparse = PagedAncestry {
+                horizon,
+                ..PagedAncestry::default()
+            };
+            sparse.insert(first).unwrap();
+            sparse.retain(&mut store, reader.clone(), &budget).unwrap();
+            assert_eq!(
+                sparse.positions_before(horizon, &budget).unwrap(),
+                vec![first]
+            );
+            let mut child = sparse.clone();
+            child.insert(0).unwrap();
+            child.retain(&mut store, reader.clone(), &budget).unwrap();
+            assert_eq!(
+                child.positions_before(horizon, &budget).unwrap(),
+                vec![0, first]
+            );
+            assert_eq!(
+                sparse.positions_before(horizon, &budget).unwrap(),
+                vec![first]
+            );
+        }
         let positions = [
             0,
             511,

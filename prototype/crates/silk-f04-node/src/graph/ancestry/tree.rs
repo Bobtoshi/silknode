@@ -128,9 +128,14 @@ impl Pages {
         // Stage growth and all fallible path reads before mutating this root.
         let mut next = self.clone();
         while page >= span(next.depth)? {
-            let mut children = std::array::from_fn(|_| None);
-            children[0] = next.root.take();
-            next.root = Some(Arc::new(Node::Branch(children)));
+            // Empty growth changes only the coordinate depth. Wrapping None
+            // would retain an empty lower branch on a later sparse insert;
+            // readers correctly refuse such a noncanonical branch.
+            if let Some(root) = next.root.take() {
+                let mut children = std::array::from_fn(|_| None);
+                children[0] = Some(root);
+                next.root = Some(Arc::new(Node::Branch(children)));
+            }
             next.depth = next
                 .depth
                 .checked_add(1)

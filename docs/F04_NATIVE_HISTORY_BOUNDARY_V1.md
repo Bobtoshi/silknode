@@ -1,5 +1,9 @@
 # Native shared-order boundary and cold continuation
 
+Later mechanism: [extensible ancestry roots](F04_EXTENSIBLE_ANCESTRY_ROOT_V1.md)
+records a separate source-36 native 520/carrier cold boundary and corrected
+synthetic sparse growth; it does not change this source-35 result.
+
 Private, valueless acceptance slice, 5 October 2026. The implemented
 [page-scanned inspection](F04_STREAMING_HISTORY_INSPECTION_V1.md) and
 [bounded publication](F04_STREAMING_ORDER_PUBLICATION_V1.md) passed one fresh
