@@ -30,6 +30,88 @@ pub(super) struct PagedLedgerSet {
     limit: usize,
     retained: Option<Retained>,
 }
+
+// Operation-local merge cursor: one decoded leaf, no validity memoization.
+struct DifferenceCursor<'a> {
+    set: &'a PagedLedgerSet,
+    ordinal: usize,
+    page: Vec<Digest>,
+    offset: usize,
+    seen: usize,
+    last: Option<Digest>,
+}
+impl<'a> DifferenceCursor<'a> {
+    fn new(set: &'a PagedLedgerSet) -> Self {
+        Self {
+            set,
+            ordinal: 0,
+            page: Vec::new(),
+            offset: 0,
+            seen: 0,
+            last: None,
+        }
+    }
+    fn next(&mut self, budget: Option<&JobBudget>) -> Result<Option<Digest>> {
+        let check = || budget.map_or(Ok(()), JobBudget::check);
+        check()?;
+        if self.set.len > self.set.limit {
+            return Err(Error::Unavailable("retained ledger set horizon"));
+        }
+        if self.offset == self.page.len() {
+            self.page.clear();
+            self.offset = 0;
+            if let Some(retained) = &self.set.retained {
+                if let Some(page) = retained.pages.get(self.ordinal) {
+                    if !(1..=PAGE_KEYS).contains(&page.count) {
+                        return Err(Error::Unavailable("retained ledger set page count"));
+                    }
+                    if let Some(budget) = budget {
+                        budget.source()?;
+                    }
+                    let size = HEADER + page.count * 32;
+                    let bytes = retained.reader.object(page.id, size)?;
+                    if bytes.len() != size
+                        || bytes.get(..8) != Some(retained.magic.as_slice())
+                        || bytes[8..40] != retained.domain
+                        || u64le(&bytes, 40)? != self.ordinal as u64
+                        || u32le(&bytes, 48)? as usize != page.count
+                    {
+                        return Err(Error::Unavailable("retained ledger set page binding"));
+                    }
+                    for row in bytes[HEADER..].chunks_exact(32) {
+                        self.page.push(
+                            row.try_into()
+                                .map_err(|_| Error::Unavailable("retained ledger set key"))?,
+                        );
+                    }
+                }
+            } else if let Some(page) = self.set.pages.get(self.ordinal) {
+                if !(1..=PAGE_KEYS).contains(&page.len()) {
+                    return Err(Error::Unavailable("derived ledger set page count"));
+                }
+                self.page.extend_from_slice(page);
+            }
+            if self.page.is_empty() {
+                if self.seen != self.set.len {
+                    return Err(Error::Unavailable("retained ledger set directory length"));
+                }
+                return Ok(None);
+            }
+            self.ordinal += 1;
+        }
+        let key = self.page[self.offset];
+        if self.last.is_some_and(|last| last >= key) {
+            return Err(Error::Unavailable("retained ledger set order"));
+        }
+        self.offset += 1;
+        self.seen += 1;
+        if self.seen > self.set.len {
+            return Err(Error::Unavailable("retained ledger set directory length"));
+        }
+        self.last = Some(key);
+        Ok(Some(key))
+    }
+}
 impl PagedLedgerSet {
     pub(super) const fn new(limit: usize) -> Self {
         Self {
@@ -220,6 +302,30 @@ impl PagedLedgerSet {
             retained: None,
         })
     }
+    /// Sorted difference for private delta staging. BOTH streams must finish,
+    /// including a previous suffix beyond the largest current key.
+    pub(super) fn difference_visit(
+        &self,
+        prior: &Self,
+        budget: Option<&JobBudget>,
+        visit: &mut dyn FnMut(&Digest) -> Result<()>,
+    ) -> Result<()> {
+        let mut current = DifferenceCursor::new(self);
+        let mut previous = DifferenceCursor::new(prior);
+        let mut old = previous.next(budget)?;
+        while let Some(key) = current.next(budget)? {
+            while old.is_some_and(|old| old < key) {
+                old = previous.next(budget)?;
+            }
+            if old != Some(key) {
+                visit(&key)?;
+            }
+        }
+        while old.is_some() {
+            old = previous.next(budget)?;
+        }
+        budget.map_or(Ok(()), JobBudget::check)
+    }
     pub(super) fn retain(
         &self,
         store: &mut Store,
@@ -298,6 +404,70 @@ impl PagedLedgerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streamed_difference_drains_previous_suffix_and_refuses_bad_bindings() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        store.begin_replay(b"synthetic merge cursor").unwrap();
+        let previous = fixture(129)
+            .retain(&mut store, [19; 32], *b"SNF04NP1", &budget)
+            .unwrap();
+        let mut current = PagedLedgerSet::new(256);
+        current.insert(key(0)).unwrap();
+        current.insert(key(200)).unwrap();
+        let stored = current
+            .retain(&mut store, [19; 32], *b"SNF04NP1", &budget)
+            .unwrap();
+        let mut added = Vec::new();
+        stored
+            .difference_visit(&previous, Some(&budget), &mut |key| {
+                added.push(*key);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(added, [key(200)]);
+        // No current rows: the entire previous stream must still qualify.
+        let empty = PagedLedgerSet::new(256);
+        let path = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(previous.retained_ids().last().unwrap())
+        ));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(
+            empty
+                .difference_visit(&previous, Some(&budget), &mut |_| Ok(()))
+                .is_err()
+        );
+        std::fs::rename(&held, &path).unwrap();
+        empty
+            .difference_visit(&previous, Some(&budget), &mut |_| {
+                panic!("empty difference")
+            })
+            .unwrap();
+        for kind in 0..4 {
+            let mut wrong = previous.clone();
+            match kind {
+                0 => wrong.retained.as_mut().unwrap().domain = [20; 32],
+                1 => wrong.retained.as_mut().unwrap().magic = *b"SNF04EP1",
+                2 => Arc::make_mut(&mut wrong.retained.as_mut().unwrap().pages).swap(0, 1),
+                _ => wrong.len -= 1,
+            }
+            assert!(
+                empty
+                    .difference_visit(&wrong, Some(&budget), &mut |_| Ok(()))
+                    .is_err()
+            );
+        }
+        let mut wrong = fixture(129);
+        wrong.pages.swap(0, 1);
+        assert!(
+            empty
+                .difference_visit(&wrong, Some(&budget), &mut |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(store.head(), None);
+    }
     use std::collections::BTreeSet;
 
     fn key(position: u16) -> Digest {

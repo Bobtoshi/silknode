@@ -570,6 +570,8 @@ impl BranchState {
         rollback: bool,
         budget: Option<&crate::budget::JobBudget>,
     ) -> Result<Vec<u8>> {
+        let check = || budget.map_or(Ok(()), crate::budget::JobBudget::check);
+        check()?;
         let mut b = Vec::new();
         b.extend_from_slice(b"SNF04DL1");
         b.push(u8::from(rollback));
@@ -595,24 +597,35 @@ impl BranchState {
                 b.extend_from_slice(&m);
             }
         } else {
-            let executed = self.executed.materialize(budget)?;
-            let prior_executed = prior.executed.materialize(budget)?;
-            if self.executed.len() != prior.executed.len() + 8
-                || !executed.starts_with(&prior_executed)
-            {
+            if prior.executed.len().checked_add(8) != Some(self.executed.len()) {
+                return Err(Error::Unavailable("delta prefix"));
+            }
+            let mut prefix = prior.executed.prefix_comparison();
+            self.executed.visit_encoded(budget, &mut |row| {
+                let id = VertexId::from_bytes(
+                    row.try_into()
+                        .map_err(|_| Error::Unavailable("delta executed width"))?,
+                );
+                prefix.advance(&id, budget)
+            })?;
+            if prefix.finish(budget)? != prior.executed.len() {
                 return Err(Error::Unavailable("delta prefix"));
             }
             for set in [&self.nullifiers, &self.effects]
                 .into_iter()
                 .zip([&prior.nullifiers, &prior.effects])
             {
-                let current = set.0.materialize(budget)?;
-                let previous = set.1.materialize(budget)?;
-                let added: Vec<_> = current.difference(&previous).collect();
-                b.extend_from_slice(&(added.len() as u32).to_le_bytes());
-                for x in added {
+                let count_at = b.len();
+                b.extend_from_slice(&0_u32.to_le_bytes());
+                let mut count = 0_u32;
+                set.0.difference_visit(set.1, budget, &mut |x| {
+                    count = count
+                        .checked_add(1)
+                        .ok_or(Error::Unavailable("delta set count"))?;
                     b.extend_from_slice(x);
-                }
+                    Ok(())
+                })?;
+                b[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
             }
             let added_len = self
                 .recovery
@@ -622,16 +635,27 @@ impl BranchState {
             let added_count =
                 u32::try_from(added_len).map_err(|_| Error::Unavailable("delta recovery count"))?;
             b.extend_from_slice(&added_count.to_le_bytes());
-            let recovery = self.recovery.materialize(budget)?;
-            let added = recovery.resident().iter_from(prior.recovery.len())?;
-            for x in added {
-                b.extend_from_slice(x.as_slice());
+            let mut position = 0;
+            self.recovery.visit_encoded(budget, &mut |row| {
+                if position >= prior.recovery.len() {
+                    b.extend_from_slice(row);
+                }
+                position += 1;
+                Ok(())
+            })?;
+            if prior.rewards.len() > self.rewards.len() {
+                return Err(Error::Unavailable("delta reward prefix"));
             }
-            let rewards = self.rewards.materialize(budget)?;
-            for r in rewards.iter_from(prior.rewards.len())? {
-                b.extend_from_slice(r);
-            }
+            let mut position = 0;
+            self.rewards.visit_encoded(budget, &mut |row| {
+                if position >= prior.rewards.len() {
+                    b.extend_from_slice(row);
+                }
+                position += 1;
+                Ok(())
+            })?;
         }
+        check()?;
         Ok(b)
     }
 
@@ -1360,6 +1384,123 @@ mod tests {
                 .interval,
             ids[128..]
         );
+    }
+
+    #[test]
+    fn streaming_forward_delta_matches_literal_bytes_and_refuses_late_inputs() {
+        // Synthetic serializer model only; no work/proof/payment acceptance.
+        let (mut prior, _, _) = ordered_fixture(128);
+        let (mut next, _, _) = ordered_fixture(136);
+        for state in [&mut prior, &mut next] {
+            state.initial_pool = 100;
+            state.pool = 100;
+        }
+        append_recovery_rows(&mut prior, 1..=70);
+        append_recovery_rows(&mut next, 1..=74);
+        let outcomes = [EffectOutcome::Accepted, EffectOutcome::Duplicate];
+        // Independent previous literal collection serializer.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"SNF04DL1");
+        expected.extend_from_slice(&[0; 8]);
+        expected.extend_from_slice(&prior.checkpoint_id);
+        expected.extend_from_slice(&next.checkpoint_id);
+        expected.extend_from_slice(&2_u32.to_le_bytes());
+        expected.extend_from_slice(&[0, 2]);
+        for (current, previous) in [
+            (&next.nullifiers, &prior.nullifiers),
+            (&next.effects, &prior.effects),
+        ] {
+            let added = current.difference(previous).collect::<Vec<_>>();
+            expected.extend_from_slice(&(added.len() as u32).to_le_bytes());
+            for key in added {
+                expected.extend_from_slice(key);
+            }
+        }
+        expected.extend_from_slice(
+            &((next.recovery.len() - prior.recovery.len()) as u32).to_le_bytes(),
+        );
+        for row in next
+            .recovery
+            .resident()
+            .iter_from(prior.recovery.len())
+            .unwrap()
+        {
+            expected.extend_from_slice(row.as_slice());
+        }
+        for row in next.rewards.iter_from(prior.rewards.len()).unwrap() {
+            expected.extend_from_slice(row);
+        }
+        assert_eq!(next.delta(&prior, &outcomes, false).unwrap(), expected);
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        store
+            .begin_replay(b"synthetic streamed forward delta")
+            .unwrap();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        let previous = prior.retain_ledger(&mut store, &budget).unwrap();
+        let current = next.retain_ledger(&mut store, &budget).unwrap();
+        let manifests = [previous.manifest(), current.manifest()];
+        assert_eq!(
+            current
+                .delta_checked(&previous, &outcomes, false, Some(&budget))
+                .unwrap(),
+            expected
+        );
+        let mut pages = current.retained_set_pages().to_vec();
+        pages.extend(previous.retained_set_pages());
+        pages.push(current.retained_recovery_pages());
+        pages.push(current.retained_history_pages()[1].clone());
+        pages.push(current.retained_history_pages()[2].clone());
+        pages.push(previous.retained_history_pages()[2].clone());
+        for ids in pages {
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(ids.last().unwrap())));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(
+                current
+                    .delta_checked(&previous, &outcomes, false, Some(&budget))
+                    .is_err()
+            );
+            std::fs::rename(&held, &path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let mut changed = bytes.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, changed).unwrap();
+            assert!(
+                current
+                    .delta_checked(&previous, &outcomes, false, Some(&budget))
+                    .is_err()
+            );
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::hard_link(&path, &held).unwrap();
+            assert!(
+                current
+                    .delta_checked(&previous, &outcomes, false, Some(&budget))
+                    .is_err()
+            );
+            std::fs::remove_file(&held).unwrap();
+            assert_eq!(
+                current
+                    .delta_checked(&previous, &outcomes, false, Some(&budget))
+                    .unwrap(),
+                expected
+            );
+        }
+        let expired = crate::budget::JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(
+            current
+                .delta_checked(&previous, &outcomes, false, Some(&expired))
+                .is_err()
+        );
+        assert!(
+            previous
+                .delta_checked(&current, &outcomes, false, Some(&budget))
+                .is_err()
+        );
+        assert_eq!([previous.manifest(), current.manifest()], manifests);
+        assert_eq!(store.head(), None);
     }
 
     #[test]

@@ -64,3 +64,7 @@ materialize histories. Removing those loads needs its own coherent mutation,
 validation and failure-atomicity implementation. Physical ancestry/order
 extensibility is separate from integrated growing-history capacity and native
 sync/restart/competing-branch/private-payment acceptance.
+
+[Streamed forward deltas](F04_STREAMING_FORWARD_DELTA_V1.md) subsequently remove
+whole-collection loading from forward delta construction and add changed-path
+nonempty native replay evidence on their own frozen ELF.
