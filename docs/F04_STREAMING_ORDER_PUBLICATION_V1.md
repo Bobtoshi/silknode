@@ -10,7 +10,8 @@ records, HEAD/PREVIOUS publication and all resource/default limits are unchanged
 ## Two walks, one original budget
 
 Planning derives the original fixed tree in depth-first order, holding one
-physical page payload and two directories of at most eight child hashes. Every
+derived page payload, its matching checked-read buffer when present, and two
+directories of at most eight child hashes. Every
 existing page is freshly checked against its exact expected bytes. Missing pages
 retain only address/length metadata in a bounded map (at most 73 entries at the
 unchanged horizon), not their payloads. Existing complete orders are checked
