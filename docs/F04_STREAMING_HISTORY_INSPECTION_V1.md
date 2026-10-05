@@ -1,5 +1,9 @@
 # F0.4 bounded history inspection
 
+Native follow-up: [72-carrier shared-order/cold boundary](F04_NATIVE_HISTORY_BOUNDARY_V1.md)
+passed after the bounded-publication source change, on its exact separate
+production ELF. The earlier synthetic evidence below is not relabelled native.
+
 Follow-up: [bounded order publication](F04_STREAMING_ORDER_PUBLICATION_V1.md)
 removes physical page-payload staging from the writer without changing formats
 or limits. Its separate source/ELF evidence does not extend these test results.

@@ -1,5 +1,10 @@
 # F0.4 bounded physical order publication
 
+Follow-up: the exact changed Rust source passed the
+[72-carrier native shared-order/cold boundary](F04_NATIVE_HISTORY_BOUNDARY_V1.md)
+on its separately frozen production ELF. Historical component evidence below
+remains distinct; no full-3,080 or beyond-horizon result is transferred.
+
 Private, valueless implementation follow-up to
 [bounded history inspection](F04_STREAMING_HISTORY_INSPECTION_V1.md),
 5 October 2026. The production order writer now walks physical pages instead
