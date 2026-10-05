@@ -11,7 +11,7 @@ use crate::{
 use silk_sapling_f04::crypto::LiveRepresentationBinding;
 use std::sync::Arc;
 
-pub(super) const SLOT: usize = 561;
+pub(super) const SLOT: usize = 331;
 const ITEMS: usize = 64;
 const HEADER: usize = 52;
 type Bindings = Arc<Vec<LiveRepresentationBinding>>;
@@ -469,7 +469,7 @@ impl<V> VertexDirectory<V> {
         let size = HEADER + page.count * SLOT;
         let bytes = rows.reader.objects().object(page.id, size)?;
         if bytes.len() != size
-            || bytes.get(..8) != Some(b"SNF04DP1")
+            || bytes.get(..8) != Some(b"SNF04DP2")
             || bytes[8..40] != rows.reader.domain()
             || u64le(&bytes, 40)? != ordinal as u64
             || u32le(&bytes, 48)? as usize != page.count
@@ -606,7 +606,7 @@ impl<V> VertexDirectory<V> {
         let ordinal = old.len / ITEMS;
         let count = old.len % ITEMS;
         let mut bytes = Vec::with_capacity(HEADER + (count + 1) * SLOT);
-        bytes.extend_from_slice(b"SNF04DP1");
+        bytes.extend_from_slice(b"SNF04DP2");
         bytes.extend_from_slice(&reader.domain());
         bytes.extend_from_slice(&(ordinal as u64).to_le_bytes());
         bytes.extend_from_slice(
@@ -667,7 +667,7 @@ impl<V> VertexDirectory<V> {
         for (ordinal, chunk) in rows.chunks(ITEMS).enumerate() {
             budget.check()?;
             let mut bytes = Vec::with_capacity(HEADER + chunk.len() * SLOT);
-            bytes.extend_from_slice(b"SNF04DP1");
+            bytes.extend_from_slice(b"SNF04DP2");
             bytes.extend_from_slice(&reader.domain());
             bytes.extend_from_slice(&(ordinal as u64).to_le_bytes());
             bytes.extend_from_slice(

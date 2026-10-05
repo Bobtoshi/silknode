@@ -102,6 +102,129 @@ fn assert_complete(node: &Node) {
 }
 
 #[test]
+#[ignore = "changed ancestry-root native boundary ONLY; fresh 520 existing genuine carriers, isolated outer limits, no mining/proofs"]
+fn extensible_ancestry_native_520_fresh_node() {
+    assert_eq!(
+        std::env::var("SILK_F04_EXTENSIBLE_ANCESTRY_NATIVE").as_deref(),
+        Ok("1")
+    );
+    let (root, margin, genesis, history, parameters) = inputs();
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    let mut node = Node::create(&root.join("node"), &margin, genesis).unwrap();
+    const PREFIX: usize = 520;
+    let started = std::time::Instant::now();
+    for start in (0..PREFIX).step_by(32) {
+        let count = (PREFIX - start).min(32);
+        let bytes = history.read_range(start, count).unwrap();
+        let range = history.decode_range(&bytes, start, count).unwrap();
+        for carrier in range.carriers() {
+            let ordinal = node.vertex_count();
+            let ingress = node.ingest(carrier, &parameters);
+            if let Err(error) = &ingress {
+                eprintln!(
+                    "extensible_ancestry_refused_ordinal={ordinal}; error={error:?}; original_budget_failure={:?}",
+                    node.admission_budget_failure()
+                );
+            }
+            assert_eq!(ingress.unwrap(), Ingress::Admitted);
+            for _ in 0..66 {
+                if node.status().unwrap() == Status::Ready {
+                    break;
+                }
+                node.advance().unwrap();
+            }
+            assert_eq!(node.status().unwrap(), Status::Ready);
+            assert!(!root.join("node/ACTIVE_JOB").exists());
+        }
+        println!(
+            "extensible_ancestry_vertices={}; elapsed_seconds={}",
+            node.vertex_count(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    assert_eq!(node.vertex_count(), PREFIX);
+    assert_eq!(node.core.state.executed_len(), PREFIX);
+    assert_eq!(node.core.state.checkpoint_index(), 65);
+    assert!(!node.recovered_previous());
+    let directory_pages = node.core.graph.retained_directory_pages();
+    for page in directory_pages {
+        let bytes = fs::read(root.join("node").join(format!("{}.obj", hex::encode(page)))).unwrap();
+        assert_eq!(&bytes[..8], b"SNF04DP2");
+    }
+    assert!(fs::read_dir(root.join("node")).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        path.extension().is_some_and(|ext| ext == "obj")
+            && fs::read(path).unwrap().starts_with(b"SNF04AD2")
+    }));
+    let order = node
+        .core
+        .order
+        .bytes(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    let ledger = public_ledger(&node);
+    let head = node.local_head().unwrap();
+    for (name, value) in [
+        ("head", head),
+        ("order", raw_hash(&order)),
+        ("ledger", ledger),
+        ("checkpoint", node.core.state.checkpoint_id()),
+        ("state", node.core.state.digest()),
+    ] {
+        fs::write(root.join(format!("derived-{name}.hex")), hex::encode(value)).unwrap();
+    }
+    println!(
+        "extensible_ancestry_fresh_head={}; order_sha256={}; public_ledger_sha256={}; vertices=520; checkpoints=65; new_work_records=0; new_payment_proofs=0; new_directory_root_format=true; whole_core_beyond4096=false",
+        hex::encode(head),
+        hex::encode(raw_hash(&order)),
+        hex::encode(ledger)
+    );
+}
+
+#[test]
+#[ignore = "separate pinned cold process for the new 520-carrier ancestry root boundary ONLY; no retries/old owners/mining/proofs"]
+fn extensible_ancestry_native_520_separate_cold_process() {
+    assert_eq!(
+        std::env::var("SILK_F04_EXTENSIBLE_ANCESTRY_NATIVE").as_deref(),
+        Ok("1")
+    );
+    let (root, margin, genesis, _, parameters) = inputs();
+    let pin = digest(&std::env::var("SILK_F04_EXTENSIBLE_EXPECTED_HEAD").unwrap());
+    let node =
+        Node::open_retained_pinned(&root.join("node"), &margin, genesis, &parameters, pin).unwrap();
+    assert_eq!(node.vertex_count(), 520);
+    assert_eq!(node.status().unwrap(), Status::Ready);
+    assert_eq!(node.core.state.executed_len(), 520);
+    assert_eq!(node.core.state.checkpoint_index(), 65);
+    assert!(!node.recovered_previous());
+    let order = node
+        .core
+        .order
+        .bytes(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    let ledger = public_ledger(&node);
+    for (name, actual) in [
+        ("HEAD", node.local_head().unwrap()),
+        ("ORDER", raw_hash(&order)),
+        ("LEDGER", ledger),
+        ("CHECKPOINT", node.core.state.checkpoint_id()),
+        ("STATE", node.core.state.digest()),
+    ] {
+        assert_eq!(
+            actual,
+            digest(&std::env::var(format!("SILK_F04_EXTENSIBLE_EXPECTED_{name}")).unwrap())
+        );
+    }
+    assert!(!root.join("node/ACTIVE_JOB").exists());
+    assert!(!root.join("node/ACTIVE_REPLAY").exists());
+    println!(
+        "extensible_ancestry_cold_head={}; order_sha256={}; public_ledger_sha256={}; vertices=520; checkpoints=65; exact_fresh_semantic_replay=true; new_work_records=0; new_payment_proofs=0; whole_core_beyond4096=false",
+        hex::encode(pin),
+        hex::encode(raw_hash(&order)),
+        hex::encode(ledger)
+    );
+}
+
+#[test]
 #[ignore = "NEEDS exact independent outer execution approval; 3080 genuine historical records through ordinary receiver; NO mining or proof generation"]
 fn historical_public_ranges_ingest_and_reconcile_fresh_node() {
     let (root, margin, genesis, history, parameters) = inputs();

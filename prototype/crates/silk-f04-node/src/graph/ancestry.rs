@@ -1,6 +1,7 @@
 //! Receiver-derived ancestry; retained pages are auxiliary data, never validity.
 //! Immutable 512-position leaves are shared across descendants and graph clones.
 //! Changing a bit copies at most one 64-byte leaf, not the whole strict past.
+mod tree;
 use crate::{
     Digest,
     budget::JobBudget,
@@ -12,15 +13,15 @@ use std::sync::Arc;
 
 const WORDS_PER_PAGE: usize = 8;
 const POSITIONS_PER_PAGE: usize = WORDS_PER_PAGE * 64;
-const PAGES: usize = 8;
-// Deliberately preserve the reference horizon. Raising it requires a separate
-// graph/order/ledger/sync resource design, not silently widening this directory.
-const _: () = assert!(PAGES * POSITIONS_PER_PAGE == HISTORY_LIMIT_V1);
+// Policy stays at the reference horizon; the address representation is no
+// longer an eight-leaf array. Coupled graph/order/ledger/sync work must precede
+// any node-wide horizon change.
 
 /// One owned 64-byte leaf, scoped to an immutable receiver graph operation.
 pub(super) struct AncestryOperation<'a> {
     reader: Option<&'a Arc<RetainedContext>>,
     leaf: Option<(Digest, usize, [u64; WORDS_PER_PAGE])>,
+    leaf_directory: Option<tree::Pages>,
     #[cfg(test)]
     loads: usize,
 }
@@ -29,6 +30,7 @@ impl<'a> AncestryOperation<'a> {
         Self {
             reader,
             leaf: None,
+            leaf_directory: None,
             #[cfg(test)]
             loads: 0,
         }
@@ -45,8 +47,27 @@ impl<'a> AncestryOperation<'a> {
     ) -> Result<bool, Sg0Error> {
         let check = || budget.check().map_err(|_| Sg0Error::ResourceBudget);
         check()?;
+        bits.check_position(position)?;
         let page = position / POSITIONS_PER_PAGE;
-        let slot = bits.pages.get(page).ok_or(Sg0Error::Invariant)?;
+        if let Some((_, ordinal, words)) = &self.leaf
+            && *ordinal == page
+            && self
+                .leaf_directory
+                .as_ref()
+                .is_some_and(|directory| directory.same_root(&bits.pages))
+            && bits
+                .reader
+                .as_ref()
+                .is_some_and(|reader| self.reader.is_some_and(|bound| Arc::ptr_eq(bound, reader)))
+        {
+            let present = words[position / 64 % WORDS_PER_PAGE] & (1_u64 << (position % 64)) != 0;
+            check()?;
+            return Ok(present);
+        }
+        let slot = bits
+            .pages
+            .get(page, bits.reader.as_ref(), Some(budget))
+            .map_err(directory_error)?;
         let words = match slot.as_deref() {
             None => None,
             Some(Leaf::Resident(words)) => Some(*words),
@@ -61,11 +82,12 @@ impl<'a> AncestryOperation<'a> {
                     .is_none_or(|(cached, ordinal, _)| cached != id || *ordinal != page)
                 {
                     budget.source().map_err(|_| Sg0Error::ResourceBudget)?;
-                    let words = bits.words(page)?.ok_or(Sg0Error::Invariant)?;
+                    let words = bits.leaf_words(page, slot.as_ref().ok_or(Sg0Error::Invariant)?)?;
                     check()?;
                     // Install only a complete hash/inode/domain/page-qualified
                     // positive leaf. Failures and missing objects are not bits.
                     self.leaf = Some((*id, page, words));
+                    self.leaf_directory = Some(bits.pages.clone());
                     #[cfg(test)]
                     {
                         self.loads += 1;
@@ -104,62 +126,68 @@ impl RetainedContext {
         Arc::new(Self { objects, domain })
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct PagedAncestry {
-    pages: [Option<Arc<Leaf>>; PAGES],
+    pages: tree::Pages,
     reader: Option<Arc<RetainedContext>>,
+    horizon: usize,
+}
+impl Default for PagedAncestry {
+    fn default() -> Self {
+        Self {
+            pages: tree::Pages::default(),
+            reader: None,
+            horizon: HISTORY_LIMIT_V1,
+        }
+    }
+}
+fn directory_error(error: crate::Error) -> Sg0Error {
+    match error {
+        crate::Error::Paused(_) => Sg0Error::ResourceBudget,
+        _ => Sg0Error::Invariant,
+    }
 }
 impl PagedAncestry {
-    pub(super) fn directory_bytes(&self) -> crate::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(PAGES * 33);
-        for leaf in &self.pages {
-            match leaf.as_deref() {
-                None => bytes.extend_from_slice(&[0; 33]),
-                Some(Leaf::Retained(id)) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(id);
-                }
-                Some(Leaf::Resident(_)) => {
-                    return Err(crate::Error::Unavailable(
-                        "directory requires disk ancestry",
-                    ));
-                }
-            }
+    fn check_position(&self, position: usize) -> Result<(), Sg0Error> {
+        if position >= self.horizon {
+            Err(Sg0Error::Invariant)
+        } else {
+            Ok(())
         }
-        Ok(bytes)
+    }
+    pub(super) fn directory_bytes(&self) -> crate::Result<Vec<u8>> {
+        self.pages.directory_bytes()
     }
     /// Addresses from private receiver-minted, hash-bound live directory pages.
     pub(super) fn from_live_directory(
         bytes: &[u8],
         reader: Arc<RetainedContext>,
     ) -> crate::Result<Self> {
-        if bytes.len() != PAGES * 33 {
-            return Err(crate::Error::Unavailable("ancestry directory length"));
-        }
-        let mut result = Self {
+        Ok(Self {
+            pages: tree::Pages::from_directory(
+                bytes,
+                HISTORY_LIMIT_V1.div_ceil(POSITIONS_PER_PAGE),
+            )?,
             reader: Some(reader),
             ..Self::default()
-        };
-        for (page, bytes) in result.pages.iter_mut().zip(bytes.chunks_exact(33)) {
-            match bytes[0] {
-                0 if bytes[1..].iter().all(|byte| *byte == 0) => {}
-                1 => {
-                    *page =
-                        Some(Arc::new(Leaf::Retained(bytes[1..].try_into().map_err(
-                            |_| crate::Error::Unavailable("ancestry directory id"),
-                        )?)));
-                }
-                _ => return Err(crate::Error::Unavailable("ancestry directory kind")),
-            }
-        }
-        Ok(result)
+        })
     }
     fn words(&self, page: usize) -> Result<Option<[u64; WORDS_PER_PAGE]>, Sg0Error> {
-        let Some(leaf) = self.pages.get(page).ok_or(Sg0Error::Invariant)? else {
+        if page >= self.horizon.div_ceil(POSITIONS_PER_PAGE) {
+            return Err(Sg0Error::Invariant);
+        }
+        let Some(leaf) = self
+            .pages
+            .get(page, self.reader.as_ref(), None)
+            .map_err(directory_error)?
+        else {
             return Ok(None);
         };
+        self.leaf_words(page, &leaf).map(Some)
+    }
+    fn leaf_words(&self, page: usize, leaf: &Arc<Leaf>) -> Result<[u64; WORDS_PER_PAGE], Sg0Error> {
         match leaf.as_ref() {
-            Leaf::Resident(words) => Ok(Some(*words)),
+            Leaf::Resident(words) => Ok(*words),
             Leaf::Retained(id) => {
                 let reader = self.reader.as_ref().ok_or(Sg0Error::Invariant)?;
                 let bytes = reader
@@ -180,19 +208,29 @@ impl PagedAncestry {
                 for (word, bytes) in words.iter_mut().zip(bytes[48..].chunks_exact(8)) {
                     *word = u64::from_le_bytes(bytes.try_into().map_err(|_| Sg0Error::Invariant)?);
                 }
-                Ok(Some(words))
+                Ok(words)
             }
         }
     }
     /// At most eight leaves, local to one complete strict-past traversal. Every
     /// retained byte is read/checked; no persistent read/validity cache is used.
+    #[cfg(test)]
     pub(super) fn materialize(&self) -> Result<Self, Sg0Error> {
-        let mut result = Self::default();
-        for page in 0..PAGES {
-            if let Some(words) = self.words(page)? {
-                result.pages[page] = Some(Arc::new(Leaf::Resident(words)));
-            }
-        }
+        let mut result = Self {
+            horizon: self.horizon,
+            ..Self::default()
+        };
+        self.pages
+            .visit(self.reader.as_ref(), None, &mut |page, leaf| {
+                if page >= self.horizon.div_ceil(POSITIONS_PER_PAGE) {
+                    return Err(crate::Error::Unavailable("ancestry leaf horizon"));
+                }
+                let words = self.leaf_words(page, &leaf).map_err(crate::Error::Order)?;
+                result
+                    .pages
+                    .set(page, Arc::new(Leaf::Resident(words)), None)
+            })
+            .map_err(directory_error)?;
         Ok(result)
     }
     /// Own only the set positions, in the same increasing ordinal order. Every
@@ -203,35 +241,34 @@ impl PagedAncestry {
         end: usize,
         budget: &JobBudget,
     ) -> Result<Vec<usize>, Sg0Error> {
-        if end > HISTORY_LIMIT_V1 {
+        if end > self.horizon {
             return Err(Sg0Error::Invariant);
         }
         budget.check().map_err(|_| Sg0Error::ResourceBudget)?;
-        for leaf in &self.pages {
-            if matches!(leaf.as_deref(), Some(Leaf::Retained(_))) {
-                budget.source().map_err(|_| Sg0Error::ResourceBudget)?;
-            }
-        }
-        let materialized = self.materialize()?;
         let mut positions = Vec::new();
-        for page in 0..PAGES {
-            budget.check().map_err(|_| Sg0Error::ResourceBudget)?;
-            let Some(words) = materialized.words(page)? else {
-                continue;
-            };
-            for (word_index, mut word) in words.into_iter().enumerate() {
-                budget.graph_read()?;
-                while word != 0 {
-                    let bit =
-                        usize::try_from(word.trailing_zeros()).map_err(|_| Sg0Error::Invariant)?;
-                    let position = page * POSITIONS_PER_PAGE + word_index * 64 + bit;
-                    if position < end {
-                        positions.push(position);
-                    }
-                    word &= word - 1;
+        self.pages
+            .visit(self.reader.as_ref(), Some(budget), &mut |page, leaf| {
+                if page >= self.horizon.div_ceil(POSITIONS_PER_PAGE) {
+                    return Err(crate::Error::Unavailable("ancestry leaf horizon"));
                 }
-            }
-        }
+                if matches!(leaf.as_ref(), Leaf::Retained(_)) {
+                    budget.source()?;
+                }
+                let words = self.leaf_words(page, &leaf).map_err(crate::Error::Order)?;
+                for (word_index, mut word) in words.into_iter().enumerate() {
+                    budget.graph_read()?;
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as usize;
+                        let position = page * POSITIONS_PER_PAGE + word_index * 64 + bit;
+                        if position < end {
+                            positions.push(position);
+                        }
+                        word &= word - 1;
+                    }
+                }
+                Ok(())
+            })
+            .map_err(directory_error)?;
         budget.check().map_err(|_| Sg0Error::ResourceBudget)?;
         Ok(positions)
     }
@@ -250,39 +287,38 @@ impl PagedAncestry {
         {
             return Err(crate::Error::Unavailable("ancestry reader context changed"));
         }
+        let pages = self
+            .pages
+            .retain(store, &reader, budget, &mut |page, leaf, store| {
+                budget.check()?;
+                if let Leaf::Retained(id) = leaf.as_ref() {
+                    return Ok(*id);
+                }
+                budget.source()?;
+                let words = self.leaf_words(page, leaf).map_err(crate::Error::Order)?;
+                let mut bytes = Vec::with_capacity(112);
+                bytes.extend_from_slice(b"SNF04AP1");
+                bytes.extend_from_slice(&reader.domain);
+                bytes.extend_from_slice(
+                    &u64::try_from(page)
+                        .map_err(|_| crate::Error::Unavailable("ancestry page index"))?
+                        .to_le_bytes(),
+                );
+                for word in words {
+                    bytes.extend_from_slice(&word.to_le_bytes());
+                }
+                let id = store.retain_ancestry_page(&bytes)?;
+                budget.check()?;
+                Ok(id)
+            })?;
         let mut next = self.clone();
-        for page in 0..PAGES {
-            budget.check()?;
-            let Some(leaf) = &self.pages[page] else {
-                continue;
-            };
-            if matches!(leaf.as_ref(), Leaf::Retained(_)) {
-                continue;
-            }
-            budget.source()?;
-            let words = self
-                .words(page)?
-                .ok_or(crate::Error::Unavailable("ancestry leaf disappeared"))?;
-            let mut bytes = Vec::with_capacity(112);
-            bytes.extend_from_slice(b"SNF04AP1");
-            bytes.extend_from_slice(&reader.domain);
-            bytes.extend_from_slice(
-                &u64::try_from(page)
-                    .map_err(|_| crate::Error::Unavailable("ancestry page index"))?
-                    .to_le_bytes(),
-            );
-            for word in words {
-                bytes.extend_from_slice(&word.to_le_bytes());
-            }
-            let id = store.retain_ancestry_page(&bytes)?;
-            next.pages[page] = Some(Arc::new(Leaf::Retained(id)));
-            budget.check()?;
-        }
+        next.pages = pages;
         next.reader = Some(reader);
         *self = next;
         Ok(())
     }
     pub(super) fn contains(&self, position: usize) -> Result<bool, Sg0Error> {
+        self.check_position(position)?;
         Ok(self
             .words(position / POSITIONS_PER_PAGE)?
             .is_some_and(|words| {
@@ -291,16 +327,20 @@ impl PagedAncestry {
     }
     #[cfg(test)]
     pub(super) fn retained_ids(&self) -> Vec<Digest> {
+        let mut ids = Vec::new();
         self.pages
-            .iter()
-            .filter_map(|leaf| match leaf.as_deref() {
-                Some(Leaf::Retained(id)) => Some(*id),
-                _ => None,
+            .visit(self.reader.as_ref(), None, &mut |_, leaf| {
+                if let Leaf::Retained(id) = leaf.as_ref() {
+                    ids.push(*id);
+                }
+                Ok(())
             })
-            .collect()
+            .unwrap();
+        ids
     }
 
     pub(super) fn insert(&mut self, position: usize) -> Result<(), Sg0Error> {
+        self.check_position(position)?;
         let page = position / POSITIONS_PER_PAGE;
         let mut words = self.words(page)?.unwrap_or([0; WORDS_PER_PAGE]);
         let word = position / 64 % WORDS_PER_PAGE;
@@ -309,12 +349,15 @@ impl PagedAncestry {
             return Ok(());
         }
         words[word] |= bit;
-        let leaf = self.pages[page].get_or_insert_with(|| Arc::new(Leaf::Resident(words)));
-        *Arc::make_mut(leaf) = Leaf::Resident(words);
-        Ok(())
+        self.pages
+            .set(page, Arc::new(Leaf::Resident(words)), self.reader.as_ref())
+            .map_err(directory_error)
     }
 
     pub(super) fn union(&mut self, other: &Self) -> Result<(), Sg0Error> {
+        if self.horizon != other.horizon {
+            return Err(Sg0Error::Invariant);
+        }
         if let (Some(a), Some(b)) = (&self.reader, &other.reader)
             && !Arc::ptr_eq(a, b)
         {
@@ -325,35 +368,55 @@ impl PagedAncestry {
         if next.reader.is_none() {
             next.reader.clone_from(&other.reader);
         }
-        for page in 0..PAGES {
-            let source = &other.pages[page];
-            let Some(source) = source else { continue };
-            let target = &mut next.pages[page];
-            let Some(target) = target else {
-                *target = Some(source.clone());
-                continue;
-            };
-            // Identical or already included leaves need no copy. This also
-            // keeps saturated prefix leaves shared when branches merge.
-            if Arc::ptr_eq(target, source) {
-                continue;
-            }
-            let mut target_words = self.words(page)?.ok_or(Sg0Error::Invariant)?;
-            let source_words = other.words(page)?.ok_or(Sg0Error::Invariant)?;
-            if source_words
-                .iter()
-                .zip(&target_words)
-                .all(|(s, t)| s & !t == 0)
-            {
-                continue;
-            }
-            for (target, source) in target_words.iter_mut().zip(source_words) {
-                *target |= source;
-            }
-            *target = Arc::new(Leaf::Resident(target_words));
-        }
+        other
+            .pages
+            .visit(other.reader.as_ref(), None, &mut |page, source| {
+                if page >= self.horizon.div_ceil(POSITIONS_PER_PAGE) {
+                    return Err(crate::Error::Unavailable("ancestry leaf horizon"));
+                }
+                let target = self.pages.get(page, self.reader.as_ref(), None)?;
+                let Some(target) = target else {
+                    next.pages.set(page, source, next.reader.as_ref())?;
+                    return Ok(());
+                };
+                // Identical or already included leaves need no copy. This also
+                // keeps saturated prefix leaves shared when branches merge.
+                if Arc::ptr_eq(&target, &source) {
+                    return Ok(());
+                }
+                let mut target_words = self
+                    .leaf_words(page, &target)
+                    .map_err(crate::Error::Order)?;
+                let source_words = other
+                    .leaf_words(page, &source)
+                    .map_err(crate::Error::Order)?;
+                if source_words
+                    .iter()
+                    .zip(&target_words)
+                    .all(|(s, t)| s & !t == 0)
+                {
+                    return Ok(());
+                }
+                for (target, source) in target_words.iter_mut().zip(source_words) {
+                    *target |= source;
+                }
+                next.pages.set(
+                    page,
+                    Arc::new(Leaf::Resident(target_words)),
+                    next.reader.as_ref(),
+                )
+            })
+            .map_err(directory_error)?;
         *self = next;
         Ok(())
+    }
+    #[cfg(test)]
+    fn test_leaf(&self, page: usize) -> Option<Arc<Leaf>> {
+        self.pages.get(page, self.reader.as_ref(), None).unwrap()
+    }
+    #[cfg(test)]
+    fn test_set(&mut self, page: usize, leaf: Arc<Leaf>) {
+        self.pages.set(page, leaf, self.reader.as_ref()).unwrap();
     }
 }
 
@@ -482,6 +545,7 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
         let held = path.with_extension("held");
         let mut operation = AncestryOperation::new(bound.as_ref());
+        let source_before = budget.source_calls();
         for position in 0..POSITIONS_PER_PAGE {
             assert_eq!(
                 operation.contains(&bits, position, &budget).unwrap(),
@@ -489,6 +553,9 @@ mod tests {
             );
         }
         assert_eq!(operation.loads(), 1);
+        // One root-branch qualification plus one leaf, not a branch reopen for
+        // every bit probe. The owned root key is scoped to this operation.
+        assert_eq!(budget.source_calls() - source_before, 2);
         assert_eq!(
             std::mem::size_of_val(&operation.leaf.as_ref().unwrap().2),
             64
@@ -525,7 +592,7 @@ mod tests {
             foreign[offset] ^= 1;
             let foreign_id = store.retain_ancestry_page(&foreign).unwrap();
             let mut wrong = bits.clone();
-            wrong.pages[0] = Some(Arc::new(Leaf::Retained(foreign_id)));
+            wrong.test_set(0, Arc::new(Leaf::Retained(foreign_id)));
             assert_eq!(fresh.contains(&wrong, 0, &budget), Err(Sg0Error::Invariant));
             assert_eq!(fresh.loads(), 1);
         }
@@ -579,7 +646,7 @@ mod tests {
             foreign[offset] ^= 1;
             let foreign_id = store.retain_ancestry_page(&foreign).unwrap();
             let mut wrong = bits.clone();
-            wrong.pages[0] = Some(Arc::new(Leaf::Retained(foreign_id)));
+            wrong.test_set(0, Arc::new(Leaf::Retained(foreign_id)));
             assert_eq!(wrong.contains(0), Err(Sg0Error::Invariant));
         }
         let other = RetainedContext::new(store.object_reader().unwrap(), [8; 32]);
@@ -600,10 +667,7 @@ mod tests {
         let mut child = left.clone();
         child.insert(513).unwrap();
         child.retain(&mut store, reader.clone(), &budget).unwrap();
-        assert!(Arc::ptr_eq(
-            left.pages[0].as_ref().unwrap(),
-            child.pages[0].as_ref().unwrap()
-        ));
+        assert_eq!(left.retained_ids()[0], child.retained_ids()[0]);
         assert!(!left.contains(513).unwrap());
         assert!(child.contains(513).unwrap());
         let mut right = PagedAncestry::default();
@@ -674,28 +738,28 @@ mod tests {
         let mut child = prefix.clone();
         child.insert(POSITIONS_PER_PAGE).unwrap();
         assert!(Arc::ptr_eq(
-            prefix.pages[0].as_ref().unwrap(),
-            child.pages[0].as_ref().unwrap()
+            &prefix.test_leaf(0).unwrap(),
+            &child.test_leaf(0).unwrap()
         ));
-        assert!(prefix.pages[1].is_none());
+        assert!(prefix.test_leaf(1).is_none());
         let mut fork = child.clone();
         fork.insert(POSITIONS_PER_PAGE + 1).unwrap();
         assert!(Arc::ptr_eq(
-            child.pages[0].as_ref().unwrap(),
-            fork.pages[0].as_ref().unwrap()
+            &child.test_leaf(0).unwrap(),
+            &fork.test_leaf(0).unwrap()
         ));
         assert!(!Arc::ptr_eq(
-            child.pages[1].as_ref().unwrap(),
-            fork.pages[1].as_ref().unwrap()
+            &child.test_leaf(1).unwrap(),
+            &fork.test_leaf(1).unwrap()
         ));
         assert!(!child.contains(POSITIONS_PER_PAGE + 1).unwrap());
-        let before = fork.pages[1].as_ref().unwrap().clone();
+        let before = fork.test_leaf(1).unwrap();
         fork.insert(POSITIONS_PER_PAGE + 1).unwrap();
         fork.union(&child).unwrap();
-        assert!(Arc::ptr_eq(&before, fork.pages[1].as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&before, &fork.test_leaf(1).unwrap()));
         assert_eq!(
             std::mem::size_of::<PagedAncestry>(),
-            (PAGES + 1) * std::mem::size_of::<usize>()
+            4 * std::mem::size_of::<usize>()
         );
         assert_eq!(std::mem::size_of::<[u64; WORDS_PER_PAGE]>(), 64);
     }
@@ -704,12 +768,134 @@ mod tests {
     fn paged_ancestry_outside_horizon_refuses_without_mutation() {
         let mut bits = PagedAncestry::default();
         bits.insert(4095).unwrap();
-        let retained = bits.pages[7].as_ref().unwrap().clone();
+        let retained = bits.test_leaf(7).unwrap();
         for position in [HISTORY_LIMIT_V1, usize::MAX] {
             assert_eq!(bits.contains(position), Err(Sg0Error::Invariant));
             assert_eq!(bits.insert(position), Err(Sg0Error::Invariant));
-            assert!(Arc::ptr_eq(&retained, bits.pages[7].as_ref().unwrap()));
+            assert!(Arc::ptr_eq(&retained, &bits.test_leaf(7).unwrap()));
         }
         assert!(bits.contains(4095).unwrap());
+    }
+    #[test]
+    fn extensible_ancestry_root_crosses_old_geometry_and_rejects_deep_damage_atomically() {
+        // Synthetic auxiliary positions only. The integrated node policy and
+        // every consensus/crypto/graph/order/ledger/sync limit remain unchanged.
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        store
+            .begin_replay(b"synthetic extensible ancestry root")
+            .unwrap();
+        let reader = context(&store);
+        let budget = JobBudget::checkpoint().unwrap();
+        let horizon = 1_048_576;
+        let positions = [
+            0,
+            511,
+            512,
+            4095,
+            4096,
+            32767,
+            32768,
+            65535,
+            65536,
+            horizon - 1,
+        ];
+        let mut bits = PagedAncestry {
+            horizon,
+            ..PagedAncestry::default()
+        };
+        for position in positions {
+            bits.insert(position).unwrap();
+        }
+        let prior = bits.clone();
+        let mut fork = bits.clone();
+        fork.insert(4097).unwrap();
+        assert!(Arc::ptr_eq(
+            &prior.test_leaf(0).unwrap(),
+            &fork.test_leaf(0).unwrap()
+        ));
+        assert!(!prior.contains(4097).unwrap());
+        bits.union(&fork).unwrap();
+        bits.retain(&mut store, reader.clone(), &budget).unwrap();
+        let entry = bits.directory_bytes().unwrap();
+        assert_eq!(entry.len(), 34);
+        assert_eq!(entry[0], 4);
+        // Higher-depth roots cannot be injected into the unchanged node policy.
+        assert!(PagedAncestry::from_live_directory(&entry, reader.clone()).is_err());
+        let restored = PagedAncestry {
+            pages: tree::Pages::from_directory(&entry, horizon.div_ceil(POSITIONS_PER_PAGE))
+                .unwrap(),
+            reader: Some(reader.clone()),
+            horizon,
+        };
+        let expected: Vec<_> = positions
+            .into_iter()
+            .chain([4097])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            restored.positions_before(horizon, &budget).unwrap(),
+            expected
+        );
+        assert_eq!(
+            restored.positions_before(4097, &budget).unwrap(),
+            expected
+                .iter()
+                .copied()
+                .filter(|p| *p < 4097)
+                .collect::<Vec<_>>()
+        );
+        assert!(!restored.contains(12345).unwrap());
+        let ids = restored.retained_ids();
+        let tail = page_path(&temp, *ids.last().unwrap());
+        let held = tail.with_extension("held");
+        std::fs::rename(&tail, &held).unwrap();
+        assert_eq!(
+            restored.positions_before(0, &budget),
+            Err(Sg0Error::Invariant)
+        );
+        let mut merged = prior.clone();
+        let before = merged.positions_before(horizon, &budget).unwrap();
+        assert_eq!(merged.union(&restored), Err(Sg0Error::Invariant));
+        assert_eq!(merged.positions_before(horizon, &budget).unwrap(), before);
+        std::fs::rename(&held, &tail).unwrap();
+        let root: Digest = entry[2..].try_into().unwrap();
+        let root_path = page_path(&temp, root);
+        let bytes = std::fs::read(&root_path).unwrap();
+        assert_eq!(bytes.len(), 320);
+        assert_eq!(&bytes[..8], b"SNF04AD2");
+        for offset in [8, 40, 48] {
+            let mut foreign = bytes.clone();
+            foreign[offset] ^= 1;
+            // Keep a structurally writable depth while making the expected
+            // root coordinate wrong. A valid content hash alone is not enough.
+            let id = store.retain_ancestry_directory_page(&foreign).unwrap();
+            let mut wrong_entry = entry.clone();
+            wrong_entry[2..].copy_from_slice(&id);
+            let wrong = PagedAncestry {
+                pages: tree::Pages::from_directory(
+                    &wrong_entry,
+                    horizon.div_ceil(POSITIONS_PER_PAGE),
+                )
+                .unwrap(),
+                reader: Some(reader.clone()),
+                horizon,
+            };
+            assert_eq!(wrong.positions_before(0, &budget), Err(Sg0Error::Invariant));
+        }
+        std::fs::hard_link(&root_path, root_path.with_extension("linked")).unwrap();
+        assert_eq!(restored.contains(0), Err(Sg0Error::Invariant));
+        std::fs::remove_file(root_path.with_extension("linked")).unwrap();
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert_eq!(
+            restored.positions_before(0, &expired),
+            Err(Sg0Error::ResourceBudget)
+        );
+        assert_eq!(restored.contains(horizon), Err(Sg0Error::Invariant));
+        assert_eq!(
+            restored.positions_before(horizon, &budget).unwrap(),
+            expected
+        );
+        assert_eq!(store.head(), None);
     }
 }

@@ -312,6 +312,26 @@ impl Store {
             )),
         }
     }
+    /// Receiver-local extensible ancestry address branch, never cold validity.
+    pub(crate) fn retain_ancestry_directory_page(&mut self, bytes: &[u8]) -> Result<Digest> {
+        if bytes.len() != 320
+            || bytes.get(..8) != Some(b"SNF04AD2")
+            || !(1..=21).contains(&bytes[48])
+            || bytes[49..56].iter().any(|b| *b != 0)
+            || (self.active_job()?.is_none() && self.active_replay()?.is_none())
+        {
+            return Err(Error::Unavailable(
+                "ancestry directory requires active verified transition",
+            ));
+        }
+        self.retain_ledger_page(
+            bytes,
+            "ancestry directory writer stopped",
+            "retained ancestry directory damaged",
+            "post-ancestry-directory host margin",
+            "retained ancestry directory publication failed",
+        )
+    }
     /// Derived encrypted recovery rows ONLY inside a fenced verified transition.
     /// No head/pointer changes or persistent validity constructor are installed.
     pub(crate) fn retain_recovery_page(&mut self, bytes: &[u8]) -> Result<Digest> {
@@ -421,15 +441,19 @@ impl Store {
     /// Private live receiver-derived vertex directory; never cold validity input.
     pub(crate) fn retain_vertex_directory_page(&mut self, bytes: &[u8]) -> Result<Digest> {
         const HEADER: usize = 52;
-        const SLOT: usize = 561;
+        let slot = match bytes.get(..8) {
+            Some(b"SNF04DP1") => 561, // Preserve old physical objects/writer checks.
+            Some(b"SNF04DP2") => 331,
+            _ => 0,
+        };
         let count = if bytes.len() >= HEADER {
             u32le(bytes, 48)? as usize
         } else {
             0
         };
-        if bytes.get(..8) != Some(b"SNF04DP1")
+        if slot == 0
             || !(1..=64).contains(&count)
-            || bytes.len() != HEADER + count * SLOT
+            || bytes.len() != HEADER + count * slot
             || (self.active_job()?.is_none() && self.active_replay()?.is_none())
         {
             return Err(Error::Unavailable(
