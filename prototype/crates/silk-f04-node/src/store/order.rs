@@ -13,8 +13,9 @@ use std::{collections::BTreeMap, fs::File, io::Write};
 const HEADER: usize = 76;
 const ROWS: usize = 64;
 const FANOUT: usize = 8;
-const LIMIT: usize = ROWS * FANOUT * FANOUT;
-const _: () = assert!(LIMIT == crate::sync::HISTORY_LIMIT_V1);
+// Node policy is separate from physical tree geometry. It stays unchanged
+// until the coupled graph/ledger/sync resource path can admit a larger history.
+const LIMIT: usize = crate::sync::HISTORY_LIMIT_V1;
 const DESCRIPTOR: usize = 8 + HEADER + 32;
 const PAGE_LIMIT: usize = 12 + ROWS * 32;
 const DAMAGED: &str = "retained order representation damaged";
@@ -112,38 +113,95 @@ fn visit_tree(
             "shared order requires more than one leaf",
         ));
     }
-    let mut roots = Vec::with_capacity(FANOUT);
-    for (group, rows) in order[HEADER..].chunks(ROWS * FANOUT * 32).enumerate() {
-        let mut children = Vec::with_capacity(FANOUT);
-        for (offset, rows) in rows.chunks(ROWS * 32).enumerate() {
-            budget.check()?;
-            let mut bytes = page_header(*b"SNF04OL1", rows.len() / 32, 0, group * FANOUT + offset)?;
-            bytes.extend_from_slice(rows);
-            let id = raw_hash(&bytes);
-            visit(Page { id, bytes })?;
-            children.push(id);
-        }
-        budget.check()?;
-        let mut bytes = page_header(*b"SNF04OB1", 1, children.len(), group * FANOUT)?;
-        for id in children {
-            bytes.extend_from_slice(&id);
-        }
-        let id = raw_hash(&bytes);
-        visit(Page { id, bytes })?;
-        roots.push(id);
-    }
-    budget.check()?;
-    let mut bytes = page_header(*b"SNF04OB1", 2, roots.len(), 0)?;
-    for id in roots {
-        bytes.extend_from_slice(&id);
-    }
-    let root = raw_hash(&bytes);
-    visit(Page { id: root, bytes })?;
+    let root = derive_branch(order, n, root_level(n)?, 0, budget, visit)?;
     budget.check()?;
     let mut descriptor = Vec::from(b"SNF04OT1".as_slice());
     descriptor.extend_from_slice(&order[..HEADER]);
     descriptor.extend_from_slice(&root);
     Ok(descriptor)
+}
+
+fn branch_stride(level: usize) -> Result<usize> {
+    let exponent = level.checked_sub(1).ok_or(Error::Unavailable(DAMAGED))?;
+    FANOUT
+        .checked_pow(u32::try_from(exponent).map_err(|_| Error::Unavailable(DAMAGED))?)
+        .ok_or(Error::Unavailable(DAMAGED))
+}
+fn root_level(n: usize) -> Result<usize> {
+    let leaves = n.div_ceil(ROWS);
+    if leaves == 0 || leaves > usize::from(u16::MAX) + 1 {
+        return Err(Error::Unavailable("order page coordinate horizon"));
+    }
+    // Preserve the existing two-level root even for only two leaves. Larger
+    // shapes add levels, never change the old descriptor or page bytes.
+    let mut level = 2;
+    while branch_stride(level)?
+        .checked_mul(FANOUT)
+        .ok_or(Error::Unavailable(DAMAGED))?
+        < leaves
+    {
+        level += 1;
+    }
+    Ok(level)
+}
+fn derive_branch(
+    order: &[u8],
+    n: usize,
+    level: usize,
+    base: usize,
+    budget: &JobBudget,
+    visit: &mut impl FnMut(Page) -> Result<()>,
+) -> Result<Digest> {
+    budget.check()?;
+    let stride = branch_stride(level)?;
+    let remaining = n
+        .div_ceil(ROWS)
+        .checked_sub(base)
+        .filter(|n| *n != 0)
+        .ok_or(Error::Unavailable(DAMAGED))?;
+    let count = remaining.div_ceil(stride).min(FANOUT);
+    let mut children = Vec::with_capacity(count);
+    for slot in 0..count {
+        let child_base = base
+            .checked_add(
+                slot.checked_mul(stride)
+                    .ok_or(Error::Unavailable(DAMAGED))?,
+            )
+            .ok_or(Error::Unavailable(DAMAGED))?;
+        let id = if level > 1 {
+            derive_branch(order, n, level - 1, child_base, budget, visit)?
+        } else {
+            let start = HEADER
+                .checked_add(
+                    child_base
+                        .checked_mul(ROWS * 32)
+                        .ok_or(Error::Unavailable(DAMAGED))?,
+                )
+                .ok_or(Error::Unavailable(DAMAGED))?;
+            let rows = n
+                .checked_sub(child_base * ROWS)
+                .ok_or(Error::Unavailable(DAMAGED))?
+                .min(ROWS);
+            let end = start
+                .checked_add(rows * 32)
+                .ok_or(Error::Unavailable(DAMAGED))?;
+            let mut bytes = page_header(*b"SNF04OL1", rows, 0, child_base)?;
+            bytes.extend_from_slice(order.get(start..end).ok_or(Error::Unavailable(DAMAGED))?);
+            let id = raw_hash(&bytes);
+            visit(Page { id, bytes })?;
+            id
+        };
+        children.push(id);
+    }
+    budget.check()?;
+    let mut bytes = page_header(*b"SNF04OB1", level, count, base)?;
+    for id in children {
+        bytes.extend_from_slice(&id);
+    }
+    let id = raw_hash(&bytes);
+    visit(Page { id, bytes })?;
+    budget.check()?;
+    Ok(id)
 }
 
 impl ObjectReader {
@@ -217,7 +275,7 @@ impl ObjectReader {
         hash.update(header);
         self.order_branch(
             root,
-            2,
+            root_level(n)?,
             0,
             n,
             &mut |rows| {
@@ -249,8 +307,12 @@ impl ObjectReader {
         budget: &JobBudget,
     ) -> Result<()> {
         let bytes = self.order_page(id, budget)?;
-        let stride = if level == 2 { FANOUT } else { 1 };
-        let remaining_pages = n.div_ceil(ROWS) - base;
+        let stride = branch_stride(level)?;
+        let remaining_pages = n
+            .div_ceil(ROWS)
+            .checked_sub(base)
+            .filter(|n| *n != 0)
+            .ok_or(Error::Unavailable(DAMAGED))?;
         let children = remaining_pages.div_ceil(stride).min(FANOUT);
         let header = page_header(*b"SNF04OB1", level, children, base)?;
         if bytes.len() != 12 + children * 32 || bytes.get(..12) != Some(header.as_slice()) {
@@ -258,9 +320,11 @@ impl ObjectReader {
         }
         for (i, row) in bytes[12..].chunks_exact(32).enumerate() {
             let child = row.try_into().map_err(|_| Error::Unavailable(DAMAGED))?;
-            let child_base = base + i * stride;
-            if level == 2 {
-                self.order_branch(child, 1, child_base, n, visit, budget)?;
+            let child_base = base
+                .checked_add(i.checked_mul(stride).ok_or(Error::Unavailable(DAMAGED))?)
+                .ok_or(Error::Unavailable(DAMAGED))?;
+            if level > 1 {
+                self.order_branch(child, level - 1, child_base, n, visit, budget)?;
             } else {
                 let leaf = self.order_page(child, budget)?;
                 let rows = (n - child_base * ROWS).min(ROWS);

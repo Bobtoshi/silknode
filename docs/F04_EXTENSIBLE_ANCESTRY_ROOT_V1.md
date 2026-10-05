@@ -1,5 +1,8 @@
 # Extensible receiver ancestry roots
 
+Follow-up: [extensible physical order geometry](F04_EXTENSIBLE_ORDER_GEOMETRY_V1.md)
+removes the next hard-coded tree shape, with separate synthetic evidence only.
+
 Implemented private, valueless core mechanism, 5 October 2026. The fixed
 eight-leaf address array is replaced by an immutable, sparse eight-way page
 tree. Updating one leaf copies its branch path; a retained ancestry owns one

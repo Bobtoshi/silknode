@@ -30,6 +30,141 @@ fn names(root: &std::path::Path) -> HashSet<std::ffi::OsString> {
 }
 
 #[test]
+fn extensible_order_geometry_matches_independent_levels_and_refuses_bad_coordinates() {
+    // Auxiliary physical shapes ONLY. Production admission/commit/read policy
+    // remains 4096; these synthetic rows confer no graph or ordering validity.
+    for (n, depth) in [(4097, 3), (32768, 3), (32769, 4)] {
+        let original = order(n);
+        let b = budget();
+        assert_eq!(root_level(n).unwrap(), depth);
+        let mut expected = BTreeMap::new();
+        let mut level_ids = Vec::new();
+        for (base, rows) in original[HEADER..].chunks(ROWS * 32).enumerate() {
+            let mut bytes = page_header(*b"SNF04OL1", rows.len() / 32, 0, base).unwrap();
+            bytes.extend_from_slice(rows);
+            let id = raw_hash(&bytes);
+            expected.insert(id, bytes);
+            level_ids.push(id);
+        }
+        let final_leaf = *level_ids.last().unwrap();
+        for level in 1..=depth {
+            let mut next = Vec::new();
+            for (group, ids) in level_ids.chunks(FANOUT).enumerate() {
+                let mut bytes = page_header(
+                    *b"SNF04OB1",
+                    level,
+                    ids.len(),
+                    group * FANOUT.pow(level as u32),
+                )
+                .unwrap();
+                for id in ids {
+                    bytes.extend_from_slice(id);
+                }
+                let id = raw_hash(&bytes);
+                expected.insert(id, bytes);
+                next.push(id);
+            }
+            level_ids = next;
+        }
+        assert_eq!(level_ids.len(), 1);
+        let (temp, mut store) = ancestry_test_store();
+        store
+            .begin_job(b"synthetic extensible physical order shape")
+            .unwrap();
+        let mut observed = BTreeMap::new();
+        let root = derive_branch(&original, n, depth, 0, &b, &mut |page| {
+            assert!(page.bytes.len() <= PAGE_LIMIT);
+            assert_eq!(store.put(&page.bytes)?, page.id);
+            assert!(observed.insert(page.id, page.bytes).is_none());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(root, level_ids[0]);
+        assert_eq!(observed, expected);
+        let reader = store.object_reader().unwrap();
+        let mut rows = Vec::new();
+        reader
+            .order_branch(
+                root,
+                depth,
+                0,
+                n,
+                &mut |page| {
+                    assert!(page.len() <= ROWS * 32);
+                    rows.extend_from_slice(page);
+                    Ok(())
+                },
+                &b,
+            )
+            .unwrap();
+        assert_eq!(rows, original[HEADER..]);
+        let mut hash = Sha256::new();
+        hash.update(&original[..HEADER]);
+        hash.update(&rows);
+        assert_eq!(Digest::from(hash.finalize()), raw_hash(&original));
+        for (level, base) in [(depth - 1, 0), (depth, 1)] {
+            assert!(
+                reader
+                    .order_branch(
+                        root,
+                        level,
+                        base,
+                        n,
+                        &mut |_| panic!("bad coordinate visitor"),
+                        &b
+                    )
+                    .is_err()
+            );
+        }
+        let path = object_path(&temp.path().join("store"), final_leaf);
+        let held = path.with_extension("held");
+        fs::rename(&path, &held).unwrap();
+        let mut calls = 0;
+        assert!(
+            reader
+                .order_branch(
+                    root,
+                    depth,
+                    0,
+                    n,
+                    &mut |_| {
+                        calls += 1;
+                        Ok(())
+                    },
+                    &b
+                )
+                .is_err()
+        );
+        assert_eq!(calls, n.div_ceil(ROWS) - 1);
+        fs::rename(&held, &path).unwrap();
+        let expired = JobBudget::testing(Duration::ZERO).unwrap();
+        assert!(
+            reader
+                .order_branch(
+                    root,
+                    depth,
+                    0,
+                    n,
+                    &mut |_| panic!("expired visitor"),
+                    &expired
+                )
+                .is_err()
+        );
+        // The extensible representation is NOT a silent production cap lift.
+        assert!(
+            store
+                .commit_ordered(&[], &original, b"unadmitted oversize", &b)
+                .is_err()
+        );
+        assert_eq!(store.head(), None);
+    }
+    assert!(root_level(0).is_err());
+    assert!(root_level(usize::MAX).is_err());
+    assert!(branch_stride(0).is_err());
+    assert!(branch_stride(usize::MAX).is_err());
+}
+
+#[test]
 fn streaming_order_exact_pages_hash_tail_and_original_budget() {
     let (temp, mut store) = ancestry_test_store();
     let root = temp.path().join("store");
