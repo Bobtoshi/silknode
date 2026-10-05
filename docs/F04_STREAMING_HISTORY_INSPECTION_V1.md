@@ -1,5 +1,9 @@
 # F0.4 bounded history inspection
 
+Follow-up: [bounded order publication](F04_STREAMING_ORDER_PUBLICATION_V1.md)
+removes physical page-payload staging from the writer without changing formats
+or limits. Its separate source/ELF evidence does not extend these test results.
+
 Private, valueless implementation slice, 5 October 2026. Reconciliation,
 publication-capacity preflight and selected-parent qualification no longer
 reconstruct a complete preferred-order ID vector or materialize the complete

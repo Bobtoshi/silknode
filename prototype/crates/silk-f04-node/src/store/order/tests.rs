@@ -109,6 +109,88 @@ fn streaming_order_exact_pages_hash_tail_and_original_budget() {
 }
 
 #[test]
+fn streaming_publication_preserves_every_reference_page_descriptor_and_charge() {
+    let b = budget();
+    for n in [65, 66, 511, 512, 513, 4095, LIMIT] {
+        let original = order(n);
+        let reference = Tree::derive(&original, &b).unwrap();
+        let expected: BTreeMap<_, _> = reference
+            .pages
+            .into_iter()
+            .map(|page| (page.id, page.bytes))
+            .collect();
+        let mut observed = BTreeMap::new();
+        let descriptor = visit_tree(&original, &b, &mut |page| {
+            assert!(page.bytes.len() <= PAGE_LIMIT);
+            assert!(observed.insert(page.id, page.bytes).is_none());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(descriptor, reference.descriptor);
+        assert_eq!(observed, expected);
+    }
+    let (temp, mut store) = ancestry_test_store();
+    let root = temp.path().join("store");
+    let marker = store.begin_job(b"synthetic streamed publication").unwrap();
+    for n in [65, 66, 513, 514] {
+        let original = order(n);
+        let Plan::Shared {
+            descriptor,
+            missing,
+        } = store.plan_order(&original, &b).unwrap()
+        else {
+            panic!("new synthetic order must be shared");
+        };
+        let reference = Tree::derive(&original, &b).unwrap();
+        let expected: BTreeMap<_, _> = reference
+            .pages
+            .into_iter()
+            .filter(|page| !object_path(&root, page.id).exists())
+            .map(|page| (page.id, page.bytes.len()))
+            .collect();
+        assert_eq!(missing, expected);
+        assert_eq!(descriptor, reference.descriptor);
+        let prior = store.accounted_bytes();
+        let head = n.to_le_bytes();
+        let expected_charge = 4 * 4096
+            + charge(head.len() as u64)
+            + charge(DESCRIPTOR as u64)
+            + missing
+                .values()
+                .map(|size| charge(*size as u64))
+                .sum::<u64>();
+        store.commit_ordered(&[], &original, &head, &b).unwrap();
+        assert_eq!(store.accounted_bytes() - prior, expected_charge);
+        assert_eq!(
+            store.order_object(raw_hash(&original), &b).unwrap(),
+            original
+        );
+        assert!(matches!(
+            store.plan_order(&original, &b).unwrap(),
+            Plan::Existing
+        ));
+    }
+    store.finish_job(marker, true).unwrap();
+    drop(store);
+    let margin = std::env::var_os("SILK_F04_HOST_MARGIN")
+        .map_or_else(|| temp.path().to_owned(), std::path::PathBuf::from);
+    let reopened = Store::open(&root, &margin).unwrap();
+    assert_eq!(
+        reopened.order_object(raw_hash(&order(514)), &b).unwrap(),
+        order(514)
+    );
+    let before = names(&root);
+    let expired = JobBudget::testing(Duration::ZERO).unwrap();
+    assert!(
+        visit_tree(&order(515), &expired, &mut |_| panic!(
+            "expired publication visitor"
+        ))
+        .is_err()
+    );
+    assert_eq!(names(&root), before);
+}
+
+#[test]
 fn shared_order_codec_boundaries_and_closed_shapes() {
     let (temp, mut store) = ancestry_test_store();
     let root = temp.path().join("store");

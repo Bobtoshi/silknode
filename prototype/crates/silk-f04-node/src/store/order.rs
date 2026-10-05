@@ -8,7 +8,7 @@ use crate::{
 };
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest as _, Sha256};
-use std::{fs::File, io::Write};
+use std::{collections::BTreeMap, fs::File, io::Write};
 
 const HEADER: usize = 76;
 const ROWS: usize = 64;
@@ -34,6 +34,7 @@ struct Page {
     id: Digest,
     bytes: Vec<u8>,
 }
+#[cfg(test)]
 struct Tree {
     descriptor: Vec<u8>,
     pages: Vec<Page>,
@@ -54,6 +55,7 @@ fn page_header(
     );
     Ok(bytes)
 }
+#[cfg(test)]
 impl Tree {
     fn derive(order: &[u8], budget: &JobBudget) -> Result<Self> {
         let n = count(order)?;
@@ -95,6 +97,53 @@ impl Tree {
         descriptor.extend_from_slice(&root);
         Ok(Self { descriptor, pages })
     }
+}
+
+/// Derive identical existing tree bytes in a depth-first page walk. Production
+/// planning retains addresses/lengths only, never every physical page payload.
+fn visit_tree(
+    order: &[u8],
+    budget: &JobBudget,
+    visit: &mut impl FnMut(Page) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let n = count(order)?;
+    if n <= ROWS {
+        return Err(Error::Unavailable(
+            "shared order requires more than one leaf",
+        ));
+    }
+    let mut roots = Vec::with_capacity(FANOUT);
+    for (group, rows) in order[HEADER..].chunks(ROWS * FANOUT * 32).enumerate() {
+        let mut children = Vec::with_capacity(FANOUT);
+        for (offset, rows) in rows.chunks(ROWS * 32).enumerate() {
+            budget.check()?;
+            let mut bytes = page_header(*b"SNF04OL1", rows.len() / 32, 0, group * FANOUT + offset)?;
+            bytes.extend_from_slice(rows);
+            let id = raw_hash(&bytes);
+            visit(Page { id, bytes })?;
+            children.push(id);
+        }
+        budget.check()?;
+        let mut bytes = page_header(*b"SNF04OB1", 1, children.len(), group * FANOUT)?;
+        for id in children {
+            bytes.extend_from_slice(&id);
+        }
+        let id = raw_hash(&bytes);
+        visit(Page { id, bytes })?;
+        roots.push(id);
+    }
+    budget.check()?;
+    let mut bytes = page_header(*b"SNF04OB1", 2, roots.len(), 0)?;
+    for id in roots {
+        bytes.extend_from_slice(&id);
+    }
+    let root = raw_hash(&bytes);
+    visit(Page { id: root, bytes })?;
+    budget.check()?;
+    let mut descriptor = Vec::from(b"SNF04OT1".as_slice());
+    descriptor.extend_from_slice(&order[..HEADER]);
+    descriptor.extend_from_slice(&root);
+    Ok(descriptor)
 }
 
 impl ObjectReader {
@@ -231,7 +280,7 @@ enum Plan {
     Raw,
     Shared {
         descriptor: Vec<u8>,
-        missing: Vec<Page>,
+        missing: BTreeMap<Digest, usize>,
     },
 }
 impl Store {
@@ -241,8 +290,21 @@ impl Store {
     fn plan_order(&self, order: &[u8], budget: &JobBudget) -> Result<Plan> {
         let n = count(order)?;
         let reader = self.object_reader()?;
-        match reader.order(raw_hash(order), order.len(), budget) {
-            Ok(existing) if existing == order => return Ok(Plan::Existing),
+        let mut at = HEADER;
+        let existing = reader.visit_order(raw_hash(order), order.len(), budget, &mut |rows| {
+            let end = at
+                .checked_add(rows.len())
+                .ok_or(Error::Unavailable(DAMAGED))?;
+            if order.get(at..end) != Some(rows) {
+                return Err(Error::Unavailable(DAMAGED));
+            }
+            at = end;
+            Ok(())
+        });
+        match existing {
+            Ok(header) if order[..HEADER] == header && at == order.len() => {
+                return Ok(Plan::Existing);
+            }
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(error @ Error::Paused(_)) => return Err(error),
             _ => return Err(Error::Unavailable(DAMAGED)),
@@ -255,19 +317,23 @@ impl Store {
                 "shared order requires active verified transition",
             ));
         }
-        let tree = Tree::derive(order, budget)?;
-        let mut missing = Vec::new();
-        for page in tree.pages {
+        let mut missing = BTreeMap::new();
+        let descriptor = visit_tree(order, budget, &mut |page| {
             budget.check()?;
             budget.source()?;
             match reader.object(page.id, PAGE_LIMIT) {
                 Ok(bytes) if bytes == page.bytes => {}
-                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => missing.push(page),
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if missing.insert(page.id, page.bytes.len()).is_some() {
+                        return Err(Error::Unavailable("duplicate derived order page"));
+                    }
+                }
                 _ => return Err(Error::Unavailable(DAMAGED)),
             }
-        }
+            Ok(())
+        })?;
         Ok(Plan::Shared {
-            descriptor: tree.descriptor,
+            descriptor,
             missing,
         })
     }
@@ -307,15 +373,14 @@ impl Store {
             Plan::Shared {
                 descriptor,
                 missing,
-            } => missing.iter().try_fold(
+            } => missing.values().try_fold(
                 charge(
                     u64::try_from(descriptor.len())
                         .map_err(|_| Error::Paused("commit group overflow"))?,
                 ),
-                |sum, page| {
+                |sum, size| {
                     sum.checked_add(charge(
-                        u64::try_from(page.bytes.len())
-                            .map_err(|_| Error::Paused("commit group overflow"))?,
+                        u64::try_from(*size).map_err(|_| Error::Paused("commit group overflow"))?,
                     ))
                     .ok_or(Error::Paused("commit group overflow"))
                 },
@@ -343,12 +408,21 @@ impl Store {
                 }
                 Plan::Shared {
                     descriptor,
-                    missing,
+                    mut missing,
                 } => {
-                    for page in missing {
+                    let regenerated = visit_tree(order, budget, &mut |page| {
                         budget.check()?;
-                        budget.source()?;
-                        self.put(&page.bytes)?;
+                        if let Some(size) = missing.remove(&page.id) {
+                            if size != page.bytes.len() {
+                                return Err(Error::Unavailable("derived order plan mismatch"));
+                            }
+                            budget.source()?;
+                            self.put(&page.bytes)?;
+                        }
+                        Ok(())
+                    })?;
+                    if !missing.is_empty() || regenerated != descriptor {
+                        return Err(Error::Unavailable("derived order plan mismatch"));
                     }
                     self.directory.sync_all()?;
                     budget.check()?;

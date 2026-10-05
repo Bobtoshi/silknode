@@ -1,5 +1,9 @@
 # F0.4 shared physical ordering history
 
+Follow-up: [bounded physical publication](F04_STREAMING_ORDER_PUBLICATION_V1.md)
+keeps these exact bytes and charges while replacing all-page payload staging
+with a metadata-only plan and page-at-a-time writer. The horizons are unchanged.
+
 This prototype changes local physical storage, not graph ordering or consensus.
 The canonical `SNF04OR1` bytes, their SHA-256, and generation `Record.order`
 remain identical. Admission, checkpoint publication, clock flush and cold replay
