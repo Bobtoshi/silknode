@@ -116,6 +116,9 @@ pub(crate) struct RetainedContext {
     domain: Digest,
 }
 impl RetainedContext {
+    pub(super) fn limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        self.objects.limits()
+    }
     pub(super) const fn domain(&self) -> Digest {
         self.domain
     }
@@ -148,6 +151,12 @@ fn directory_error(error: crate::Error) -> Sg0Error {
     }
 }
 impl PagedAncestry {
+    pub(super) fn with_horizon(horizon: usize) -> Self {
+        Self {
+            horizon,
+            ..Self::default()
+        }
+    }
     fn check_position(&self, position: usize) -> Result<(), Sg0Error> {
         if position >= self.horizon {
             Err(Sg0Error::Invariant)
@@ -166,10 +175,10 @@ impl PagedAncestry {
         Ok(Self {
             pages: tree::Pages::from_directory(
                 bytes,
-                HISTORY_LIMIT_V1.div_ceil(POSITIONS_PER_PAGE),
+                reader.limits().vertices().div_ceil(POSITIONS_PER_PAGE),
             )?,
+            horizon: reader.limits().vertices(),
             reader: Some(reader),
-            ..Self::default()
         })
     }
     fn words(&self, page: usize) -> Result<Option<[u64; WORDS_PER_PAGE]>, Sg0Error> {
@@ -280,6 +289,9 @@ impl PagedAncestry {
         reader: Arc<RetainedContext>,
         budget: &JobBudget,
     ) -> crate::Result<()> {
+        if store.limits() != reader.limits() {
+            return Err(crate::Error::Unavailable("ancestry local resource profile"));
+        }
         if self
             .reader
             .as_ref()
@@ -432,6 +444,39 @@ mod tests {
             .join("store")
             .join(format!("{}.obj", hex::encode(id)))
     }
+    #[test]
+    fn explicit_profile_ancestry_reads_positions_past_reference_and_refuses_foreign_reader() {
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let (temp, store) = crate::store::ancestry_test_store();
+        let mut store = store.with_limits(limits);
+        let reader = context(&store);
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic selected profile ancestry")
+            .unwrap();
+        let mut bits = PagedAncestry::with_horizon(limits.vertices());
+        for position in [4095, 4096, 4103, 8191] {
+            bits.insert(position).unwrap();
+        }
+        assert!(bits.insert(8192).is_err());
+        bits.retain(&mut store, reader.clone(), &budget).unwrap();
+        let directory = bits.directory_bytes().unwrap();
+        let read = PagedAncestry::from_live_directory(&directory, reader).unwrap();
+        for position in [4095, 4096, 4103, 8191] {
+            assert!(read.contains(position).unwrap());
+        }
+        assert!(!read.contains(8190).unwrap());
+        let (_other, reference) = crate::store::ancestry_test_store();
+        assert!(PagedAncestry::from_live_directory(&directory, context(&reference)).is_err());
+        let last = *bits.retained_ids().last().unwrap();
+        let path = page_path(&temp, last);
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(read.contains(8191).is_err());
+        std::fs::rename(&held, &path).unwrap();
+        assert!(read.contains(8191).unwrap());
+    }
+
     #[test]
     fn disk_ancestry_reads_actual_retained_pages_and_preserves_horizon() {
         let (temp, mut store) = crate::store::ancestry_test_store();

@@ -17,7 +17,22 @@ impl<'a> RangeBatchV1<'a> {
     /// Decode the existing count/BE-length range response before any ingestion.
     /// The peer's horizon is only a resource bound, never state/work authority.
     pub fn decode(bytes: &'a [u8], start: usize, advertised_total: usize) -> Result<Self> {
-        if advertised_total > HISTORY_LIMIT_V1 || start >= advertised_total {
+        Self::decode_with_limits(
+            bytes,
+            start,
+            advertised_total,
+            crate::capacity::HistoryLimitsV1::REFERENCE,
+        )
+    }
+    /// Frame UNVERIFIED carriers under the receiver's explicit local profile.
+    /// A sender's advertised horizon never selects or enlarges that profile.
+    pub fn decode_with_limits(
+        bytes: &'a [u8],
+        start: usize,
+        advertised_total: usize,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
+        if advertised_total > limits.vertices() || start >= advertised_total {
             return Err(Error::Invalid("sync range horizon"));
         }
         let count = usize::from(*bytes.first().ok_or(Error::Invalid("sync range count"))?);
@@ -124,5 +139,30 @@ mod tests {
         let mut oversized = vec![1];
         oversized.extend_from_slice(&u32::try_from(MAX_VERTEX_BYTES + 1).unwrap().to_be_bytes());
         assert!(RangeBatchV1::decode(&oversized, 0, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn higher_count_needs_explicit_receiver_profile_not_peer_advertisement() {
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let carrier = [7u8; 720];
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&(carrier.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&carrier);
+        assert!(RangeBatchV1::decode(&bytes, 4096, 4104).is_err());
+        let batch = RangeBatchV1::decode_with_limits(&bytes, 4096, 4104, limits).unwrap();
+        assert_eq!(batch.carriers(), &[carrier.as_slice()]);
+        assert!(RangeBatchV1::decode_with_limits(&bytes, 8192, 8193, limits).is_err());
+        assert!(
+            RangeBatchV1::decode_with_limits(&bytes[..bytes.len() - 1], 4096, 4104, limits)
+                .is_err()
+        );
+        assert!(RangeBatchV1::decode_with_limits(&bytes, 4104, 4104, limits).is_err());
+        let old = RangeBatchV1::decode(&bytes, 0, 1).unwrap();
+        let selected = RangeBatchV1::decode_with_limits(&bytes, 0, 1, limits).unwrap();
+        assert_eq!(old.carriers(), selected.carriers());
     }
 }

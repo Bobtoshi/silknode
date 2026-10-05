@@ -82,10 +82,25 @@ impl Node {
     /// Create a new private store under the separately qualified runtime. `margin`
     /// names the host filesystem outside a preallocated task store filesystem.
     pub fn create(root: &Path, margin: &Path, genesis: Genesis) -> Result<Self> {
+        Self::create_with_limits(
+            root,
+            margin,
+            genesis,
+            crate::capacity::HistoryLimitsV1::REFERENCE,
+        )
+    }
+    /// Explicit receiver-local bounded resource profile. No runtime qualification
+    /// or native larger-history acceptance is implied by selecting it.
+    pub fn create_with_limits(
+        root: &Path,
+        margin: &Path,
+        genesis: Genesis,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
         let mut clock = LocalClock::default();
         clock.observe(system_wall()?)?;
-        let mut core = Core::new(Arc::new(genesis), clock)?;
-        let store = Store::create(root, margin)?;
+        let mut core = Core::new_with_limits(Arc::new(genesis), clock, limits)?;
+        let store = Store::create(root, margin)?.with_limits(limits);
         core.graph
             .attach_ancestry_reader(store.object_reader()?, core.genesis.domain())?;
         let mut node = Self {
@@ -138,8 +153,27 @@ impl Node {
         parameters: &SaplingParameters,
         expected_local_head: Digest,
     ) -> Result<Self> {
+        Self::open_retained_pinned_with_limits(
+            root,
+            margin,
+            genesis,
+            parameters,
+            expected_local_head,
+            crate::capacity::HistoryLimitsV1::REFERENCE,
+        )
+    }
+    /// Same independently pinned full replay under an explicit local profile.
+    /// The profile comes from the operator, never a saved/peer validity flag.
+    pub fn open_retained_pinned_with_limits(
+        root: &Path,
+        margin: &Path,
+        genesis: Genesis,
+        parameters: &SaplingParameters,
+        expected_local_head: Digest,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
         Self::open_store(
-            Store::open_pinned(root, margin, expected_local_head)?,
+            Store::open_pinned(root, margin, expected_local_head)?.with_limits(limits),
             genesis,
             parameters,
             false,
@@ -166,6 +200,13 @@ impl Node {
         if let Ok(Some(record)) = &current_record {
             if record.domain != genesis.domain() {
                 return Err(Error::Unavailable("retained generation context"));
+            }
+            if record.vertices > store.limits().vertices() as u64
+                || record.sequence > store.limits().generations()
+            {
+                // Header counts can only refuse resource selection, not establish
+                // validity. Do not consume a replay attempt for a too-small profile.
+                return Err(Error::Unavailable("retained local resource profile"));
             }
         }
         // Only a plausible immediate completed transition may justify replay to
@@ -294,7 +335,7 @@ impl Node {
         // validity or a decoded branch snapshot. Full semantic replay below is
         // unchanged; at most one fixed-size page is resident during traversal.
         let mut records = replay::ReplayPagesV1::build(store, head, genesis.domain())?;
-        let mut core = Core::new(genesis, LocalClock::default())?;
+        let mut core = Core::new_with_limits(genesis, LocalClock::default(), store.limits())?;
         core.graph
             .attach_ancestry_reader(store.object_reader()?, core.genesis.domain())?;
         let mut previous = [0; 32];
@@ -495,11 +536,16 @@ impl Node {
     pub fn history_capacity(&self) -> Result<HistoryCapacityV1> {
         self.healthy()?;
         self.idle()?;
-        HistoryCapacityV1::for_counts(
+        HistoryCapacityV1::for_counts_with_limits(
+            self.store.limits(),
             self.sequence,
             self.core.graph.len(),
             self.core.state.executed_len(),
         )
+    }
+    /// Immutable local configuration, not admitted state or a runtime permit.
+    pub fn history_limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        self.store.limits()
     }
     /// Reserve a bounded public output against the same whole-task store/margin
     /// policy. The runtime must place the actual output on that capped volume.
@@ -962,7 +1008,7 @@ impl Node {
         budget: &JobBudget,
     ) -> Result<Digest> {
         let (vertices, status) = publication;
-        if self.sequence >= GENERATION_LIMIT_V1 {
+        if self.sequence >= self.store.limits().generations() {
             return Err(Error::Paused("generation reference horizon"));
         }
         let manifest = state.manifest();

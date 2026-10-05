@@ -8,7 +8,7 @@ use crate::{
     carriage::{Candidate, MAX_VERTEX_BYTES},
     genesis::Genesis,
     node::Node,
-    sync::{HISTORY_LIMIT_V1, RANGE_LIMIT_V1, RangeBatchV1},
+    sync::{RANGE_LIMIT_V1, RangeBatchV1},
     wire::{field, raw_hash, u32le},
 };
 use std::{
@@ -22,7 +22,8 @@ use std::{
 
 const HEADER: usize = 176;
 const ROW: usize = 68;
-const MANIFEST_LIMIT: usize = HEADER + HISTORY_LIMIT_V1 * ROW;
+#[cfg(test)]
+use crate::sync::HISTORY_LIMIT_V1;
 
 struct Entry {
     vertex: Digest,
@@ -42,6 +43,7 @@ pub struct PublicHistoryV1 {
     checkpoint: Digest,
     state: Digest,
     entries: Vec<Entry>,
+    limits: crate::capacity::HistoryLimitsV1,
 }
 impl PublicHistoryV1 {
     /// Bind a bounded public manifest to an independently retained content hash
@@ -53,6 +55,20 @@ impl PublicHistoryV1 {
     /// Refuses directory aliases, changed/unowned/nonregular files, hash/context
     /// mismatch, framing/duplicate rows or the existing reference horizon.
     pub fn open(root: &Path, expected_manifest: Digest, genesis: Arc<Genesis>) -> Result<Self> {
+        Self::open_with_limits(
+            root,
+            expected_manifest,
+            genesis,
+            crate::capacity::HistoryLimitsV1::REFERENCE,
+        )
+    }
+    /// Explicit receiver-local inventory envelope; rows remain UNVERIFIED.
+    pub fn open_with_limits(
+        root: &Path,
+        expected_manifest: Digest,
+        genesis: Arc<Genesis>,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -62,7 +78,7 @@ impl PublicHistoryV1 {
             &directory,
             owner,
             "history.manifest",
-            MANIFEST_LIMIT,
+            HEADER + limits.vertices() * ROW,
             expected_manifest,
         )?;
         if bytes.len() < HEADER || &bytes[..8] != b"SNF04HF1" || bytes[172..176] != [0; 4] {
@@ -70,7 +86,7 @@ impl PublicHistoryV1 {
         }
         let count = usize::try_from(u32le(&bytes, 168)?)
             .map_err(|_| Error::Invalid("public history count"))?;
-        if count > HISTORY_LIMIT_V1 || bytes.len() != HEADER + count * ROW {
+        if count > limits.vertices() || bytes.len() != HEADER + count * ROW {
             return Err(Error::Invalid("public history reference horizon or rows"));
         }
         if bytes[8..40] != genesis.domain() || bytes[40..72] != raw_hash(&genesis.local_bundle()) {
@@ -104,6 +120,7 @@ impl PublicHistoryV1 {
             checkpoint: field(&bytes, 104)?,
             state: field(&bytes, 136)?,
             entries,
+            limits,
         })
     }
     /// Source-local advertised count only, not the receiver's admitted graph.
@@ -151,7 +168,8 @@ impl PublicHistoryV1 {
             return Err(Error::Invalid("public history range bounds"));
         }
         let end = start + count.min(self.entries.len() - start);
-        let batch = RangeBatchV1::decode(bytes, start, self.entries.len())?;
+        let batch =
+            RangeBatchV1::decode_with_limits(bytes, start, self.entries.len(), self.limits)?;
         if batch.carriers().len() != end - start {
             return Err(Error::Invalid("public history response count"));
         }
@@ -181,6 +199,11 @@ impl PublicHistoryV1 {
     }
     fn admitted_prefix_budget(&self, node: &Node, budget: &JobBudget) -> Result<usize> {
         node.check_history_query_ready()?;
+        if self.entries.len() > node.history_limits().vertices() {
+            return Err(Error::Unavailable(
+                "public history receiver resource profile",
+            ));
+        }
         if self.genesis.domain() != node.genesis().domain()
             || self.genesis.local_bundle() != node.genesis().local_bundle()
         {

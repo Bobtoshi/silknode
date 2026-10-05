@@ -115,6 +115,7 @@ pub struct AcceptedOutputs {
 #[derive(Clone)]
 pub struct BranchState {
     domain: Digest,
+    limits: crate::capacity::HistoryLimitsV1,
     parameters: Digest,
     initial_leaves: u64,
     initial_pool: u64,
@@ -151,6 +152,12 @@ pub(crate) struct CheckpointTransition {
 impl BranchState {
     /// Complete checkpoint-zero state from admitted immutable genesis material.
     pub fn genesis(g: &Genesis) -> Result<Self> {
+        Self::genesis_with_limits(g, crate::capacity::HistoryLimitsV1::REFERENCE)
+    }
+    pub(crate) fn genesis_with_limits(
+        g: &Genesis,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
         let domain = g.domain();
         let parameters = g.parameters_id();
         let j = domain_hash("SilkNode-F0-eligible-genesis", &[&domain]);
@@ -168,6 +175,7 @@ impl BranchState {
         }
         let mut s = Self {
             domain,
+            limits,
             parameters,
             initial_leaves: g.recoveries().len() as u64,
             initial_pool: g.total(),
@@ -176,11 +184,11 @@ impl BranchState {
             effects: PagedLedgerSet::new(50_000),
             recovery,
             accepted_outputs: LedgerHistory::new(50_000),
-            rewards: LedgerHistory::new(crate::sync::HISTORY_LIMIT_V1),
+            rewards: LedgerHistory::new(limits.vertices()),
             pool: g.total(),
             burned: 0,
             issued: 0,
-            executed: LedgerHistory::new(crate::sync::HISTORY_LIMIT_V1),
+            executed: LedgerHistory::new(limits.vertices()),
             j,
             tail: VecDeque::new(),
             dc: [0; 32],
@@ -354,7 +362,7 @@ impl BranchState {
         let i = (self.executed.len() as u64)
             .checked_add(1)
             .ok_or(Error::Invalid("eligible cursor overflow"))?;
-        if self.executed.len() >= 4096 {
+        if self.executed.len() >= self.limits.vertices() {
             return Err(Error::Paused("eligible reference horizon"));
         }
         self.j = fold_j(&self.domain, self.j, i, candidate.id);
@@ -472,7 +480,7 @@ impl BranchState {
     }
     fn check_invariants_checked(&self, budget: Option<&crate::budget::JobBudget>) -> Result<()> {
         self.economic_counts()
-            .validate_counts(&self.domain, self.initial_pool)
+            .validate_counts_with_limits(&self.domain, self.initial_pool, self.limits)
             .map_err(|_| Error::Unavailable("complete economic ledger invariants"))?;
         let mut prefix = self.executed.prefix_comparison();
         let mut position = 0;
@@ -509,6 +517,10 @@ impl BranchState {
 
     // Conservative cache charge counts shared ciphertexts afresh, so sharing can
     // only reduce actual use; includes collection node/allocator slack.
+    pub(crate) const fn history_limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        self.limits
+    }
+
     pub(crate) const fn cache_charge(&self) -> usize {
         8192 + self.recovery.len() * 1024
             + self.recovery.cache_charge()
@@ -598,6 +610,9 @@ impl BranchState {
     ) -> Result<Vec<u8>> {
         let check = || budget.map_or(Ok(()), crate::budget::JobBudget::check);
         check()?;
+        if self.limits != prior.limits {
+            return Err(Error::Unavailable("delta resource profile binding"));
+        }
         let mut b = Vec::new();
         b.extend_from_slice(b"SNF04DL1");
         b.push(u8::from(rollback));
@@ -716,6 +731,9 @@ impl BranchState {
         store: &mut crate::store::Store,
         budget: &crate::budget::JobBudget,
     ) -> Result<Self> {
+        if store.limits() != self.limits {
+            return Err(Error::Unavailable("ledger resource profile binding"));
+        }
         let mut state = self.clone();
         state.recovery = self.recovery.retain(store, self.domain, budget)?;
         state.nullifiers = self
@@ -1345,8 +1363,14 @@ mod tests {
     }
 
     fn ordered_fixture(count: u16) -> (BranchState, Vec<VertexId>, Vec<[u8; 112]>) {
+        ordered_fixture_with_limits(count, crate::capacity::HistoryLimitsV1::REFERENCE)
+    }
+    fn ordered_fixture_with_limits(
+        count: u16,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> (BranchState, Vec<VertexId>, Vec<[u8; 112]>) {
         let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
-        let mut state = BranchState::genesis(&genesis).unwrap();
+        let mut state = BranchState::genesis_with_limits(&genesis, limits).unwrap();
         let mut ids = Vec::new();
         let mut rewards = Vec::new();
         for position in 1..=count {
@@ -1366,6 +1390,90 @@ mod tests {
         state.checkpoint_index = u64::from(count) / 8;
         state.state_digest = state.hash_state();
         (state, ids, rewards)
+    }
+
+    #[test]
+    fn explicit_profile_couples_retained_order_ledger_and_delta_across_reference_boundary() {
+        // Synthetic ordered/reward rows only, not work, proof or chain acceptance.
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let (reference, _, _) = ordered_fixture(4096);
+        let (selected, _, _) = ordered_fixture_with_limits(4096, limits);
+        assert_eq!(reference.manifest(), selected.manifest());
+        assert_eq!(reference.hash_state(), selected.hash_state());
+        for count in [4104, 8192] {
+            let (next, ids, _) = ordered_fixture_with_limits(count, limits);
+            let (prior, _, _) = ordered_fixture_with_limits(count - 8, limits);
+            let budget = crate::budget::JobBudget::checkpoint().unwrap();
+            next.check_invariants().unwrap();
+            let ledger = next.economic_ledger();
+            assert!(ledger.validate(&next.domain, next.initial_pool).is_err());
+            ledger
+                .validate_with_limits(&next.domain, next.initial_pool, limits)
+                .unwrap();
+            next.check_invariants_checked(Some(&budget)).unwrap();
+            assert!(
+                next.delta_checked(&reference, &[], false, Some(&budget))
+                    .is_err()
+            );
+            let (temp, store) = crate::store::ancestry_test_store();
+            let mut store = store.with_limits(limits);
+            store
+                .begin_replay(b"synthetic explicit local profile")
+                .unwrap();
+            let stored = next.retain_ledger(&mut store, &budget).unwrap();
+            let previous = prior.retain_ledger(&mut store, &budget).unwrap();
+            assert_eq!(stored.manifest(), next.manifest());
+            assert_eq!(
+                stored.hash_state_checked(Some(&budget)).unwrap(),
+                next.hash_state()
+            );
+            assert_eq!(
+                stored
+                    .delta_checked(&previous, &[], false, Some(&budget))
+                    .unwrap(),
+                next.delta_checked(&prior, &[], false, Some(&budget))
+                    .unwrap()
+            );
+            let mut bytes = Vec::from(b"SNF04OR1".as_slice());
+            bytes.extend_from_slice(&[1; 32]);
+            bytes.extend_from_slice(&[2; 32]);
+            bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in &ids {
+                bytes.extend_from_slice(id.as_bytes());
+            }
+            store
+                .commit_ordered(&[], &bytes, b"synthetic profile inspection", &budget)
+                .unwrap();
+            let order = crate::core::order::CoreOrder::synthetic_retained(
+                &bytes,
+                store.object_reader().unwrap(),
+            );
+            let inspection = order
+                .inspect(&[&stored, &previous], Some(usize::from(count - 8)), &budget)
+                .unwrap();
+            assert_eq!(inspection.count, usize::from(count));
+            assert_eq!(
+                inspection.common,
+                [usize::from(count), usize::from(count - 8)]
+            );
+            assert_eq!(inspection.interval, ids[usize::from(count - 8)..]);
+            let (_other_temp, mut other) = crate::store::ancestry_test_store();
+            assert!(next.retain_ledger(&mut other, &budget).is_err());
+            let last = *stored.retained_history_pages()[2].last().unwrap();
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(last)));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(order.inspect(&[&stored], None, &budget).is_err());
+            assert!(stored.check_invariants_checked(Some(&budget)).is_err());
+            std::fs::rename(&held, &path).unwrap();
+            assert_eq!(
+                order.inspect(&[&stored], None, &budget).unwrap().common,
+                [usize::from(count)]
+            );
+        }
     }
 
     #[test]

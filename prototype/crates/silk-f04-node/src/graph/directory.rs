@@ -106,6 +106,76 @@ mod tests {
         Ok(Arc::new(u64le(bytes, 0)?))
     }
     #[test]
+    fn explicit_profile_directory_appends_past_reference_and_refuses_cross_profile() {
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let (temp, store) = crate::store::ancestry_test_store();
+        let mut store = store.with_limits(limits);
+        let reader = RetainedContext::new(store.object_reader().unwrap(), [7; 32]);
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic selected profile directory")
+            .unwrap();
+        let rows: Vec<_> = (0..4103_u64).map(Arc::new).collect();
+        let old = VertexDirectory::retain(
+            &rows,
+            &mut store,
+            reader.clone(),
+            &budget,
+            encode,
+            capabilities,
+            decode,
+        )
+        .unwrap();
+        let next = old
+            .append(
+                Arc::new(4103),
+                &mut store,
+                reader.clone(),
+                &budget,
+                encode,
+                capabilities,
+                decode,
+            )
+            .unwrap();
+        assert_eq!(next.len(), 4104);
+        assert_eq!(
+            *DirectoryOperation::new(&next).load(4096, &budget).unwrap(),
+            4096
+        );
+        assert_eq!(
+            *DirectoryOperation::new(&next).load(4103, &budget).unwrap(),
+            4103
+        );
+        let (_other, reference) = crate::store::ancestry_test_store();
+        let wrong = RetainedContext::new(reference.object_reader().unwrap(), [7; 32]);
+        assert!(
+            old.append(
+                Arc::new(4103),
+                &mut store,
+                wrong,
+                &budget,
+                encode,
+                capabilities,
+                decode
+            )
+            .is_err()
+        );
+        let path = temp.path().join("store").join(format!(
+            "{}.obj",
+            hex::encode(*next.retained_ids().last().unwrap())
+        ));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(DirectoryOperation::new(&next).load(4103, &budget).is_err());
+        std::fs::rename(&held, &path).unwrap();
+        assert_eq!(
+            *DirectoryOperation::new(&next).load(4103, &budget).unwrap(),
+            4103
+        );
+        assert_eq!(old.len(), 4103);
+    }
+
+    #[test]
     fn operation_page_reader_is_bounded_exact_and_does_not_cache_read_failures() {
         let (temp, mut store) = crate::store::ancestry_test_store();
         let reader = RetainedContext::new(store.object_reader().unwrap(), [7; 32]);
@@ -447,7 +517,7 @@ impl<V> VertexDirectory<V> {
         if let Some(budget) = budget {
             budget.check()?;
         }
-        if rows.len > HISTORY_LIMIT_V1
+        if rows.len > rows.reader.limits().vertices()
             || rows.bindings.len() != rows.len
             || rows.pages.len() != rows.len.div_ceil(ITEMS)
         {
@@ -546,7 +616,7 @@ impl<V> VertexDirectory<V> {
     pub(super) fn check_shape(&self, budget: &JobBudget) -> Result<()> {
         budget.check()?;
         if let Self::Retained(rows, _) = self {
-            if rows.len > HISTORY_LIMIT_V1
+            if rows.len > rows.reader.limits().vertices()
                 || rows.bindings.len() != rows.len
                 || rows.pages.len() != rows.len.div_ceil(ITEMS)
             {
@@ -564,7 +634,7 @@ impl<V> VertexDirectory<V> {
         match self {
             Self::Resident(rows) => Ok(rows.clone()),
             Self::Retained(rows, decode) => {
-                if rows.len > HISTORY_LIMIT_V1
+                if rows.len > rows.reader.limits().vertices()
                     || rows.bindings.len() != rows.len
                     || rows.pages.len() != rows.len.div_ceil(ITEMS)
                 {
@@ -602,7 +672,10 @@ impl<V> VertexDirectory<V> {
         decode: Decoder<V>,
     ) -> Result<Self> {
         budget.check()?;
-        if self.len() >= HISTORY_LIMIT_V1 {
+        if reader.limits() != store.limits() {
+            return Err(Error::Unavailable("directory resource profile binding"));
+        }
+        if self.len() >= reader.limits().vertices() {
             return Err(Error::Paused("vertex directory reference horizon"));
         }
         let Self::Retained(old, _) = self else {
@@ -673,7 +746,10 @@ impl<V> VertexDirectory<V> {
         capabilities: Capabilities<V>,
         decode: Decoder<V>,
     ) -> Result<Self> {
-        if rows.len() > HISTORY_LIMIT_V1 {
+        if reader.limits() != store.limits() {
+            return Err(Error::Unavailable("directory resource profile binding"));
+        }
+        if rows.len() > reader.limits().vertices() {
             return Err(Error::Paused("vertex directory reference horizon"));
         }
         let mut pages = Vec::with_capacity(rows.len().div_ceil(ITEMS));

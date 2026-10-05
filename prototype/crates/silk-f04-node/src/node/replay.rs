@@ -71,7 +71,7 @@ impl ReplayPagesV1 {
     /// cold open. A saved root or cursor never resumes verification authority.
     pub(super) fn build(store: &mut Store, head: Digest, domain: Digest) -> Result<Self> {
         let terminal = Record::decode(&store.object(head)?)?;
-        if terminal.sequence >= GENERATION_LIMIT_V1 {
+        if terminal.sequence >= store.limits().generations() {
             return Err(Error::Paused("generation replay reference horizon"));
         }
         let total = terminal.sequence + 1;

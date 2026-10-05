@@ -150,7 +150,7 @@ impl CoreOrder {
                 }
             }
             Self::Retained(order) => {
-                if order.count > HISTORY_LIMIT_V1 {
+                if order.count > order.reader.limits().vertices() {
                     return Err(Error::Unavailable("retained order horizon"));
                 }
                 let header = order.reader.visit_order(
@@ -196,8 +196,8 @@ impl CoreOrder {
         budget: &JobBudget,
     ) -> Result<Self> {
         budget.check()?;
-        if order.eligible_order().len() > HISTORY_LIMIT_V1
-            || order.total_order().len() > HISTORY_LIMIT_V1
+        if order.eligible_order().len() > reader.limits().vertices()
+            || order.total_order().len() > reader.limits().vertices()
         {
             return Err(Error::Paused("order reference horizon"));
         }
@@ -222,7 +222,7 @@ impl CoreOrder {
         match self {
             Self::Resident(order) => Ok(snapshot_bytes(order)),
             Self::Retained(order) => {
-                if order.count > HISTORY_LIMIT_V1 {
+                if order.count > order.reader.limits().vertices() {
                     return Err(Error::Unavailable("retained order horizon"));
                 }
                 let size = HEADER + order.count * 32;

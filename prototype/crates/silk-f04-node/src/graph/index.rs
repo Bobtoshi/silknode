@@ -37,7 +37,7 @@ impl<'a> IndexOperation<'a> {
         let VertexIndex::Retained(rows) = self.index else {
             return self.index.lookup(id, Some(budget));
         };
-        if rows.len > HISTORY_LIMIT_V1 {
+        if rows.len > rows.reader.limits().vertices() {
             return Err(Error::Unavailable("operation vertex index horizon"));
         }
         let ordinal = rows.pages.partition_point(|page| page.last < *id);
@@ -98,6 +98,12 @@ impl Default for VertexIndex {
     }
 }
 impl VertexIndex {
+    fn limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        match self {
+            Self::Resident(_) => crate::capacity::HistoryLimitsV1::REFERENCE,
+            Self::Retained(rows) => rows.reader.limits(),
+        }
+    }
     fn len(&self) -> usize {
         match self {
             Self::Resident(rows) => rows.len(),
@@ -113,7 +119,7 @@ impl VertexIndex {
     ) -> Result<()> {
         budget.check()?;
         let len = self.len();
-        if len > HISTORY_LIMIT_V1 {
+        if len > self.limits().vertices() {
             return Err(Error::Unavailable("retained vertex index horizon"));
         }
         let mut seen = vec![false; len];
@@ -201,14 +207,14 @@ impl VertexIndex {
     ) -> Result<Self> {
         budget.check()?;
         let len = self.len();
-        if len >= HISTORY_LIMIT_V1 {
+        if len >= store.limits().vertices() {
             return Err(Error::Paused("vertex index reference horizon"));
         }
         if position != len {
             return Err(Error::Unavailable("staged vertex index append ordinal"));
         }
         if let Self::Retained(rows) = self
-            && rows.domain != domain
+            && (rows.domain != domain || rows.reader.limits() != store.limits())
         {
             return Err(Error::Unavailable("staged vertex index context"));
         }
@@ -322,7 +328,7 @@ impl VertexIndex {
         match self {
             Self::Resident(rows) => Ok(rows.get(id).copied()),
             Self::Retained(rows) => {
-                if rows.len > HISTORY_LIMIT_V1 {
+                if rows.len > rows.reader.limits().vertices() {
                     return Err(Error::Unavailable("retained vertex index horizon"));
                 }
                 // These ranges are private live derivation, never disk metadata.
@@ -352,7 +358,7 @@ impl VertexIndex {
             Self::Resident(rows) => return Ok(rows.as_ref().clone()),
             Self::Retained(rows) => rows,
         };
-        if rows.len > HISTORY_LIMIT_V1 {
+        if rows.len > rows.reader.limits().vertices() {
             return Err(Error::Unavailable("retained vertex index horizon"));
         }
         let mut result = BTreeMap::new();
@@ -383,7 +389,7 @@ impl VertexIndex {
             Self::Resident(rows) => rows.len(),
             Self::Retained(rows) => rows.len,
         };
-        if len > HISTORY_LIMIT_V1 {
+        if len > self.limits().vertices() {
             return Err(Error::Unavailable("retained vertex index horizon"));
         }
         let mut ids = vec![VertexId::from_bytes([0; 32]); len];
@@ -426,7 +432,7 @@ impl VertexIndex {
         domain: Digest,
         budget: &JobBudget,
     ) -> Result<Self> {
-        if rows.len() > HISTORY_LIMIT_V1 {
+        if rows.len() > store.limits().vertices() {
             return Err(Error::Paused("vertex index reference horizon"));
         }
         let mut seen = vec![false; rows.len()];
@@ -498,6 +504,55 @@ mod tests {
             .map(|position| (key(position * 2), count - 1 - position))
             .collect()
     }
+    #[test]
+    fn explicit_profile_retains_and_streams_index_above_reference_without_peer_authority() {
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let (temp, store) = crate::store::ancestry_test_store();
+        let mut store = store.with_limits(limits);
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic selected profile index")
+            .unwrap();
+        let source = rows(4103);
+        let retained = VertexIndex::retain(&source, &mut store, [21; 32], &budget).unwrap();
+        let added = key(8207);
+        let result = retained
+            .retain_insert(added, 4103, &mut store, [21; 32], &budget)
+            .unwrap();
+        let mut literal = source.clone();
+        literal.insert(added, 4103);
+        let oracle = VertexIndex::retain(&literal, &mut store, [21; 32], &budget).unwrap();
+        assert_eq!(result.retained_ids(), oracle.retained_ids());
+        assert_eq!(result.materialize(Some(&budget)).unwrap(), literal);
+        let full = VertexIndex::retain(&rows(8192), &mut store, [21; 32], &budget).unwrap();
+        assert!(
+            full.retain_insert(key(16385), 8192, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        let (_other, mut reference) = crate::store::ancestry_test_store();
+        assert!(VertexIndex::retain(&literal, &mut reference, [21; 32], &budget).is_err());
+        assert!(
+            retained
+                .retain_insert(added, 4103, &mut reference, [21; 32], &budget)
+                .is_err()
+        );
+        let last = *result.retained_ids().last().unwrap();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(last)));
+        let held = path.with_extension("held");
+        fs::rename(&path, &held).unwrap();
+        assert!(result.materialize(Some(&budget)).is_err());
+        assert!(
+            result
+                .retain_insert(key(8209), 4104, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        fs::rename(&held, &path).unwrap();
+        assert_eq!(result.materialize(Some(&budget)).unwrap(), literal);
+    }
+
     #[test]
     fn streamed_insert_matches_literal_packed_pages_and_refuses_old_tail() {
         let (temp, mut store) = crate::store::ancestry_test_store();

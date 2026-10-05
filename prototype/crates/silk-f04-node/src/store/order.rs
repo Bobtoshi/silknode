@@ -21,11 +21,14 @@ const PAGE_LIMIT: usize = 12 + ROWS * 32;
 const DAMAGED: &str = "retained order representation damaged";
 
 fn count(bytes: &[u8]) -> Result<usize> {
+    count_with_limit(bytes, LIMIT)
+}
+fn count_with_limit(bytes: &[u8], horizon: usize) -> Result<usize> {
     if bytes.len() < HEADER || bytes.get(..8) != Some(b"SNF04OR1") {
         return Err(Error::Unavailable(DAMAGED));
     }
     let count = usize::try_from(u32le(bytes, 72)?).map_err(|_| Error::Unavailable(DAMAGED))?;
-    if count > LIMIT || bytes.len() != HEADER + count * 32 {
+    if count > horizon || bytes.len() != HEADER + count * 32 {
         return Err(Error::Unavailable(DAMAGED));
     }
     Ok(count)
@@ -107,7 +110,15 @@ fn visit_tree(
     budget: &JobBudget,
     visit: &mut impl FnMut(Page) -> Result<()>,
 ) -> Result<Vec<u8>> {
-    let n = count(order)?;
+    visit_tree_with_limit(order, budget, LIMIT, visit)
+}
+fn visit_tree_with_limit(
+    order: &[u8],
+    budget: &JobBudget,
+    horizon: usize,
+    visit: &mut impl FnMut(Page) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let n = count_with_limit(order, horizon)?;
     if n <= ROWS {
         return Err(Error::Unavailable(
             "shared order requires more than one leaf",
@@ -227,13 +238,13 @@ impl ObjectReader {
         visit: &mut impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<[u8; HEADER]> {
         budget.check()?;
-        if limit > HEADER + LIMIT * 32 {
+        if limit > HEADER + self.limits().vertices() * 32 {
             return Err(Error::Unavailable(DAMAGED));
         }
         budget.source()?;
         match self.object(id, limit) {
             Ok(bytes) => {
-                count(&bytes)?;
+                count_with_limit(&bytes, self.limits().vertices())?;
                 for rows in bytes[HEADER..].chunks(ROWS * 32) {
                     budget.check()?;
                     visit(rows)?;
@@ -262,7 +273,7 @@ impl ObjectReader {
         }
         let n = usize::try_from(u32le(&descriptor, 8 + 72)?)
             .map_err(|_| Error::Unavailable(DAMAGED))?;
-        if !(ROWS + 1..=LIMIT).contains(&n) || HEADER + n * 32 > limit {
+        if !(ROWS + 1..=self.limits().vertices()).contains(&n) || HEADER + n * 32 > limit {
             return Err(Error::Unavailable(DAMAGED));
         }
         let root: Digest = descriptor[8 + HEADER..]
@@ -349,10 +360,11 @@ enum Plan {
 }
 impl Store {
     pub(crate) fn order_object(&self, id: Digest, budget: &JobBudget) -> Result<Vec<u8>> {
-        self.object_reader()?.order(id, HEADER + LIMIT * 32, budget)
+        self.object_reader()?
+            .order(id, HEADER + self.limits().vertices() * 32, budget)
     }
     fn plan_order(&self, order: &[u8], budget: &JobBudget) -> Result<Plan> {
-        let n = count(order)?;
+        let n = count_with_limit(order, self.limits().vertices())?;
         let reader = self.object_reader()?;
         let mut at = HEADER;
         let existing = reader.visit_order(raw_hash(order), order.len(), budget, &mut |rows| {
@@ -382,20 +394,21 @@ impl Store {
             ));
         }
         let mut missing = BTreeMap::new();
-        let descriptor = visit_tree(order, budget, &mut |page| {
-            budget.check()?;
-            budget.source()?;
-            match reader.object(page.id, PAGE_LIMIT) {
-                Ok(bytes) if bytes == page.bytes => {}
-                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if missing.insert(page.id, page.bytes.len()).is_some() {
-                        return Err(Error::Unavailable("duplicate derived order page"));
+        let descriptor =
+            visit_tree_with_limit(order, budget, self.limits().vertices(), &mut |page| {
+                budget.check()?;
+                budget.source()?;
+                match reader.object(page.id, PAGE_LIMIT) {
+                    Ok(bytes) if bytes == page.bytes => {}
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if missing.insert(page.id, page.bytes.len()).is_some() {
+                            return Err(Error::Unavailable("duplicate derived order page"));
+                        }
                     }
+                    _ => return Err(Error::Unavailable(DAMAGED)),
                 }
-                _ => return Err(Error::Unavailable(DAMAGED)),
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         Ok(Plan::Shared {
             descriptor,
             missing,
@@ -474,17 +487,22 @@ impl Store {
                     descriptor,
                     mut missing,
                 } => {
-                    let regenerated = visit_tree(order, budget, &mut |page| {
-                        budget.check()?;
-                        if let Some(size) = missing.remove(&page.id) {
-                            if size != page.bytes.len() {
-                                return Err(Error::Unavailable("derived order plan mismatch"));
+                    let regenerated = visit_tree_with_limit(
+                        order,
+                        budget,
+                        self.limits().vertices(),
+                        &mut |page| {
+                            budget.check()?;
+                            if let Some(size) = missing.remove(&page.id) {
+                                if size != page.bytes.len() {
+                                    return Err(Error::Unavailable("derived order plan mismatch"));
+                                }
+                                budget.source()?;
+                                self.put(&page.bytes)?;
                             }
-                            budget.source()?;
-                            self.put(&page.bytes)?;
-                        }
-                        Ok(())
-                    })?;
+                            Ok(())
+                        },
+                    )?;
                     if !missing.is_empty() || regenerated != descriptor {
                         return Err(Error::Unavailable("derived order plan mismatch"));
                     }

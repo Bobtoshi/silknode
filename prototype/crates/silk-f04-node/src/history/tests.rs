@@ -383,3 +383,36 @@ fn historical_public_carrier_codec_and_range_compatibility() {
         "public_carriers=3080; ranges=97; current_genesis_and_static_codec_bound=true; native_work_evaluations=0; payment_proofs_verified=0; node_opens=0; wallet_or_private_git_imports=0"
     );
 }
+
+#[test]
+fn explicit_profile_manifest_and_ranges_cross_reference_but_never_select_receiver_policy() {
+    let (temp, genesis, manifest, carriers) = fixture(4104);
+    let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+    assert!(PublicHistoryV1::open(temp.path(), raw_hash(&manifest), genesis.clone()).is_err());
+    let source =
+        PublicHistoryV1::open_with_limits(temp.path(), raw_hash(&manifest), genesis, limits)
+            .unwrap();
+    let bytes = source.read_range(4096, 32).unwrap();
+    assert!(RangeBatchV1::decode(&bytes, 4096, source.len()).is_err());
+    let batch = source.decode_range(&bytes, 4096, 32).unwrap();
+    assert_eq!(
+        batch.carriers(),
+        carriers[4096..]
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        source
+            .decode_range(&bytes[..bytes.len() - 1], 4096, 32)
+            .is_err()
+    );
+    assert!(source.decode_range(&bytes, 4095, 32).is_err());
+    let last = raw_hash(carriers.last().unwrap());
+    let path = temp.path().join(format!("{}.vertex", hex::encode(last)));
+    let held = path.with_extension("held");
+    fs::rename(&path, &held).unwrap();
+    assert!(source.read_range(4096, 32).is_err());
+    fs::rename(&held, &path).unwrap();
+    assert_eq!(source.read_range(4096, 32).unwrap(), bytes);
+}

@@ -559,6 +559,7 @@ pub struct GraphData<V> {
     vertices: VertexDirectory<V>,
     index: VertexIndex,
     ancestry_reader: Option<Arc<RetainedContext>>,
+    limits: crate::capacity::HistoryLimitsV1,
 }
 impl<V> Default for GraphData<V> {
     fn default() -> Self {
@@ -566,6 +567,7 @@ impl<V> Default for GraphData<V> {
             vertices: VertexDirectory::default(),
             index: VertexIndex::default(),
             ancestry_reader: None,
+            limits: crate::capacity::HistoryLimitsV1::REFERENCE,
         }
     }
 }
@@ -575,6 +577,7 @@ impl<V> Clone for GraphData<V> {
             vertices: self.vertices.clone(),
             index: self.index.clone(),
             ancestry_reader: self.ancestry_reader.clone(),
+            limits: self.limits,
         }
     }
 }
@@ -683,6 +686,15 @@ impl CryptoCache {
 }
 
 impl<V: GraphEntry> GraphData<V> {
+    pub(crate) fn with_limits(limits: crate::capacity::HistoryLimitsV1) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+    pub(crate) const fn limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        self.limits
+    }
     #[cfg(test)]
     pub(crate) fn retained_ancestry_pages(&self) -> usize {
         self.vertices
@@ -697,7 +709,7 @@ impl<V: GraphEntry> GraphData<V> {
         reader: Arc<crate::store::ObjectReader>,
         domain: Digest,
     ) -> Result<()> {
-        if !self.is_empty() || self.ancestry_reader.is_some() {
+        if !self.is_empty() || self.ancestry_reader.is_some() || reader.limits() != self.limits {
             return Err(Error::Unavailable(
                 "ancestry reader must precede fresh replay",
             ));
@@ -1016,7 +1028,7 @@ impl<V: GraphEntry> GraphData<V> {
         if let Sg0ParentSetV1::Vertices(p) = parents {
             Sg0ParentSetV1::vertices(p.clone())?;
         }
-        let mut bits = PagedAncestry::default();
+        let mut bits = PagedAncestry::with_horizon(self.limits.vertices());
         for p in parents.ordinary_parents() {
             let i = self.position(*p, budget)?;
             let vertex = self.vertices.load(i, budget)?;
@@ -1083,7 +1095,7 @@ impl<V: GraphEntry> GraphData<V> {
         clock: Option<&LocalClock>,
         budget: &JobBudget,
     ) -> Result<Candidate> {
-        if self.len() >= 4096 {
+        if self.len() >= self.limits.vertices() {
             return Err(Error::Paused("admitted-vertex reference horizon"));
         }
         let candidate = Candidate::decode(bytes, g)?;
@@ -1386,7 +1398,7 @@ impl<V: GraphEntry> View<'_, V> {
     fn inventory(&self) -> std::result::Result<Ref<'_, ViewInventory>, Sg0Error> {
         self.budget.check().map_err(index_error)?;
         if self.inventory.borrow().is_none() {
-            if self.graph.len() > crate::sync::HISTORY_LIMIT_V1 {
+            if self.graph.len() > self.graph.limits.vertices() {
                 return Err(Sg0Error::Invariant);
             }
             let inventory = self

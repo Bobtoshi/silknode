@@ -51,6 +51,7 @@ pub(crate) struct Core {
     crypto: CryptoCache,
     work: WorkEngine,
     history: VecDeque<Arc<BranchState>>,
+    limits: crate::capacity::HistoryLimitsV1,
 }
 pub(crate) struct Admission {
     pub vertex: PreparedVertex,
@@ -86,10 +87,18 @@ impl Core {
         self.history.iter()
     }
     pub fn new(genesis: Arc<Genesis>, clock: LocalClock) -> Result<Self> {
-        let graph = Graph::default();
-        let state = Arc::new(BranchState::genesis(&genesis)?);
+        Self::new_with_limits(genesis, clock, crate::capacity::HistoryLimitsV1::REFERENCE)
+    }
+    pub(crate) fn new_with_limits(
+        genesis: Arc<Genesis>,
+        clock: LocalClock,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
+        limits.linear_generations()?;
+        let graph = Graph::with_limits(limits);
+        let state = Arc::new(BranchState::genesis_with_limits(&genesis, limits)?);
         let order = graph.order(&JobBudget::checkpoint()?)?;
-        let prefixes = PrefixCache::new(&genesis)?;
+        let prefixes = PrefixCache::new_with_limits(&genesis, limits)?;
         Ok(Self {
             genesis,
             graph,
@@ -102,6 +111,7 @@ impl Core {
             crypto: CryptoCache::default(),
             work: WorkEngine::default(),
             history: VecDeque::new(),
+            limits,
         })
     }
     pub fn prepare(
@@ -299,7 +309,10 @@ impl Core {
                     selected = Some((*state).clone());
                 }
             }
-            let state = selected.unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
+            let state = selected.unwrap_or(Arc::new(BranchState::genesis_with_limits(
+                &self.genesis,
+                self.limits,
+            )?));
             // A cached reversible snapshot is not permission to publish a
             // rollback whose original ledger pages are now unreadable.
             state.qualify_ledger_checked(budget)?;
@@ -362,7 +375,8 @@ impl Core {
     /// complete intervals; reuse of retained checkpoints can only lower the cost.
     pub fn reconciliation_generations(&self, budget: &JobBudget) -> Result<u64> {
         let inspection = self.order.inspect(&[self.state.as_ref()], None, budget)?;
-        HistoryCapacityV1::reconciliation_generations(
+        HistoryCapacityV1::reconciliation_with_limits(
+            self.limits,
             self.state.executed_len(),
             inspection.common[0],
             inspection.count,

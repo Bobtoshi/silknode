@@ -11,6 +11,29 @@ fn fixture_digest(name: &str) -> Digest {
         .unwrap()
 }
 
+fn fixture_open(
+    root: &Path,
+    margin: &Path,
+    genesis: Genesis,
+    parameters: &SaplingParameters,
+    pin: Digest,
+) -> Node {
+    if std::env::var("SILK_F04_EXTENDED_PROFILE_GATE").as_deref() == Ok("1") {
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let node =
+            Node::open_retained_pinned_with_limits(root, margin, genesis, parameters, pin, limits)
+                .unwrap();
+        assert_eq!(node.history_limits(), limits);
+        assert_eq!(
+            node.history_capacity().unwrap().vertices_remaining,
+            8192 - node.vertex_count()
+        );
+        node
+    } else {
+        Node::open_retained_pinned(root, margin, genesis, parameters, pin).unwrap()
+    }
+}
+
 fn reconcile(node: &mut Node) {
     for _ in 0..8 {
         if node.status().unwrap() == Status::Ready {
@@ -153,6 +176,19 @@ fn retained_payment_mutation_and_real_fork_rollback_saved_carriers() {
 }
 
 #[test]
+#[ignore = "explicit larger local profile over only authenticated existing SMALL history; no beyond4096 native claim or mining"]
+fn explicit_profile_create_replay_payment_fork_and_repeat_saved_carriers() {
+    assert_eq!(
+        std::env::var("SILK_F04_EXTENDED_PROFILE_GATE").as_deref(),
+        Ok("1")
+    );
+    retained_payment_mutation_and_real_fork_rollback_saved_carriers();
+    println!(
+        "selected_local_vertex_limit=8192; native_history_above4096=false; default_unchanged=true; source_profile_imported=false; newly_mined=0; newly_generated_proofs=0"
+    );
+}
+
+#[test]
 #[ignore = "isolated authenticated 16/15-vertex copies; two new empty-body vertices, externally enforced remaining original 120s/3GB bound"]
 fn genuine_fork_merge_reorganises_checkpoint_and_reopens_identically() {
     assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
@@ -179,10 +215,50 @@ fn genuine_fork_merge_reorganises_checkpoint_and_reopens_identically() {
     .unwrap();
     let a_root = root.join("a");
     let b_root = root.join("b");
-    let mut a =
-        Node::open_retained_pinned(&a_root, &margin, genesis.clone(), &parameters, pin).unwrap();
-    let mut b =
-        Node::open_retained_pinned(&b_root, &margin, genesis.clone(), &parameters, b_pin).unwrap();
+    if std::env::var("SILK_F04_EXTENDED_PROFILE_GATE").as_deref() == Ok("1") {
+        let limits = crate::capacity::HistoryLimitsV1::for_vertices(8192).unwrap();
+        let empty_root = root.join("profile-create");
+        let empty =
+            Node::create_with_limits(&empty_root, &margin, genesis.clone(), limits).unwrap();
+        assert_eq!(empty.history_limits(), limits);
+        assert_eq!(
+            empty.core.state.manifest(),
+            BranchState::genesis(&genesis).unwrap().manifest()
+        );
+        let empty_pin = empty.local_head().unwrap();
+        drop(empty);
+        assert_eq!(
+            fixture_open(
+                &empty_root,
+                &margin,
+                genesis.clone(),
+                &parameters,
+                empty_pin
+            )
+            .vertex_count(),
+            0
+        );
+    }
+    if std::env::var("SILK_F04_EXTENDED_PROFILE_GATE").as_deref() == Ok("1") {
+        let too_small = crate::capacity::HistoryLimitsV1::for_vertices(8).unwrap();
+        let head = fs::read(a_root.join("HEAD")).unwrap();
+        assert!(matches!(
+            Node::open_retained_pinned_with_limits(
+                &a_root,
+                &margin,
+                genesis.clone(),
+                &parameters,
+                pin,
+                too_small
+            ),
+            Err(Error::Unavailable("retained local resource profile"))
+        ));
+        assert_eq!(fs::read(a_root.join("HEAD")).unwrap(), head);
+        assert!(!a_root.join("ACTIVE_JOB").exists());
+        assert!(!a_root.join("ACTIVE_REPLAY").exists());
+    }
+    let mut a = fixture_open(&a_root, &margin, genesis.clone(), &parameters, pin);
+    let mut b = fixture_open(&b_root, &margin, genesis.clone(), &parameters, b_pin);
     let original = a
         .core
         .order
@@ -408,8 +484,7 @@ fn genuine_fork_merge_reorganises_checkpoint_and_reopens_identically() {
     drop(b);
     println!("phase=cold-reopen; new_vertices=2");
     for (path, head) in [(&a_root, a_head), (&b_root, b_head)] {
-        let mut node =
-            Node::open_retained_pinned(path, &margin, genesis.clone(), &parameters, head).unwrap();
+        let mut node = fixture_open(path, &margin, genesis.clone(), &parameters, head);
         assert_eq!(node.status().unwrap(), Status::Ready);
         assert_eq!(node.core.state.manifest(), expected_state);
         assert_eq!(

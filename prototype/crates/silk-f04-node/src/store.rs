@@ -24,8 +24,12 @@ const MARGIN: u64 = 4 * 1024 * 1024 * 1024;
 pub struct ObjectReader {
     directory: File,
     owner: u32,
+    limits: crate::capacity::HistoryLimitsV1,
 }
 impl ObjectReader {
+    pub(crate) const fn limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        self.limits
+    }
     pub(crate) fn object(&self, id: Digest, limit: usize) -> Result<Vec<u8>> {
         if limit > MAX_OBJECT {
             return Err(Error::Unavailable("owned object reader limit"));
@@ -103,6 +107,7 @@ pub(crate) struct Store {
     used: u64,
     head: Option<Digest>,
     poisoned: bool,
+    limits: crate::capacity::HistoryLimitsV1,
 }
 impl Store {
     pub fn create(root: &Path, margin: &Path) -> Result<Self> {
@@ -161,6 +166,7 @@ impl Store {
             used,
             head: None,
             poisoned: false,
+            limits: crate::capacity::HistoryLimitsV1::REFERENCE,
         };
         match s.pointer("HEAD") {
             Ok(head) => s.head = head,
@@ -182,6 +188,13 @@ impl Store {
     }
     pub fn head(&self) -> Option<Digest> {
         self.head
+    }
+    pub(crate) fn with_limits(mut self, limits: crate::capacity::HistoryLimitsV1) -> Self {
+        self.limits = limits;
+        self
+    }
+    pub(crate) const fn limits(&self) -> crate::capacity::HistoryLimitsV1 {
+        self.limits
     }
     pub fn previous(&self) -> Result<Option<Digest>> {
         self.pointer("PREVIOUS")
@@ -268,6 +281,7 @@ impl Store {
         Ok(Arc::new(ObjectReader {
             directory: self.directory.try_clone()?,
             owner: self.directory.metadata()?.uid(),
+            limits: self.limits,
         }))
     }
     /// Receiver-derived ancestry leaf ONLY during a fenced admission/replay.

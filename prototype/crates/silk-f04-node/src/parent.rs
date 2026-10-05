@@ -18,17 +18,25 @@ pub(crate) struct PrefixCache {
     genesis: Arc<BranchState>,
     states: VecDeque<Arc<BranchState>>,
     domain: Digest,
+    limits: crate::capacity::HistoryLimitsV1,
 }
 impl PrefixCache {
     pub fn new(g: &Genesis) -> Result<Self> {
+        Self::new_with_limits(g, crate::capacity::HistoryLimitsV1::REFERENCE)
+    }
+    pub(crate) fn new_with_limits(
+        g: &Genesis,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<Self> {
         Ok(Self {
-            genesis: Arc::new(BranchState::genesis(g)?),
+            genesis: Arc::new(BranchState::genesis_with_limits(g, limits)?),
             states: VecDeque::new(),
             domain: g.domain(),
+            limits,
         })
     }
     pub fn remember(&mut self, state: Arc<BranchState>) {
-        if state.checkpoint_index() == 0 {
+        if state.checkpoint_index() == 0 || state.history_limits() != self.limits {
             return;
         }
         if self
@@ -57,7 +65,7 @@ impl PrefixCache {
         g: &Genesis,
         budget: &JobBudget,
     ) -> Result<ParentFacts> {
-        if g.domain() != self.domain {
+        if g.domain() != self.domain || graph.limits() != self.limits {
             return Err(Error::Unavailable("prefix-cache context"));
         }
         budget.phase(AdmissionPhase::ParentOrder);
@@ -343,7 +351,7 @@ pub(crate) fn replay_source_for_test(
     ids: &[VertexId],
     budget: &JobBudget,
 ) -> Result<Arc<BranchState>> {
-    let mut cache = PrefixCache::new(genesis)?;
+    let mut cache = PrefixCache::new_with_limits(genesis, graph.limits())?;
     let mut js = vec![cache.genesis.eligible_commitment()];
     for (i, id) in ids.iter().enumerate() {
         js.push(fold_j(

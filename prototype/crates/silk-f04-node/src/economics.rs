@@ -1,7 +1,7 @@
 //! Deterministic checks for the existing VALUELESS F0.4 ledgers, not new money.
 //! Caller-supplied records do not establish work, SG-0 order, proof validity or
 //! a canonical checkpoint. Credits and the private allocation are separate ledgers.
-use crate::{Digest, Error, Result, sync::HISTORY_LIMIT_V1};
+use crate::{Digest, Error, Result};
 use silk_types::VertexId;
 
 /// Existing parameter 13: nontransferable credits per executed position.
@@ -38,6 +38,20 @@ impl EconomicLedgerV1<'_> {
     /// Refuses foreign context, broken conservation, inconsistent totals/cursors,
     /// changed row amounts, missing/reordered rows or wrong execution identities.
     pub fn validate(&self, expected_domain: &Digest, initial_private_pool: u64) -> Result<()> {
+        self.validate_with_limits(
+            expected_domain,
+            initial_private_pool,
+            crate::capacity::HistoryLimitsV1::REFERENCE,
+        )
+    }
+    /// Same complete accounting and row checks under an explicit local profile.
+    /// Caller-supplied rows and the profile confer no admission authority.
+    pub fn validate_with_limits(
+        &self,
+        expected_domain: &Digest,
+        initial_private_pool: u64,
+        limits: crate::capacity::HistoryLimitsV1,
+    ) -> Result<()> {
         EconomicCountsV1 {
             domain: self.domain,
             private_pool: self.private_pool,
@@ -47,7 +61,8 @@ impl EconomicLedgerV1<'_> {
             executed: self.executed.len(),
             rewards: self.reward_records.len(),
         }
-        .validate(
+        .validate_with_limits(
+            limits,
             expected_domain,
             initial_private_pool,
             self.executed.iter(),
@@ -71,10 +86,26 @@ impl EconomicCountsV1 {
         &self,
         expected_domain: &Digest,
         initial_private_pool: u64,
+        executed: impl Iterator<Item = &'a VertexId>,
+        rewards: impl Iterator<Item = &'a [u8; 112]>,
+    ) -> Result<()> {
+        self.validate_with_limits(
+            crate::capacity::HistoryLimitsV1::REFERENCE,
+            expected_domain,
+            initial_private_pool,
+            executed,
+            rewards,
+        )
+    }
+    pub(crate) fn validate_with_limits<'a>(
+        &self,
+        limits: crate::capacity::HistoryLimitsV1,
+        expected_domain: &Digest,
+        initial_private_pool: u64,
         mut executed: impl Iterator<Item = &'a VertexId>,
         mut rewards: impl Iterator<Item = &'a [u8; 112]>,
     ) -> Result<()> {
-        self.validate_counts(expected_domain, initial_private_pool)?;
+        self.validate_counts_with_limits(expected_domain, initial_private_pool, limits)?;
         for index in 0..self.executed {
             let vertex = executed
                 .next()
@@ -89,15 +120,16 @@ impl EconomicCountsV1 {
         }
         Ok(())
     }
-    pub(crate) fn validate_counts(
+    pub(crate) fn validate_counts_with_limits(
         &self,
         expected_domain: &Digest,
         initial_private_pool: u64,
+        limits: crate::capacity::HistoryLimitsV1,
     ) -> Result<()> {
         if self.domain != *expected_domain {
             return Err(Error::Invalid("economic ledger context"));
         }
-        if self.executed > HISTORY_LIMIT_V1
+        if self.executed > limits.vertices()
             || !self.executed.is_multiple_of(8)
             || self.rewards != self.executed
             || self.accepted_effects > 50_000
