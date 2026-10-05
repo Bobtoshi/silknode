@@ -98,6 +98,168 @@ impl Default for VertexIndex {
     }
 }
 impl VertexIndex {
+    fn len(&self) -> usize {
+        match self {
+            Self::Resident(rows) => rows.len(),
+            Self::Retained(rows) => rows.len,
+        }
+    }
+    /// Private staging visitor. All observations are provisional until the full
+    /// sorted directory and complete ordinal permutation have been checked.
+    pub(super) fn visit_checked(
+        &self,
+        budget: &JobBudget,
+        visit: &mut dyn FnMut(VertexId, usize) -> Result<()>,
+    ) -> Result<()> {
+        budget.check()?;
+        let len = self.len();
+        if len > HISTORY_LIMIT_V1 {
+            return Err(Error::Unavailable("retained vertex index horizon"));
+        }
+        let mut seen = vec![false; len];
+        let mut count = 0;
+        let mut last = None;
+        let mut accept = |id: VertexId, position: usize| -> Result<()> {
+            if position >= len || last.is_some_and(|last| last >= id) || seen[position] {
+                return Err(Error::Unavailable("retained vertex index directory order"));
+            }
+            seen[position] = true;
+            last = Some(id);
+            count += 1;
+            visit(id, position)
+        };
+        match self {
+            Self::Resident(rows) => {
+                for (offset, (id, position)) in rows.iter().enumerate() {
+                    if offset % KEYS == 0 {
+                        budget.check()?;
+                    }
+                    accept(*id, *position)?;
+                }
+            }
+            Self::Retained(rows) => {
+                if rows.pages.len() != len.div_ceil(KEYS) {
+                    return Err(Error::Unavailable("retained vertex index directory length"));
+                }
+                for ordinal in 0..rows.pages.len() {
+                    for (id, position) in Self::page(rows, ordinal, Some(budget))? {
+                        accept(id, position)?;
+                    }
+                }
+            }
+        }
+        if count != len || seen.iter().any(|seen| !seen) {
+            return Err(Error::Unavailable("retained vertex index directory length"));
+        }
+        budget.check()
+    }
+    fn retain_chunk(
+        rows: &[(VertexId, usize)],
+        ordinal: usize,
+        store: &mut Store,
+        domain: Digest,
+        budget: &JobBudget,
+    ) -> Result<Page> {
+        budget.check()?;
+        let first = rows
+            .first()
+            .ok_or(Error::Unavailable("derived vertex index count"))?
+            .0;
+        let last = rows
+            .last()
+            .ok_or(Error::Unavailable("derived vertex index count"))?
+            .0;
+        if rows.len() > KEYS {
+            return Err(Error::Unavailable("derived vertex index count"));
+        }
+        let mut bytes = Vec::with_capacity(HEADER + rows.len() * 40);
+        bytes.extend_from_slice(b"SNF04IP1");
+        bytes.extend_from_slice(&domain);
+        bytes.extend_from_slice(&(ordinal as u64).to_le_bytes());
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (id, position) in rows {
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.extend_from_slice(&(*position as u64).to_le_bytes());
+        }
+        budget.source()?;
+        Ok(Page {
+            id: store.retain_vertex_index_page(&bytes)?,
+            count: rows.len(),
+            first,
+            last,
+        })
+    }
+    /// Merge one receiver-derived append into canonical packed sorted pages.
+    /// No full resident map is created; writes are provisional within the fence.
+    pub(super) fn retain_insert(
+        &self,
+        id: VertexId,
+        position: usize,
+        store: &mut Store,
+        domain: Digest,
+        budget: &JobBudget,
+    ) -> Result<Self> {
+        budget.check()?;
+        let len = self.len();
+        if len >= HISTORY_LIMIT_V1 {
+            return Err(Error::Paused("vertex index reference horizon"));
+        }
+        if position != len {
+            return Err(Error::Unavailable("staged vertex index append ordinal"));
+        }
+        if let Self::Retained(rows) = self
+            && rows.domain != domain
+        {
+            return Err(Error::Unavailable("staged vertex index context"));
+        }
+        let mut pages = Vec::with_capacity((len + 1).div_ceil(KEYS));
+        let mut pending = Vec::with_capacity(KEYS);
+        let mut inserted = false;
+        let mut emit = |id, position| -> Result<()> {
+            pending.push((id, position));
+            if pending.len() == KEYS {
+                pages.push(Self::retain_chunk(
+                    &pending,
+                    pages.len(),
+                    store,
+                    domain,
+                    budget,
+                )?);
+                pending.clear();
+            }
+            Ok(())
+        };
+        self.visit_checked(budget, &mut |old_id, old_position| {
+            if old_id == id {
+                return Err(Error::Unavailable("duplicate staged vertex index"));
+            }
+            if !inserted && old_id > id {
+                emit(id, position)?;
+                inserted = true;
+            }
+            emit(old_id, old_position)
+        })?;
+        if !inserted {
+            emit(id, position)?;
+        }
+        drop(emit);
+        if !pending.is_empty() {
+            pages.push(Self::retain_chunk(
+                &pending,
+                pages.len(),
+                store,
+                domain,
+                budget,
+            )?);
+        }
+        budget.check()?;
+        Ok(Self::Retained(Retained {
+            pages: Arc::new(pages),
+            len: len + 1,
+            domain,
+            reader: store.object_reader()?,
+        }))
+    }
     fn page(
         rows: &Retained,
         ordinal: usize,
@@ -335,6 +497,80 @@ mod tests {
         (0..count)
             .map(|position| (key(position * 2), count - 1 - position))
             .collect()
+    }
+    #[test]
+    fn streamed_insert_matches_literal_packed_pages_and_refuses_old_tail() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic streamed index append")
+            .unwrap();
+        for count in [0, 1, 63, 64, 65, 129, HISTORY_LIMIT_V1 - 1] {
+            let source = rows(count);
+            let retained = VertexIndex::retain(&source, &mut store, [21; 32], &budget).unwrap();
+            for added in [key(1), key(count), key(count * 2 + 1)] {
+                if source.contains_key(&added) {
+                    continue;
+                }
+                let mut literal = source.clone();
+                literal.insert(added, count);
+                let result = retained
+                    .retain_insert(added, count, &mut store, [21; 32], &budget)
+                    .unwrap();
+                let oracle = VertexIndex::retain(&literal, &mut store, [21; 32], &budget).unwrap();
+                assert_eq!(result.retained_ids(), oracle.retained_ids());
+                assert_eq!(result.materialize(Some(&budget)).unwrap(), literal);
+                assert_eq!(retained.materialize(Some(&budget)).unwrap(), source);
+            }
+        }
+        let source = rows(129);
+        let retained = VertexIndex::retain(&source, &mut store, [21; 32], &budget).unwrap();
+        assert!(
+            retained
+                .retain_insert(key(0), 129, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        assert!(
+            retained
+                .retain_insert(key(1), 128, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        assert!(
+            retained
+                .retain_insert(key(1), 129, &mut store, [22; 32], &budget)
+                .is_err()
+        );
+        let tail = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(retained.retained_ids()[2])));
+        let held = tail.with_extension("held");
+        fs::rename(&tail, &held).unwrap();
+        assert!(
+            retained
+                .retain_insert(key(1), 129, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        fs::rename(&held, &tail).unwrap();
+        let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(
+            retained
+                .retain_insert(key(1), 129, &mut store, [21; 32], &expired)
+                .is_err()
+        );
+        let full = VertexIndex::Resident(Arc::new(rows(HISTORY_LIMIT_V1)));
+        assert!(
+            full.retain_insert(key(1), HISTORY_LIMIT_V1, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        let mut invalid = source.clone();
+        invalid.insert(key(0), 0);
+        assert!(
+            VertexIndex::Resident(Arc::new(invalid))
+                .retain_insert(key(1), 129, &mut store, [21; 32], &budget)
+                .is_err()
+        );
+        assert_eq!(store.head(), None);
     }
     #[test]
     fn inventory_vectors_match_complete_index_at_page_and_horizon_boundaries() {

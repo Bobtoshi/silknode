@@ -625,14 +625,13 @@ impl PreparedVertex {
             if self.revision != graph.len() {
                 return Err(Error::Unavailable("stale staged vertex index"));
             }
-            let mut rows = graph.index.materialize(Some(budget))?;
-            if rows
-                .insert(VertexId::from_bytes(self.vertex.info.id), graph.len())
-                .is_some()
-            {
-                return Err(Error::Unavailable("duplicate staged vertex index"));
-            }
-            self.index = Some(VertexIndex::retain(&rows, store, reader.domain(), budget)?);
+            self.index = Some(graph.index.retain_insert(
+                VertexId::from_bytes(self.vertex.info.id),
+                graph.len(),
+                store,
+                reader.domain(),
+                budget,
+            )?);
             let entry = V::stage_directory(&self.vertex, &reader, budget)?;
             self.directory = Some(
                 graph
@@ -1199,18 +1198,27 @@ impl<V: GraphEntry> GraphData<V> {
         }
         let id = VertexId::from_bytes(prepared.vertex.candidate.id);
         // Finish every fallible page read before publishing any graph credit.
-        let current_entries = self.vertices.materialize(Some(budget))?;
         let next_index = if V::DURABLE_INDEX {
+            self.vertices.check_shape(budget)?;
             let next = prepared
                 .index
                 .ok_or(Error::Unavailable("durable vertex index absent"))?;
-            let rows = next.materialize(Some(budget))?;
-            if rows.len() != self.len() + 1 || rows.get(&id) != Some(&self.len()) {
+            let rows = next.inventory(budget)?;
+            if rows.ids.len() != self.len() + 1 || rows.ids.last() != Some(&id) {
                 return Err(Error::Unavailable("staged vertex index length"));
             }
-            for (position, vertex) in current_entries.iter().enumerate() {
+            self.index.visit_checked(budget, &mut |old_id, position| {
                 budget.graph_read()?;
-                if rows.get(&VertexId::from_bytes(vertex.graph_info().id)) != Some(&position) {
+                if rows.ids.get(position) != Some(&old_id) {
+                    return Err(Error::Unavailable("staged vertex index identity"));
+                }
+                Ok(())
+            })?;
+            let mut current = DirectoryOperation::new(&self.vertices);
+            for position in 0..self.len() {
+                let vertex = current.load(position, budget)?;
+                budget.graph_read()?;
+                if rows.ids[position] != VertexId::from_bytes(vertex.graph_info().id) {
                     return Err(Error::Unavailable("staged vertex index identity"));
                 }
             }
@@ -1229,17 +1237,18 @@ impl<V: GraphEntry> GraphData<V> {
                     .ok_or(Error::Unavailable("durable vertex directory absent"))?,
                 V::from_directory,
             );
-            let entries = next.materialize(Some(budget))?;
-            if entries.len() != self.len() + 1
-                || entries
-                    .last()
-                    .ok_or(Error::Unavailable("staged vertex directory empty"))?
-                    .directory_slot()?
-                    != entry.directory_slot()?
+            next.check_shape(budget)?;
+            self.vertices.check_shape(budget)?;
+            let mut entries = DirectoryOperation::new(&next);
+            if next.len() != self.len() + 1
+                || entries.load(self.len(), budget)?.directory_slot()? != entry.directory_slot()?
             {
                 return Err(Error::Unavailable("staged vertex directory identity"));
             }
-            for (old, new) in current_entries.iter().zip(&entries) {
+            let mut current = DirectoryOperation::new(&self.vertices);
+            for position in 0..self.len() {
+                let old = current.load(position, budget)?;
+                let new = entries.load(position, budget)?;
                 budget.graph_read()?;
                 if old.directory_slot()? != new.directory_slot()? {
                     return Err(Error::Unavailable("staged vertex directory prefix"));
@@ -2543,6 +2552,83 @@ mod tests {
         assert_eq!(retained.bytes(&budget).unwrap(), original);
         let expired = JobBudget::testing(std::time::Duration::ZERO).unwrap();
         assert!(retained.eligible(&expired).is_err());
+    }
+    #[test]
+    fn streamed_publication_crosses_directory_page_and_refuses_late_pages_atomically() {
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = JobBudget::checkpoint().unwrap();
+        let mut graph = DurableGraph::default();
+        graph
+            .attach_ancestry_reader(store.object_reader().unwrap(), [9; 32])
+            .unwrap();
+        store
+            .begin_replay(b"synthetic streamed graph publication")
+            .unwrap();
+        for label in 1..=65 {
+            let parents = if label == 1 { vec![] } else { vec![label - 1] };
+            let mut prepared = graph
+                .seal(synthetic_vertex(&graph, label, &parents), &budget)
+                .unwrap();
+            let record = prepared.vertex().retained_record().unwrap();
+            store
+                .commit(&[&record], b"synthetic public record")
+                .unwrap();
+            prepared.bind_retained_source(&record).unwrap();
+            prepared
+                .retain_ancestry(&graph, &mut store, &budget)
+                .unwrap();
+            graph.publish_checked(prepared, &budget).unwrap();
+        }
+        let prior = graph.index.materialize(Some(&budget)).unwrap();
+        let mut expected = prior.clone();
+        expected.insert(id(66), 65);
+        let mut prepared = graph
+            .seal(synthetic_vertex(&graph, 66, &[65]), &budget)
+            .unwrap();
+        let record = prepared.vertex().retained_record().unwrap();
+        store
+            .commit(&[&record], b"synthetic final public record")
+            .unwrap();
+        prepared.bind_retained_source(&record).unwrap();
+        prepared
+            .retain_ancestry(&graph, &mut store, &budget)
+            .unwrap();
+        let oracle = VertexIndex::retain(&expected, &mut store, [9; 32], &budget).unwrap();
+        assert_eq!(
+            prepared.index.as_ref().unwrap().retained_ids(),
+            oracle.retained_ids()
+        );
+        let current_tail = graph.vertices.retained_ids()[1];
+        let next_tail = prepared.directory.as_ref().unwrap();
+        let next_ids = VertexDirectory::<RetainedVertex>::from_retained(
+            next_tail.clone(),
+            RetainedVertex::from_directory,
+        )
+        .retained_ids();
+        let index_tail = prepared.index.as_ref().unwrap().retained_ids()[1];
+        for missing in [current_tail, next_ids[1], index_tail] {
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(missing)));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            // Fresh receiver-owned staging each time; failed publication cannot
+            // leak either directory or index credit to the current graph.
+            let attempt = PreparedVertex {
+                vertex: prepared.vertex.clone(),
+                revision: prepared.revision,
+                index: prepared.index.clone(),
+                directory: prepared.directory.clone(),
+            };
+            assert!(graph.publish_checked(attempt, &budget).is_err());
+            assert_eq!(graph.len(), 65);
+            std::fs::rename(&held, &path).unwrap();
+            assert_eq!(graph.index.materialize(Some(&budget)).unwrap(), prior);
+        }
+        graph.publish_checked(prepared, &budget).unwrap();
+        assert_eq!(graph.len(), 66);
+        assert_eq!(graph.index.materialize(Some(&budget)).unwrap(), expected);
     }
     #[test]
     fn disk_index_graph_missing_current_or_staged_page_refuses_without_partial_credit() {

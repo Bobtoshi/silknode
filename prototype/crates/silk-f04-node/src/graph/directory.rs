@@ -41,7 +41,7 @@ impl<'a, V> DirectoryOperation<'a, V> {
         }
     }
     pub(super) fn load(&mut self, ordinal: usize, budget: &JobBudget) -> Result<Arc<V>> {
-        budget.check()?;
+        self.directory.check_shape(budget)?;
         let VertexDirectory::Retained(rows, decode) = self.directory else {
             return self.directory.load(ordinal, Some(budget));
         };
@@ -542,6 +542,20 @@ impl<V> VertexDirectory<V> {
                 Ok(row)
             }
         }
+    }
+    pub(super) fn check_shape(&self, budget: &JobBudget) -> Result<()> {
+        budget.check()?;
+        if let Self::Retained(rows, _) = self {
+            if rows.len > HISTORY_LIMIT_V1
+                || rows.bindings.len() != rows.len
+                || rows.pages.len() != rows.len.div_ceil(ITEMS)
+            {
+                return Err(Error::Unavailable("retained vertex directory shape"));
+            }
+        } else if self.len() > HISTORY_LIMIT_V1 {
+            return Err(Error::Unavailable("resident vertex directory horizon"));
+        }
+        Ok(())
     }
     pub(super) fn materialize(&self, budget: Option<&JobBudget>) -> Result<Vec<Arc<V>>> {
         if let Some(budget) = budget {
