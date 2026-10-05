@@ -215,7 +215,11 @@ impl BranchState {
         budget: &crate::budget::JobBudget,
     ) -> Result<CheckpointTransition> {
         budget.check()?;
-        let mut next = self.materialize_ledger(Some(budget))?;
+        // Empty admitted bodies cannot mutate any private collection. Preserve
+        // their immutable retained pages, but never treat them as validated:
+        // complete hashing/invariant reads must finish before returning a state.
+        let has_effects = batch.iter().any(|vertex| !vertex.envelopes().is_empty());
+        let mut next = self.prepare_ledger_mutation(has_effects, budget)?;
         let j = self
             .checkpoint_index
             .checked_add(1)
@@ -268,7 +272,7 @@ impl BranchState {
                 next.leaves(),
             ));
         }
-        next.check_invariants()?;
+        next.check_invariants_checked(Some(budget))?;
         budget.check()?;
         Ok(CheckpointTransition {
             state: next,
@@ -459,25 +463,42 @@ impl BranchState {
     }
 
     fn check_invariants(&self) -> Result<()> {
+        self.check_invariants_checked(None)
+    }
+    fn check_invariants_checked(&self, budget: Option<&crate::budget::JobBudget>) -> Result<()> {
         self.economic_counts()
-            .validate(
-                &self.domain,
-                self.initial_pool,
-                self.executed.iter(),
-                self.rewards.iter(),
-            )
+            .validate_counts(&self.domain, self.initial_pool)
             .map_err(|_| Error::Unavailable("complete economic ledger invariants"))?;
+        let mut prefix = self.executed.prefix_comparison();
+        let mut position = 0;
+        self.rewards.visit_encoded(budget, &mut |bytes| {
+            let row: &[u8; 112] = bytes
+                .try_into()
+                .map_err(|_| Error::Unavailable("reward history item"))?;
+            let vertex = VertexId::from_bytes(row[8..40].try_into().expect("fixed reward row"));
+            crate::economics::validate_reward(position, &vertex, row)
+                .map_err(|_| Error::Unavailable("complete economic ledger invariants"))?;
+            prefix.advance(&vertex, budget)?;
+            position += 1;
+            Ok(())
+        })?;
+        if position != self.executed.len() || prefix.finish(budget)? != position {
+            return Err(Error::Unavailable("complete economic ledger invariants"));
+        }
+        let mut last_position: Option<u64> = None;
+        self.accepted_outputs.visit_encoded(budget, &mut |row| {
+            last_position = Some(crate::wire::u64le(row, 32)?);
+            Ok(())
+        })?;
         if self.nullifiers.len() != self.effects.len() * 2
             || self.accepted_outputs.len() != self.effects.len()
-            || self
-                .accepted_outputs
-                .last()
-                .is_some_and(|row| row.first_position.checked_add(2) != Some(self.leaves()))
+            || last_position.is_some_and(|position| position.checked_add(2) != Some(self.leaves()))
             || self.leaves() != self.initial_leaves + 2 * self.burned
             || self.tree.size() as u64 != self.leaves()
         {
             return Err(Error::Unavailable("complete state invariants"));
         }
+        budget.map_or(Ok(()), crate::budget::JobBudget::check)?;
         Ok(())
     }
 
@@ -670,6 +691,23 @@ impl BranchState {
         state.accepted_outputs = self.accepted_outputs.materialize(budget)?;
         state.rewards = self.rewards.materialize(budget)?;
         state.executed = self.executed.materialize(budget)?;
+        Ok(state)
+    }
+    /// Private scratch only. The caller derives `has_effects` from the admitted
+    /// batch; no peer flag selects this path or bypasses complete qualification.
+    fn prepare_ledger_mutation(
+        &self,
+        has_effects: bool,
+        budget: &crate::budget::JobBudget,
+    ) -> Result<Self> {
+        if has_effects {
+            return self.materialize_ledger(Some(budget));
+        }
+        budget.check()?;
+        let mut state = self.clone();
+        state.executed = self.executed.materialize(Some(budget))?;
+        state.rewards = self.rewards.materialize(Some(budget))?;
+        budget.check()?;
         Ok(state)
     }
     pub(crate) fn retain_ledger(
@@ -1384,6 +1422,74 @@ mod tests {
                 .interval,
             ids[128..]
         );
+    }
+
+    #[test]
+    fn empty_batch_preparation_retains_private_pages_and_checks_complete_invariants() {
+        // Synthetic state only; selection from admitted bodies is covered by
+        // native execution, not by this private preparation adapter fixture.
+        let (mut state, _, _) = ordered_fixture(136);
+        state.initial_pool = 100;
+        state.pool = 100;
+        append_recovery_rows(&mut state, 1..=70);
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        store
+            .begin_replay(b"synthetic selective reducer preparation")
+            .unwrap();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        let stored = state.retain_ledger(&mut store, &budget).unwrap();
+        let before = stored.manifest();
+        stored.check_invariants_checked(Some(&budget)).unwrap();
+        let sparse = stored.prepare_ledger_mutation(false, &budget).unwrap();
+        assert_eq!(sparse.retained_set_pages(), stored.retained_set_pages());
+        assert_eq!(
+            sparse.retained_recovery_pages(),
+            stored.retained_recovery_pages()
+        );
+        assert_eq!(
+            sparse.retained_history_pages()[0],
+            stored.retained_history_pages()[0]
+        );
+        assert!(sparse.retained_history_pages()[1].is_empty());
+        assert!(sparse.retained_history_pages()[2].is_empty());
+        sparse.check_invariants_checked(Some(&budget)).unwrap();
+        assert_eq!(
+            sparse.hash_state_checked(Some(&budget)).unwrap(),
+            state.hash_state()
+        );
+        let full = stored.prepare_ledger_mutation(true, &budget).unwrap();
+        assert!(full.retained_set_pages().iter().all(Vec::is_empty));
+        assert!(full.retained_recovery_pages().is_empty());
+        assert!(full.retained_history_pages().iter().all(Vec::is_empty));
+        assert_eq!(full.hash_state(), state.hash_state());
+        let mut wrong = state.clone();
+        wrong.executed = LedgerHistory::new(crate::sync::HISTORY_LIMIT_V1);
+        for index in 0..136_u64 {
+            wrong
+                .executed
+                .push(VertexId::from_bytes([index as u8; 32]))
+                .unwrap();
+        }
+        assert!(wrong.check_invariants_checked(Some(&budget)).is_err());
+        for pages in [
+            stored.retained_history_pages()[0].clone(),
+            stored.retained_history_pages()[1].clone(),
+            stored.retained_history_pages()[2].clone(),
+        ] {
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(pages.last().unwrap())));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(stored.check_invariants_checked(Some(&budget)).is_err());
+            std::fs::rename(&held, &path).unwrap();
+        }
+        let expired = crate::budget::JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(stored.prepare_ledger_mutation(false, &expired).is_err());
+        assert!(stored.check_invariants_checked(Some(&expired)).is_err());
+        assert_eq!(stored.manifest(), before);
+        assert_eq!(store.head(), None);
     }
 
     #[test]

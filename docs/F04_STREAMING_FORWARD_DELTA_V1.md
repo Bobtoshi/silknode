@@ -91,3 +91,8 @@ Compiled changed source under `prototype/crates/silk-f04-node/src/`:
 All build/test/native compute ran on the authorized research VPS. No changed
 consensus/crypto defaults, cap lift, live service, valuable asset or expensive
 unchanged-baseline repetition is part of this result.
+
+[Selective checkpoint preparation](F04_SELECTIVE_CHECKPOINT_LEDGER_V1.md)
+subsequently keeps unchanged private payload collections retained for an empty
+admitted batch, with complete streamed invariant qualification. Nonempty
+mutation and mutable executed/reward histories still materialize.

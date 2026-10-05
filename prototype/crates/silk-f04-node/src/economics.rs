@@ -74,6 +74,26 @@ impl EconomicCountsV1 {
         mut executed: impl Iterator<Item = &'a VertexId>,
         mut rewards: impl Iterator<Item = &'a [u8; 112]>,
     ) -> Result<()> {
+        self.validate_counts(expected_domain, initial_private_pool)?;
+        for index in 0..self.executed {
+            let vertex = executed
+                .next()
+                .ok_or(Error::Invalid("economic ledger conservation/cursor"))?;
+            let row = rewards
+                .next()
+                .ok_or(Error::Invalid("economic ledger conservation/cursor"))?;
+            validate_reward(index, vertex, row)?;
+        }
+        if executed.next().is_some() || rewards.next().is_some() {
+            return Err(Error::Invalid("economic ledger conservation/cursor"));
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_counts(
+        &self,
+        expected_domain: &Digest,
+        initial_private_pool: u64,
+    ) -> Result<()> {
         if self.domain != *expected_domain {
             return Err(Error::Invalid("economic ledger context"));
         }
@@ -89,27 +109,20 @@ impl EconomicCountsV1 {
         {
             return Err(Error::Invalid("economic ledger conservation/cursor"));
         }
-        for index in 0..self.executed {
-            let vertex = executed
-                .next()
-                .ok_or(Error::Invalid("economic ledger conservation/cursor"))?;
-            let row = rewards
-                .next()
-                .ok_or(Error::Invalid("economic ledger conservation/cursor"))?;
-            let position = u64::from_le_bytes(row[..8].try_into().expect("fixed reward row"));
-            let amount = u64::from_le_bytes(row[104..].try_into().expect("fixed reward row"));
-            if position != index as u64 + 1
-                || row[8..40] != vertex.as_bytes()[..]
-                || amount != PUBLIC_CREDIT_V1
-            {
-                return Err(Error::Invalid("economic reward lineage/amount"));
-            }
-        }
-        if executed.next().is_some() || rewards.next().is_some() {
-            return Err(Error::Invalid("economic ledger conservation/cursor"));
-        }
         Ok(())
     }
+}
+
+pub(crate) fn validate_reward(index: usize, vertex: &VertexId, row: &[u8; 112]) -> Result<()> {
+    let position = u64::from_le_bytes(row[..8].try_into().expect("fixed reward row"));
+    let amount = u64::from_le_bytes(row[104..].try_into().expect("fixed reward row"));
+    if position != index as u64 + 1
+        || row[8..40] != vertex.as_bytes()[..]
+        || amount != PUBLIC_CREDIT_V1
+    {
+        return Err(Error::Invalid("economic reward lineage/amount"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -102,6 +102,82 @@ fn assert_complete(node: &Node) {
 }
 
 #[test]
+#[ignore = "new selective reducer path ONLY; fresh24 existing genuine carriers, no mining/proofs"]
+fn selective_empty_checkpoint_native_24_retains_private_pages() {
+    let (root, margin, genesis, history, parameters) = inputs();
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    let mut node = Node::create(&root.join("node"), &margin, genesis).unwrap();
+    let bytes = history.read_range(0, 24).unwrap();
+    let range = history.decode_range(&bytes, 0, 24).unwrap();
+    for carrier in range.carriers() {
+        assert_eq!(
+            node.ingest(carrier, &parameters).unwrap(),
+            Ingress::Admitted
+        );
+        for _ in 0..4 {
+            if node.status().unwrap() == Status::Ready {
+                break;
+            }
+            node.advance().unwrap();
+        }
+        assert_eq!(node.status().unwrap(), Status::Ready);
+    }
+    assert_eq!(node.core.state.checkpoint_index(), 3);
+    let ids = node
+        .core
+        .order
+        .eligible(&JobBudget::checkpoint().unwrap())
+        .unwrap();
+    let prior = node
+        .core
+        .retained_history_for_test()
+        .find(|state| state.checkpoint_index() == 2)
+        .unwrap()
+        .clone();
+    let bodies = ids[16..24]
+        .iter()
+        .map(|id| {
+            node.core
+                .graph
+                .load_for_execution(*id, &node.core.genesis, &JobBudget::checkpoint().unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(bodies.iter().all(|vertex| vertex.envelopes().is_empty()));
+    let batch = bodies
+        .iter()
+        .map(Arc::as_ref)
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()
+        .unwrap();
+    let replayed = prior
+        .execute(batch, &JobBudget::checkpoint().unwrap())
+        .unwrap();
+    assert_eq!(replayed.state.manifest(), node.core.state.manifest());
+    assert_eq!(
+        replayed.state.retained_recovery_pages(),
+        prior.retained_recovery_pages()
+    );
+    assert!(!prior.retained_recovery_pages().is_empty());
+    assert_eq!(
+        replayed.state.retained_set_pages(),
+        prior.retained_set_pages()
+    );
+    assert_eq!(
+        replayed.state.retained_history_pages()[0],
+        prior.retained_history_pages()[0]
+    );
+    assert!(replayed.state.retained_history_pages()[1].is_empty());
+    assert!(replayed.state.retained_history_pages()[2].is_empty());
+    assert!(!root.join("node/ACTIVE_JOB").exists());
+    assert!(!root.join("node/ACTIVE_REPLAY").exists());
+    println!(
+        "selective_empty_checkpoint_native=true; vertices=24; checkpoints=3; admitted_empty_batch=true; exact_original_manifest=true; private_payload_pages_remain_retained=true; mutable_executed_reward_histories_still_materialized=true; new_work=0; new_proofs=0; separate_cold_success=false; native_reorg=false"
+    );
+}
+
+#[test]
 #[ignore = "changed ancestry-root native boundary ONLY; fresh 520 existing genuine carriers, isolated outer limits, no mining/proofs"]
 fn extensible_ancestry_native_520_fresh_node() {
     assert_eq!(
