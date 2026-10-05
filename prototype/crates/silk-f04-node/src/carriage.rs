@@ -472,6 +472,57 @@ impl MiningTemplate {
     pub const fn body(&self) -> &Body {
         &self.body
     }
+    /// Consume into bounded LOCAL handoff bytes and their separately retained SHA.
+    /// This is not a consensus object, public endpoint or validity certificate.
+    /// File/pipe custody and delivery of the pin must be established separately.
+    /// No work proof, wallet keys or parent caches are exported; public body proofs/ciphertexts remain.
+    #[must_use]
+    pub fn encode_local(self) -> (Vec<u8>, Digest) {
+        let mut bytes = Vec::with_capacity(612 + self.body.bytes().len());
+        bytes.extend_from_slice(b"SNF04WT1\x01\0\0\0");
+        bytes.extend_from_slice(&592_u32.to_be_bytes());
+        bytes.extend_from_slice(&(self.body.bytes().len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.header.bytes);
+        bytes.extend_from_slice(self.body.bytes());
+        let pin = crate::wire::raw_hash(&bytes);
+        (bytes, pin)
+    }
+    /// Import an explicit LOCAL work input against independently selected genesis
+    /// and a pin retained from its preparing owner, never a pin read from input.
+    /// Framing/body bindings are checked before any VM allocation or nonce work.
+    /// The work key is derived from the CLAIMED header seed, not trusted parent
+    /// facts. Ordinary ingress still rederives every source/DAA/parent/clock claim.
+    /// A forged but pinned header may waste mining work; it gains no graph credit.
+    /// # Errors
+    /// Refuses excess/truncated/noncanonical bytes, foreign genesis, wrong pin
+    /// or body/header bindings. This establishes no relay/payment provenance.
+    pub fn decode_local(bytes: &[u8], genesis: Arc<Genesis>, expected_pin: Digest) -> Result<Self> {
+        if !(632..=89_912).contains(&bytes.len())
+            || &bytes[..12] != b"SNF04WT1\x01\0\0\0"
+            || u32::from_be_bytes(field(bytes, 12)?) != 592
+        {
+            return Err(Error::Invalid("local mining template framing"));
+        }
+        let length = u32::from_be_bytes(field(bytes, 16)?) as usize;
+        if !(20..=89_300).contains(&length) || bytes.len() != 612 + length {
+            return Err(Error::Invalid("local mining template length"));
+        }
+        if crate::wire::raw_hash(bytes) != expected_pin {
+            return Err(Error::Invalid("local mining template pin"));
+        }
+        let body = Body::decode(&bytes[612..], &genesis.domain())?;
+        let header = Header::decode(field(bytes, 20)?, &body, &genesis)?;
+        let key = carriage_hash(
+            "SilkNode/F01-RandomX-Key/v1",
+            &[&genesis.domain(), &header.seed],
+        );
+        Ok(Self {
+            header,
+            body,
+            genesis,
+            key,
+        })
+    }
     fn candidate(&self, nonce: u64, hash: Digest) -> Result<Option<Candidate>> {
         if Uint256::from_be_bytes(hash) > target(self.header.work)? {
             return Ok(None);
@@ -489,6 +540,10 @@ impl MiningTemplate {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "carriage/local_template_tests.rs"]
+mod local_template_tests;
 
 fn target(work: u64) -> Result<Uint256> {
     dag_target_for_work_v3(work).map_err(|_| Error::Invalid("work target"))

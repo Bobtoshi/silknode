@@ -176,3 +176,58 @@ The ignored gate is
 its explicit fixture environment is documented in the test source. Use only
 a new authenticated public-input copy with its own retained pin and resource
 containment; never reopen or repair a failed owner to rerun a qualification.
+
+## Local jobs across process boundaries
+
+`MiningTemplate::encode_local` consumes a prepared input and returns its bytes
+and SHA-256 pin for separate local retention. `decode_local` requires admitted
+genesis and the independently retained pin, not a pin supplied by the input.
+This opt-in private codec is not a consensus carriage, public endpoint, stable
+cross-language ABI, signature, relay provenance or permission to mine.
+
+The exact frame is `SNF04WT1`, four version/reserved bytes `01 00 00 00`,
+big-endian header length592 and body length, then the unchanged592-byte header
+and existing canonical body. Total size is632..89912 bytes, including at most
+32 envelopes. Lengths/context/body bindings and pin are checked before any VM
+allocation. The body retains its existing public Sapling proofs and encrypted
+recovery data; there are no wallet keys, new proofs, work proof or node caches.
+The worker derives the existing work key from the **claimed** header seed.
+Correct framing and a matching pin do not authenticate parents, source, DAA,
+current time, payment validity or canonical effects. Only ordinary ingress can
+establish those; a forged but pinned job may waste a miner's resources.
+
+Two separately invoked Linux processes on 5 October 2026 qualified this boundary.
+A fresh authenticated15-vertex owner prepared empty,1- and32-envelope jobs,
+closed every job and left its head/state/graph and old public bytes unchanged.
+The empty job used explicit ordinary mining preparation, not a cover offer.
+A second process imported only13 public job/genesis/reference files, read-only,
+with the node store and Sapling parameter paths hidden. All three job sizes
+(632,3422,89912) round-tripped exactly. Its original work-input bytes matched
+the preparer's for nonces0,7 and `u64::MAX`, without evaluating those nonces,
+creating a VM or generating work/proofs/keys. Wrong pins, malformed lengths,
+reserved bytes, changed contexts/body bindings, truncation and oversize refused.
+The deliberate accepted DAA-claim mutation shows that decoding is **not**
+receiver authentication. Repeated saved envelopes test framing, not new valid
+payments. Both processes used one CPU,3 GiB RAM/no swap/four tasks/no public
+listeners; preparation was capped39 CPU/120 wall seconds with only a fresh
+capped-volume directory writable, import5 CPU/30 wall seconds with no writable
+node path. Preparation used 5.499 CPU/5.757 wall seconds and324.3 MiB peak memory;
+import used67ms CPU/82ms wall and9 MiB peak. This is not nonce-search,
+settlement, independent-operator, crash, anonymity or whole-core acceptance.
+
+Native receipt:
+`/var/tmp/silknode-replay-pages-evidence-v1/local-template-release-v1/result.json`,
+SHA-256 `093c523c88278f9591277cbb6a542dc01f3d791ef9f2f07a5d064629d72c4782`.
+The exact final native ELF SHA-256 is
+`bb2e38e8ee95979e9a5faa0d4de63ed470ff0ddfaf36e712c9b0e3bb2455e3bf`.
+Original two-process receipts remain at `local-template-v1/result.json`, SHA-256
+`ffb1a7a44b3423d878dd586c418eedd9658c21458f0fa43033b90047f9f0b483`.
+A single doc-line correction distinguished existing body proof bytes from new
+proof generation. Its rebuild produced a different ELF, so that earlier runtime
+acceptance was not transferred: both final-binary phases used another fresh
+public-history copy. The no-transfer receipt is `local-template-v1/final-doc-result.json`,
+SHA-256 `90066b48dc47dc8c5e058109374155926716f6f1c57f0af047061465785aa32f`.
+The final receipt also corrects the earlier top-level `new_vm=0` field: zero VM
+allocation applies only to the importer. The preparing node re-verifies existing
+history with its native work engine, included in the reported CPU/RAM totals;
+it performs no new mining. No earlier receipt was overwritten or erased.
