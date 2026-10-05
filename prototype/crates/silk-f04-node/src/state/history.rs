@@ -289,7 +289,116 @@ pub(super) enum LedgerHistory<T: Item> {
     Resident(PagedSequence<T>),
     Retained(Retained<T>),
 }
+/// One immutable comparison, owning at most 64 decoded rows. Nothing is
+/// returned as a comparison result until every ledger page has been qualified.
+pub(super) struct PrefixComparison<'a, T: Item> {
+    history: &'a LedgerHistory<T>,
+    page: Option<(usize, Vec<T>)>,
+    position: usize,
+    common: usize,
+}
+impl<T: Item + PartialEq> PrefixComparison<'_, T> {
+    fn load(&mut self, position: usize, budget: Option<&JobBudget>) -> Result<T> {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        match self.history {
+            LedgerHistory::Resident(rows) => rows
+                .get(position)
+                .cloned()
+                .ok_or(Error::Unavailable("ledger comparison ordinal")),
+            LedgerHistory::Retained(rows) => {
+                let ordinal = position / ITEMS;
+                if self
+                    .page
+                    .as_ref()
+                    .is_none_or(|(cached, _)| *cached != ordinal)
+                {
+                    // Release the old payload BEFORE decoding the replacement:
+                    // even the transient decoded-row ownership stays <=64.
+                    self.page = None;
+                    let page = rows
+                        .pages
+                        .get(ordinal)
+                        .ok_or(Error::Unavailable("retained history directory length"))?;
+                    if rows.len > rows.limit
+                        || rows.pages.len() != rows.len.div_ceil(ITEMS)
+                        || page.count != (rows.len - ordinal * ITEMS).min(ITEMS)
+                    {
+                        return Err(Error::Unavailable("retained history page count"));
+                    }
+                    if let Some(budget) = budget {
+                        budget.source()?;
+                    }
+                    let size = HEADER + page.count * T::WIDTH;
+                    let bytes = rows.reader.object(page.id, size)?;
+                    if bytes.len() != size
+                        || bytes.get(..8) != Some(T::MAGIC.as_slice())
+                        || bytes[8..40] != rows.domain
+                        || u64le(&bytes, 40)? != ordinal as u64
+                        || u32le(&bytes, 48)? as usize != page.count
+                    {
+                        return Err(Error::Unavailable("retained history page binding"));
+                    }
+                    let decoded = bytes[HEADER..]
+                        .chunks_exact(T::WIDTH)
+                        .map(T::decode)
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Some(budget) = budget {
+                        budget.check()?;
+                    }
+                    self.page = Some((ordinal, decoded));
+                }
+                self.page
+                    .as_ref()
+                    .and_then(|(_, page)| page.get(position % ITEMS))
+                    .cloned()
+                    .ok_or(Error::Unavailable("ledger comparison ordinal"))
+            }
+        }
+    }
+    pub(super) fn advance(&mut self, value: &T, budget: Option<&JobBudget>) -> Result<()> {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        if self.position < self.history.len() {
+            let executed = self.load(self.position, budget)?;
+            if self.common == self.position && executed == *value {
+                self.common += 1;
+            }
+        }
+        self.position = self
+            .position
+            .checked_add(1)
+            .ok_or(Error::Unavailable("ledger comparison overflow"))?;
+        Ok(())
+    }
+    pub(super) fn finish(mut self, budget: Option<&JobBudget>) -> Result<usize> {
+        // A short preferred order or an early divergence MUST NOT conceal a
+        // missing/corrupt later ledger page. No early-success prefix return.
+        for position in self.position.min(self.history.len())..self.history.len() {
+            self.load(position, budget)?;
+        }
+        if let LedgerHistory::Retained(rows) = self.history
+            && (rows.len > rows.limit || rows.pages.len() != rows.len.div_ceil(ITEMS))
+        {
+            return Err(Error::Unavailable("retained history directory length"));
+        }
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        Ok(self.common)
+    }
+}
 impl<T: Item> LedgerHistory<T> {
+    pub(super) const fn prefix_comparison(&self) -> PrefixComparison<'_, T> {
+        PrefixComparison {
+            history: self,
+            page: None,
+            position: 0,
+            common: 0,
+        }
+    }
     pub(super) const fn new(limit: usize) -> Self {
         Self::Resident(PagedSequence::new(limit))
     }

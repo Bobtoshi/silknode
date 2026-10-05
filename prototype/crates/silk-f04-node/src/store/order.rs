@@ -7,6 +7,7 @@ use crate::{
     wire::{raw_hash, u32le},
 };
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest as _, Sha256};
 use std::{fs::File, io::Write};
 
 const HEADER: usize = 76;
@@ -100,6 +101,24 @@ impl ObjectReader {
     /// Typed canonical-order read. A damaged legacy raw object is never hidden
     /// by a virtual representation, and nested damage never permits HEAD repair.
     pub(crate) fn order(&self, id: Digest, limit: usize, budget: &JobBudget) -> Result<Vec<u8>> {
+        let mut bytes = vec![0; HEADER];
+        let header = self.visit_order(id, limit, budget, &mut |rows| {
+            bytes.extend_from_slice(rows);
+            Ok(())
+        })?;
+        bytes[..HEADER].copy_from_slice(&header);
+        Ok(bytes)
+    }
+    /// Private staging visitor only. Shared orders retain at most one leaf and
+    /// two branch pages, not the complete canonical payload. Visitor observations
+    /// MUST remain provisional until the entire canonical hash has passed.
+    pub(crate) fn visit_order(
+        &self,
+        id: Digest,
+        limit: usize,
+        budget: &JobBudget,
+        visit: &mut impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<[u8; HEADER]> {
         budget.check()?;
         if limit > HEADER + LIMIT * 32 {
             return Err(Error::Unavailable(DAMAGED));
@@ -108,8 +127,14 @@ impl ObjectReader {
         match self.object(id, limit) {
             Ok(bytes) => {
                 count(&bytes)?;
+                for rows in bytes[HEADER..].chunks(ROWS * 32) {
+                    budget.check()?;
+                    visit(rows)?;
+                }
                 budget.check()?;
-                return Ok(bytes);
+                return bytes[..HEADER]
+                    .try_into()
+                    .map_err(|_| Error::Unavailable(DAMAGED));
             }
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(Error::Unavailable(DAMAGED)),
@@ -136,14 +161,28 @@ impl ObjectReader {
         let root: Digest = descriptor[8 + HEADER..]
             .try_into()
             .map_err(|_| Error::Unavailable(DAMAGED))?;
-        let mut bytes = Vec::with_capacity(HEADER + n * 32);
-        bytes.extend_from_slice(&descriptor[8..8 + HEADER]);
-        self.order_branch(root, 2, 0, n, &mut bytes, budget)?;
-        if count(&bytes)? != n || raw_hash(&bytes) != id {
+        let header: [u8; HEADER] = descriptor[8..8 + HEADER]
+            .try_into()
+            .map_err(|_| Error::Unavailable(DAMAGED))?;
+        let mut hash = Sha256::new();
+        hash.update(header);
+        self.order_branch(
+            root,
+            2,
+            0,
+            n,
+            &mut |rows| {
+                hash.update(rows);
+                visit(rows)
+            },
+            budget,
+        )?;
+        let canonical: Digest = hash.finalize().into();
+        if canonical != id {
             return Err(Error::Unavailable(DAMAGED));
         }
         budget.check()?;
-        Ok(bytes)
+        Ok(header)
     }
     fn order_page(&self, id: Digest, budget: &JobBudget) -> Result<Vec<u8>> {
         budget.check()?;
@@ -157,7 +196,7 @@ impl ObjectReader {
         level: usize,
         base: usize,
         n: usize,
-        out: &mut Vec<u8>,
+        visit: &mut impl FnMut(&[u8]) -> Result<()>,
         budget: &JobBudget,
     ) -> Result<()> {
         let bytes = self.order_page(id, budget)?;
@@ -172,7 +211,7 @@ impl ObjectReader {
             let child = row.try_into().map_err(|_| Error::Unavailable(DAMAGED))?;
             let child_base = base + i * stride;
             if level == 2 {
-                self.order_branch(child, 1, child_base, n, out, budget)?;
+                self.order_branch(child, 1, child_base, n, visit, budget)?;
             } else {
                 let leaf = self.order_page(child, budget)?;
                 let rows = (n - child_base * ROWS).min(ROWS);
@@ -180,7 +219,7 @@ impl ObjectReader {
                 if leaf.len() != 12 + rows * 32 || leaf.get(..12) != Some(header.as_slice()) {
                     return Err(Error::Unavailable(DAMAGED));
                 }
-                out.extend_from_slice(&leaf[12..]);
+                visit(&leaf[12..])?;
             }
         }
         Ok(())

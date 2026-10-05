@@ -22,6 +22,22 @@ use silk_sapling_f04::{
 use silk_types::VertexId;
 use std::{collections::VecDeque, sync::Arc};
 
+/// Private immutable, operation-local ledger comparison, never persisted authority.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct ExecutionComparison<'a>(history::PrefixComparison<'a, VertexId>);
+impl ExecutionComparison<'_> {
+    pub(crate) fn advance(
+        &mut self,
+        id: &VertexId,
+        budget: &crate::budget::JobBudget,
+    ) -> Result<()> {
+        self.0.advance(id, Some(budget))
+    }
+    pub(crate) fn finish(self, budget: &crate::budget::JobBudget) -> Result<usize> {
+        self.0.finish(Some(budget))
+    }
+}
+
 /// Canonical cut with its exact prefix and leaf-count lineage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cut {
@@ -728,8 +744,14 @@ impl BranchState {
         ids: &[VertexId],
         budget: Option<&crate::budget::JobBudget>,
     ) -> Result<usize> {
-        let executed = self.executed.materialize(budget)?;
-        Ok(executed.iter().zip(ids).take_while(|(a, b)| a == b).count())
+        let mut comparison = self.executed.prefix_comparison();
+        for id in ids {
+            comparison.advance(id, budget)?;
+        }
+        comparison.finish(budget)
+    }
+    pub(crate) const fn execution_comparison(&self) -> ExecutionComparison<'_> {
+        ExecutionComparison(self.executed.prefix_comparison())
     }
     #[cfg(test)]
     pub(crate) fn executed_prefix_matches(&self, ids: &[VertexId]) -> bool {
@@ -1129,6 +1151,85 @@ mod tests {
         state.checkpoint_index = u64::from(count) / 8;
         state.state_digest = state.hash_state();
         (state, ids, rewards)
+    }
+
+    #[test]
+    fn streaming_order_ledger_inspection_matches_prefix_interval_and_refuses_late_damage() {
+        // Synthetic private serializer rows, NOT work/crypto/checkpoint acceptance.
+        let (state, ids, _) = ordered_fixture(136);
+        let (prior, _, _) = ordered_fixture(128);
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        store
+            .begin_replay(b"synthetic streaming comparison")
+            .unwrap();
+        let stored = state.retain_ledger(&mut store, &budget).unwrap();
+        let prior = prior.retain_ledger(&mut store, &budget).unwrap();
+        let mut bytes = Vec::from(b"SNF04OR1".as_slice());
+        bytes.extend_from_slice(&[1; 32]);
+        bytes.extend_from_slice(&[2; 32]);
+        bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in &ids {
+            bytes.extend_from_slice(id.as_bytes());
+        }
+        store
+            .commit_ordered(&[], &bytes, b"synthetic inspection", &budget)
+            .unwrap();
+        let order = crate::core::order::CoreOrder::synthetic_retained(
+            &bytes,
+            store.object_reader().unwrap(),
+        );
+        let inspection = order
+            .inspect(&[&stored, &prior], Some(128), &budget)
+            .unwrap();
+        assert_eq!(inspection.count, 136);
+        assert_eq!(inspection.common, [136, 128]);
+        assert_eq!(inspection.interval, ids[128..136]);
+        assert_eq!(order.inspect(&[], None, &budget).unwrap().count, 136);
+        assert!(order.inspect(&[&stored; 7], None, &budget).is_err());
+        assert!(order.inspect(&[], Some(usize::MAX), &budget).is_err());
+        let mut divergent = ids.clone();
+        divergent[0] = VertexId::from_bytes([99; 32]);
+        assert_eq!(
+            stored
+                .common_executed_prefix_checked(&divergent, Some(&budget))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            stored
+                .common_executed_prefix_checked(&ids[..1], Some(&budget))
+                .unwrap(),
+            1
+        );
+        let executed_pages = stored.retained_history_pages()[2].clone();
+        let path = temp
+            .path()
+            .join("store")
+            .join(format!("{}.obj", hex::encode(executed_pages[2])));
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        assert!(order.inspect(&[&stored], Some(0), &budget).is_err());
+        assert!(
+            stored
+                .common_executed_prefix_checked(&divergent, Some(&budget))
+                .is_err()
+        );
+        assert!(
+            stored
+                .common_executed_prefix_checked(&[], Some(&budget))
+                .is_err()
+        );
+        std::fs::rename(&held, &path).unwrap();
+        let expired = crate::budget::JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(order.inspect(&[&stored], Some(0), &expired).is_err());
+        assert_eq!(
+            order
+                .inspect(&[&stored], Some(128), &budget)
+                .unwrap()
+                .interval,
+            ids[128..]
+        );
     }
 
     #[test]

@@ -270,29 +270,41 @@ impl Core {
             return Err(Error::Unavailable("no reconciliation pending"));
         }
         budget.check()?;
-        let ids = self.order.eligible(budget)?;
         let old_len = self.state.executed_len();
-        let common = self
-            .state
-            .common_executed_prefix_checked(&ids, Some(budget))?;
+        let inspection = self
+            .order
+            .inspect(&[self.state.as_ref()], Some(old_len), budget)?;
+        let common = inspection.common[0];
         if common < old_len {
             let end = common / 8 * 8;
             let mut selected: Option<Arc<BranchState>> = None;
-            for state in &self.history {
+            let candidates = self
+                .history
+                .iter()
+                .filter(|state| state.executed_len() <= end)
+                .collect::<Vec<_>>();
+            let states = candidates
+                .iter()
+                .copied()
+                .map(Arc::as_ref)
+                .collect::<Vec<_>>();
+            let rollback = self.order.inspect(&states, None, budget)?;
+            for (state, common) in candidates.iter().zip(&rollback.common) {
                 if state.executed_len() <= end
-                    && state.executed_prefix_matches_checked(&ids, Some(budget))?
+                    && *common == state.executed_len()
                     && selected
                         .as_ref()
                         .is_none_or(|selected| state.executed_len() >= selected.executed_len())
                 {
-                    selected = Some(state.clone());
+                    selected = Some((*state).clone());
                 }
             }
             let state = selected.unwrap_or(Arc::new(BranchState::genesis(&self.genesis)?));
             // A cached reversible snapshot is not permission to publish a
             // rollback whose original ledger pages are now unreadable.
             let state = Arc::new(state.materialize_ledger(Some(budget))?);
-            let derived_status = status_for(&state, &ids, budget)?;
+            let derived_status =
+                status_from_prefix(state.executed_len(), state.executed_len(), inspection.count);
             let status = if derived_status == Status::Ready {
                 Status::Ready
             } else if self.status == Status::ArchiveReplay {
@@ -309,10 +321,11 @@ impl Core {
                 previous: self.state.checkpoint_id(),
             });
         }
-        let start = old_len;
-        let batch = ids
-            .get(start..start + 8)
-            .ok_or(Error::Unavailable("incomplete replay interval"))?;
+        let batch: &[VertexId; 8] = inspection
+            .interval
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Unavailable("incomplete replay interval"))?;
         let verified = batch
             .iter()
             .map(|id| self.graph.load_for_execution(*id, &self.genesis, budget))
@@ -328,11 +341,14 @@ impl Core {
         )?;
         budget.check()?;
         let state = Arc::new(t.state);
-        let status = if status_for(&state, &ids, budget)? == Status::Ready {
-            Status::Ready
-        } else {
-            self.status
-        };
+        let status =
+            if status_from_prefix(state.executed_len(), state.executed_len(), inspection.count)
+                == Status::Ready
+            {
+                Status::Ready
+            } else {
+                self.status
+            };
         Ok(Step {
             state,
             status,
@@ -345,11 +361,12 @@ impl Core {
     /// state mutation. A divergent prefix may require genesis rollback plus all
     /// complete intervals; reuse of retained checkpoints can only lower the cost.
     pub fn reconciliation_generations(&self, budget: &JobBudget) -> Result<u64> {
-        let ids = self.order.eligible(budget)?;
-        let common = self
-            .state
-            .common_executed_prefix_checked(&ids, Some(budget))?;
-        HistoryCapacityV1::reconciliation_generations(self.state.executed_len(), common, ids.len())
+        let inspection = self.order.inspect(&[self.state.as_ref()], None, budget)?;
+        HistoryCapacityV1::reconciliation_generations(
+            self.state.executed_len(),
+            inspection.common[0],
+            inspection.count,
+        )
     }
     pub fn publish_step(&mut self, s: Step) -> Result<()> {
         if s.previous != self.state.checkpoint_id() {
@@ -437,7 +454,7 @@ impl Core {
     }
     pub fn selected_parent(&self, budget: &JobBudget) -> Result<Sg0ParentSetV1> {
         // Default mining selection may not proceed on an unreadable order.
-        self.order.bytes(budget)?;
+        self.order.inspect(&[], None, budget)?;
         Ok(self
             .order
             .selected_tip()
@@ -448,13 +465,14 @@ impl Core {
 }
 fn status_for(state: &BranchState, ids: &[VertexId], budget: &JobBudget) -> Result<Status> {
     let common = state.common_executed_prefix_checked(ids, Some(budget))?;
-    Ok(
-        if common == state.executed_len() && ids.len() / 8 * 8 == state.executed_len() {
-            Status::Ready
-        } else if state.executed_len().saturating_sub(common / 8 * 8) > 32 {
-            Status::ArchiveReplay
-        } else {
-            Status::NeedsReconcile
-        },
-    )
+    Ok(status_from_prefix(state.executed_len(), common, ids.len()))
+}
+const fn status_from_prefix(executed: usize, common: usize, eligible: usize) -> Status {
+    if common == executed && eligible / 8 * 8 == executed {
+        Status::Ready
+    } else if executed.saturating_sub(common / 8 * 8) > 32 {
+        Status::ArchiveReplay
+    } else {
+        Status::NeedsReconcile
+    }
 }

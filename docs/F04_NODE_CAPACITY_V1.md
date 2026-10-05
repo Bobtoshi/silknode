@@ -1,5 +1,9 @@
 # F0.4 local history capacity, version 1
 
+Follow-up: [bounded history inspection](F04_STREAMING_HISTORY_INSPECTION_V1.md)
+removes full order/executed buffers from inspection and interval selection. The
+limits here remain unchanged; this is not beyond-horizon native acceptance.
+
 `Node::history_capacity()` exposes read-only local resource metadata for node
 operators and ordinary third-party modules. `HistoryCapacityV1::for_counts`
 reproduces the arithmetic from unverified counts; it grants no graph, work,

@@ -3,6 +3,7 @@
 use crate::{
     Digest, Error, Result,
     budget::JobBudget,
+    state::BranchState,
     store::ObjectReader,
     sync::HISTORY_LIMIT_V1,
     wire::{raw_hash, u32le},
@@ -12,6 +13,15 @@ use silk_types::VertexId;
 use std::sync::Arc;
 
 const HEADER: usize = 76;
+/// Provisional scan data becomes usable only after complete order hashing and
+/// every supplied ledger's full qualification. At most six ledgers and eight
+/// selected IDs; never an importable order or a verification certificate.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct OrderInspection {
+    pub count: usize,
+    pub common: Vec<usize>,
+    pub interval: Vec<VertexId>,
+}
 #[derive(Clone)]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) enum CoreOrder {
@@ -80,6 +90,102 @@ pub(crate) fn snapshot_bytes(order: &Sg0OrderSnapshotV1) -> Vec<u8> {
     bytes
 }
 impl CoreOrder {
+    #[cfg(test)]
+    pub(crate) fn synthetic_retained(bytes: &[u8], reader: Arc<ObjectReader>) -> Self {
+        Self::Retained(RetainedOrder {
+            id: raw_hash(bytes),
+            count: u32le(bytes, 72).unwrap() as usize,
+            graph: bytes[8..40].try_into().unwrap(),
+            total: bytes[40..72].try_into().unwrap(),
+            selected: None,
+            reader,
+        })
+    }
+    pub(crate) fn inspect(
+        &self,
+        states: &[&BranchState],
+        interval_start: Option<usize>,
+        budget: &JobBudget,
+    ) -> Result<OrderInspection> {
+        budget.check()?;
+        if states.len() > 6 {
+            return Err(Error::Unavailable("order comparison state bound"));
+        }
+        let interval_end = interval_start
+            .map(|start| {
+                start
+                    .checked_add(8)
+                    .ok_or(Error::Unavailable("order inspection interval"))
+            })
+            .transpose()?;
+        let mut comparisons = states
+            .iter()
+            .map(|state| state.execution_comparison())
+            .collect::<Vec<_>>();
+        let mut count = 0_usize;
+        let mut interval = Vec::with_capacity(if interval_start.is_some() { 8 } else { 0 });
+        let mut observe = |id: VertexId| -> Result<()> {
+            budget.check()?;
+            for comparison in &mut comparisons {
+                comparison.advance(&id, budget)?;
+            }
+            if interval_start
+                .zip(interval_end)
+                .is_some_and(|(start, end)| (start..end).contains(&count))
+            {
+                interval.push(id);
+            }
+            count += 1;
+            Ok(())
+        };
+        match self {
+            Self::Resident(order) => {
+                if order.eligible_order().len() > HISTORY_LIMIT_V1
+                    || order.total_order().len() > HISTORY_LIMIT_V1
+                {
+                    return Err(Error::Unavailable("retained order horizon"));
+                }
+                for id in order.eligible_order() {
+                    observe(*id)?;
+                }
+            }
+            Self::Retained(order) => {
+                if order.count > HISTORY_LIMIT_V1 {
+                    return Err(Error::Unavailable("retained order horizon"));
+                }
+                let header = order.reader.visit_order(
+                    order.id,
+                    HEADER + order.count * 32,
+                    budget,
+                    &mut |rows| {
+                        for row in rows.chunks_exact(32) {
+                            observe(VertexId::from_bytes(
+                                row.try_into()
+                                    .map_err(|_| Error::Unavailable("retained order vertex"))?,
+                            ))?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                if header[8..40] != order.graph
+                    || header[40..72] != order.total
+                    || u32le(&header, 72)? as usize != order.count
+                {
+                    return Err(Error::Unavailable("retained order binding"));
+                }
+            }
+        }
+        let common = comparisons
+            .into_iter()
+            .map(|comparison| comparison.finish(budget))
+            .collect::<Result<Vec<_>>>()?;
+        budget.check()?;
+        Ok(OrderInspection {
+            count,
+            common,
+            interval,
+        })
+    }
     pub(crate) fn resident(order: Sg0OrderSnapshotV1) -> Self {
         Self::Resident(Arc::new(order))
     }
@@ -135,6 +241,7 @@ impl CoreOrder {
         }
     }
     /// Owned operation-local IDs. The core never caches these payload vectors.
+    #[cfg(test)]
     pub(crate) fn eligible(&self, budget: &JobBudget) -> Result<Vec<VertexId>> {
         let bytes = self.bytes(budget)?;
         let ids = bytes[HEADER..]

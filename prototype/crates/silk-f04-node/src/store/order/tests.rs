@@ -30,6 +30,85 @@ fn names(root: &std::path::Path) -> HashSet<std::ffi::OsString> {
 }
 
 #[test]
+fn streaming_order_exact_pages_hash_tail_and_original_budget() {
+    let (temp, mut store) = ancestry_test_store();
+    let root = temp.path().join("store");
+    store.begin_job(b"synthetic streaming order").unwrap();
+    for n in [0, 64, 65, 513, LIMIT] {
+        let original = order(n);
+        store
+            .commit_ordered(&[], &original, &n.to_le_bytes(), &budget())
+            .unwrap();
+        let reader = store.object_reader().unwrap();
+        let mut observed = Vec::new();
+        let header = reader
+            .visit_order(
+                raw_hash(&original),
+                original.len(),
+                &budget(),
+                &mut |rows| {
+                    assert!(rows.len() <= ROWS * 32);
+                    observed.extend_from_slice(rows);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(header, original[..HEADER]);
+        assert_eq!(observed, original[HEADER..]);
+        assert_eq!(
+            reader
+                .order(raw_hash(&original), original.len(), &budget())
+                .unwrap(),
+            original
+        );
+    }
+    let original = order(LIMIT);
+    let id = raw_hash(&original);
+    let reader = store.object_reader().unwrap();
+    let leaf = Tree::derive(&original, &budget()).unwrap().pages[63].id;
+    let path = object_path(&root, leaf);
+    let held = path.with_extension("held");
+    fs::rename(&path, &held).unwrap();
+    let mut calls = 0;
+    assert!(
+        reader
+            .visit_order(id, original.len(), &budget(), &mut |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert_eq!(calls, 63); // No successful result from a usable-looking prefix.
+    fs::rename(&held, &path).unwrap();
+    let descriptor = descriptor_path(&root, id);
+    let bytes = fs::read(&descriptor).unwrap();
+    let mut wrong = bytes.clone();
+    wrong[16] ^= 1; // Valid tree, wrong canonical header hash.
+    fs::write(&descriptor, wrong).unwrap();
+    assert!(
+        reader
+            .visit_order(id, original.len(), &budget(), &mut |_| Ok(()))
+            .is_err()
+    );
+    fs::write(&descriptor, bytes).unwrap();
+    let expired = JobBudget::testing(Duration::ZERO).unwrap();
+    assert!(
+        reader
+            .visit_order(id, original.len(), &expired, &mut |_| panic!(
+                "expired visitor"
+            ))
+            .is_err()
+    );
+    assert!(
+        reader
+            .visit_order(id, original.len() - 1, &budget(), &mut |_| panic!(
+                "oversize visitor"
+            ))
+            .is_err()
+    );
+}
+
+#[test]
 fn shared_order_codec_boundaries_and_closed_shapes() {
     let (temp, mut store) = ancestry_test_store();
     let root = temp.path().join("store");
