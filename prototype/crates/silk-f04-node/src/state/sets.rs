@@ -102,6 +102,67 @@ impl PagedLedgerSet {
         );
         self.pages.iter().flat_map(|page| page.iter())
     }
+    /// Private staging visitor: observations are provisional until ALL sorted
+    /// pages and the exact directory length pass. Owns one page and one key.
+    pub(super) fn visit_encoded(
+        &self,
+        budget: Option<&JobBudget>,
+        visit: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let check = || budget.map_or(Ok(()), JobBudget::check);
+        check()?;
+        if self.len > self.limit {
+            return Err(Error::Unavailable("retained ledger set horizon"));
+        }
+        let Some(retained) = &self.retained else {
+            for (position, key) in self.iter().enumerate() {
+                if position % PAGE_KEYS == 0 {
+                    check()?;
+                }
+                visit(key)?;
+            }
+            return check();
+        };
+        let mut seen = 0;
+        let mut last: Option<Digest> = None;
+        for (ordinal, page) in retained.pages.iter().enumerate() {
+            check()?;
+            if !(1..=PAGE_KEYS).contains(&page.count) {
+                return Err(Error::Unavailable("retained ledger set page count"));
+            }
+            if let Some(budget) = budget {
+                budget.source()?;
+            }
+            let size = HEADER + page.count * 32;
+            let bytes = retained.reader.object(page.id, size)?;
+            if bytes.len() != size
+                || bytes.get(..8) != Some(retained.magic.as_slice())
+                || bytes[8..40] != retained.domain
+                || u64le(&bytes, 40)? != ordinal as u64
+                || u32le(&bytes, 48)? as usize != page.count
+            {
+                return Err(Error::Unavailable("retained ledger set page binding"));
+            }
+            for row in bytes[HEADER..].chunks_exact(32) {
+                let key: Digest = row
+                    .try_into()
+                    .map_err(|_| Error::Unavailable("retained ledger set key"))?;
+                if last.is_some_and(|last| last >= key) {
+                    return Err(Error::Unavailable("retained ledger set order"));
+                }
+                last = Some(key);
+                seen += 1;
+                if seen > self.len {
+                    return Err(Error::Unavailable("retained ledger set directory length"));
+                }
+                visit(row)?;
+            }
+        }
+        if seen != self.len {
+            return Err(Error::Unavailable("retained ledger set directory length"));
+        }
+        check()
+    }
     pub(super) fn materialize(&self, budget: Option<&JobBudget>) -> Result<Self> {
         let Some(retained) = &self.retained else {
             return Ok(self.clone());

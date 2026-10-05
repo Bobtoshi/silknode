@@ -292,6 +292,51 @@ impl RecoveryHistory {
         }
         Ok(Self::Resident(rows))
     }
+    /// Private hash staging only; no digest/result can escape before the final
+    /// complete page/length check. At most one ciphertext page is owned here.
+    pub(super) fn visit_encoded(
+        &self,
+        budget: Option<&JobBudget>,
+        visit: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let check = || budget.map_or(Ok(()), JobBudget::check);
+        check()?;
+        let Self::Retained(rows) = self else {
+            for (position, row) in self.resident().iter().enumerate() {
+                if position % ROWS == 0 {
+                    check()?;
+                }
+                visit(row.as_slice())?;
+            }
+            return check();
+        };
+        if rows.len > rows.limit || rows.pages.len() != rows.len.div_ceil(ROWS) {
+            return Err(Error::Unavailable("retained recovery directory length"));
+        }
+        for (ordinal, page) in rows.pages.iter().enumerate() {
+            check()?;
+            if page.count != (rows.len - ordinal * ROWS).min(ROWS) {
+                return Err(Error::Unavailable("retained recovery page binding"));
+            }
+            if let Some(budget) = budget {
+                budget.source()?;
+            }
+            let size = HEADER + page.count * RECOVERY_BYTES;
+            let bytes = rows.reader.object(page.id, size)?;
+            if bytes.len() != size
+                || bytes.get(..8) != Some(b"SNF04RP1")
+                || bytes[8..40] != rows.domain
+                || u64le(&bytes, 40)? != ordinal as u64
+                || u32le(&bytes, 48)? as usize != page.count
+            {
+                return Err(Error::Unavailable("retained recovery page binding"));
+            }
+            for row in bytes[HEADER..].chunks_exact(RECOVERY_BYTES) {
+                visit(row)?;
+            }
+        }
+        check()
+    }
     pub(super) fn retain(
         &self,
         store: &mut Store,

@@ -39,3 +39,7 @@ The source-36 native 520/cold result belongs to its preceding frozen ELF, not
 this new binary. No new native, beyond-4,096, P2P, privacy, speed or whole-core
 acceptance is claimed. Full ledger materialization, graph inventories and
 coherent graph/index/ledger/sync/generation resource policy remain integration work.
+
+[Streamed ledger hashing](F04_STREAMING_LEDGER_HASH_V1.md) subsequently removes
+full-collection reads from state hashing only; reducer/rollback materialization
+and integrated capacity remain separate work.

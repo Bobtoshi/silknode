@@ -409,40 +409,36 @@ impl BranchState {
     fn hash_state_checked(&self, budget: Option<&crate::budget::JobBudget>) -> Result<Digest> {
         let check = || budget.map_or(Ok(()), crate::budget::JobBudget::check);
         check()?;
-        let nullifiers = self.nullifiers.materialize(budget)?;
-        let nf = hash_stream_checked(
+        let nf = hash_visit_checked(
             "SilkNode-F0-NF",
             &self.domain,
             self.nullifiers.len(),
-            nullifiers.iter().map(Digest::as_slice),
             budget,
+            |visit| self.nullifiers.visit_encoded(budget, visit),
         )?;
         check()?;
-        let effects = self.effects.materialize(budget)?;
-        let ef = hash_stream_checked(
+        let ef = hash_visit_checked(
             "SilkNode-F0-EF",
             &self.domain,
             self.effects.len(),
-            effects.iter().map(Digest::as_slice),
             budget,
+            |visit| self.effects.visit_encoded(budget, visit),
         )?;
         check()?;
-        let recovery = self.recovery.materialize(budget)?;
-        let rh = hash_stream_checked(
+        let rh = hash_visit_checked(
             "SilkNode-F0-recovery-history",
             &self.domain,
             self.recovery.len(),
-            recovery.iter().map(|x| x.as_slice()),
             budget,
+            |visit| self.recovery.visit_encoded(budget, visit),
         )?;
         check()?;
-        let rewards = self.rewards.materialize(budget)?;
-        let pr = hash_stream_checked(
+        let pr = hash_visit_checked(
             "SilkNode-F0-public-rewards",
             &self.domain,
             self.rewards.len(),
-            rewards.iter().map(<[u8; 112]>::as_slice),
             budget,
+            |visit| self.rewards.visit_encoded(budget, visit),
         )?;
         check()?;
         Ok(domain_hash(
@@ -885,6 +881,7 @@ fn hash_stream<'a>(
 ) -> Digest {
     hash_stream_checked(label, n, count, entries, None).unwrap()
 }
+#[cfg(test)]
 fn hash_stream_checked<'a>(
     label: &'static str,
     n: &Digest,
@@ -905,6 +902,39 @@ fn hash_stream_checked<'a>(
         }
         h.update(entry);
     }
+    Ok(h.finalize().into())
+}
+
+fn hash_visit_checked(
+    label: &'static str,
+    n: &Digest,
+    count: usize,
+    budget: Option<&crate::budget::JobBudget>,
+    source: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
+) -> Result<Digest> {
+    let check = || budget.map_or(Ok(()), crate::budget::JobBudget::check);
+    check()?;
+    let mut h = Sha256::new();
+    h.update([label.len() as u8]);
+    h.update(label.as_bytes());
+    h.update(n);
+    h.update((count as u64).to_le_bytes());
+    let mut seen = 0_usize;
+    source(&mut |row| {
+        if seen % 64 == 0 {
+            check()?;
+        }
+        if seen >= count {
+            return Err(Error::Unavailable("streamed ledger hash count"));
+        }
+        h.update(row);
+        seen += 1;
+        Ok(())
+    })?;
+    if seen != count {
+        return Err(Error::Unavailable("streamed ledger hash count"));
+    }
+    check()?;
     Ok(h.finalize().into())
 }
 
@@ -961,6 +991,106 @@ mod tests {
         state.state_digest = state.hash_state();
         state.check_invariants().unwrap();
         state
+    }
+
+    #[test]
+    fn streaming_state_hash_matches_literal_collections_and_refuses_every_late_page() {
+        // Synthetic economic/storage model only, not admitted payments, work,
+        // encrypted recovery, competing peers or a native checkpoint journey.
+        let (mut state, _, _) = ordered_fixture(136);
+        state.initial_pool = 100;
+        state.pool = 100;
+        append_recovery_rows(&mut state, 1..=70);
+        state.check_invariants().unwrap();
+        let nf = hash_stream(
+            "SilkNode-F0-NF",
+            &state.domain,
+            state.nullifiers.len(),
+            state.nullifiers.iter().map(Digest::as_slice),
+        );
+        let ef = hash_stream(
+            "SilkNode-F0-EF",
+            &state.domain,
+            state.effects.len(),
+            state.effects.iter().map(Digest::as_slice),
+        );
+        let rh = hash_stream(
+            "SilkNode-F0-recovery-history",
+            &state.domain,
+            state.recovery.len(),
+            state.recovery.iter().map(|row| row.as_slice()),
+        );
+        let pr = hash_stream(
+            "SilkNode-F0-public-rewards",
+            &state.domain,
+            state.rewards.len(),
+            state.rewards.iter().map(<[u8; 112]>::as_slice),
+        );
+        let expected = domain_hash(
+            "SilkNode-F0-state",
+            &[
+                &state.domain,
+                &state.root(),
+                &state.leaves().to_le_bytes(),
+                &nf,
+                &ef,
+                &state.pool.to_le_bytes(),
+                &state.burned.to_le_bytes(),
+                &rh,
+                &pr,
+                &state.issued.to_le_bytes(),
+            ],
+        );
+        let (temp, mut store) = crate::store::ancestry_test_store();
+        store
+            .begin_replay(b"synthetic streamed complete ledger hashes")
+            .unwrap();
+        let budget = crate::budget::JobBudget::checkpoint().unwrap();
+        assert_eq!(state.hash_state_checked(Some(&budget)).unwrap(), expected);
+        let stored = state.retain_ledger(&mut store, &budget).unwrap();
+        let before = stored.manifest();
+        assert_eq!(stored.hash_state_checked(Some(&budget)).unwrap(), expected);
+        let pages = [
+            stored.retained_set_pages()[0].clone(),
+            stored.retained_set_pages()[1].clone(),
+            stored.retained_recovery_pages(),
+            stored.retained_history_pages()[1].clone(),
+        ];
+        assert!(pages.iter().all(|pages| pages.len() >= 2));
+        for pages in pages {
+            let path = temp
+                .path()
+                .join("store")
+                .join(format!("{}.obj", hex::encode(pages.last().unwrap())));
+            let held = path.with_extension("held");
+            std::fs::rename(&path, &held).unwrap();
+            assert!(stored.hash_state_checked(Some(&budget)).is_err());
+            std::fs::rename(&held, &path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let mut changed = bytes.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, changed).unwrap();
+            assert!(stored.hash_state_checked(Some(&budget)).is_err());
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::hard_link(&path, &held).unwrap();
+            assert!(stored.hash_state_checked(Some(&budget)).is_err());
+            std::fs::remove_file(&held).unwrap();
+            assert_eq!(stored.hash_state_checked(Some(&budget)).unwrap(), expected);
+            assert_eq!(stored.manifest(), before);
+        }
+        let expired = crate::budget::JobBudget::testing(std::time::Duration::ZERO).unwrap();
+        assert!(stored.hash_state_checked(Some(&expired)).is_err());
+        assert!(
+            hash_visit_checked("fixture", &state.domain, 1, Some(&budget), |_| Ok(())).is_err()
+        );
+        assert!(
+            hash_visit_checked("fixture", &state.domain, 0, Some(&budget), |visit| visit(
+                b"extra"
+            ))
+            .is_err()
+        );
+        assert_eq!(store.head(), None);
+        assert_eq!(stored.manifest(), before);
     }
 
     #[test]

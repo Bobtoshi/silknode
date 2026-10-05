@@ -487,6 +487,58 @@ impl<T: Item> LedgerHistory<T> {
         }
         Ok(Self::Resident(result))
     }
+    /// Private hash staging, owning one checked page plus at most one typed row.
+    /// No caller may use observations as a successful result before completion.
+    pub(super) fn visit_encoded(
+        &self,
+        budget: Option<&JobBudget>,
+        visit: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let check = || budget.map_or(Ok(()), JobBudget::check);
+        check()?;
+        let Self::Retained(rows) = self else {
+            let mut encoded = Vec::with_capacity(T::WIDTH);
+            for (position, row) in self.resident().iter().enumerate() {
+                if position % ITEMS == 0 {
+                    check()?;
+                }
+                encoded.clear();
+                row.encode(&mut encoded);
+                if encoded.len() != T::WIDTH {
+                    return Err(Error::Unavailable("encoded history item width"));
+                }
+                visit(&encoded)?;
+            }
+            return check();
+        };
+        if rows.len > rows.limit || rows.pages.len() != rows.len.div_ceil(ITEMS) {
+            return Err(Error::Unavailable("retained history directory length"));
+        }
+        for (ordinal, page) in rows.pages.iter().enumerate() {
+            check()?;
+            if page.count != (rows.len - ordinal * ITEMS).min(ITEMS) {
+                return Err(Error::Unavailable("retained history page count"));
+            }
+            if let Some(budget) = budget {
+                budget.source()?;
+            }
+            let size = HEADER + page.count * T::WIDTH;
+            let bytes = rows.reader.object(page.id, size)?;
+            if bytes.len() != size
+                || bytes.get(..8) != Some(T::MAGIC.as_slice())
+                || bytes[8..40] != rows.domain
+                || u64le(&bytes, 40)? != ordinal as u64
+                || u32le(&bytes, 48)? as usize != page.count
+            {
+                return Err(Error::Unavailable("retained history page binding"));
+            }
+            for row in bytes[HEADER..].chunks_exact(T::WIDTH) {
+                let _typed = T::decode(row)?;
+                visit(row)?;
+            }
+        }
+        check()
+    }
     pub(super) fn retain(
         &self,
         store: &mut Store,
