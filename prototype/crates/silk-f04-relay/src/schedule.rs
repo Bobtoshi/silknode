@@ -188,6 +188,51 @@ impl Schedule {
     pub const fn round(&self) -> u64 {
         self.round
     }
+    /// Derive another round in this same epoch from the original immutable UTC
+    /// mapping, not from a new observation's possibly shifted wall-clock origin.
+    /// The fresh qualified observation checks health and present eligibility only.
+    /// # Errors
+    /// Refuses a foreign epoch, stale observation, recorded fault or overflow.
+    pub fn anchored_round(
+        &self,
+        config: &SignedConfig,
+        round: u64,
+        observation: &QualifiedClockSample,
+    ) -> Result<Self> {
+        if !config.contains_round(self.round)
+            || !config.contains_round(round)
+            || round.abs_diff(observation.utc_round()) > 2
+            || !self.qualified
+        {
+            return Err(Error::Unavailable("relay anchored epoch/sample"));
+        }
+        self.observe_clock(observation)?;
+        let offset = Duration::from_secs(
+            round
+                .abs_diff(self.round)
+                .checked_mul(30)
+                .ok_or(Error::Unavailable("relay anchored offset"))?,
+        );
+        let origin = if round >= self.round {
+            self.origin.checked_add(offset)
+        } else {
+            self.origin.checked_sub(offset)
+        }
+        .ok_or(Error::Unavailable("relay anchored origin"))?;
+        Ok(Self {
+            origin,
+            round,
+            sample: QualifiedClockSample {
+                utc: self.sample.utc,
+                monotonic: self.sample.monotonic,
+                error: self.sample.error,
+            },
+            last_observed: Cell::new((observation.monotonic, observation.utc)),
+            clock_failed: Cell::new(false),
+            budget_claimed: Cell::new(false),
+            qualified: true,
+        })
+    }
     /// Immutable monotonic instant for a fixed offset, including pre-round slots.
     /// # Errors
     /// Refuses offsets outside this round's fixed -10..+30 second interval.
@@ -287,6 +332,53 @@ fn fixture_sample() -> Result<QualifiedClockSample> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchored_epoch_round_keeps_original_mapping_and_rejects_rebase() {
+        let config = crate::tests::relay_test_config();
+        let captured = Instant::now();
+        let old = captured.checked_sub(Duration::from_secs(30)).unwrap();
+        let anchor = Schedule::new(
+            &config,
+            6000,
+            QualifiedClockSample::from_qualified_source(
+                UNIX_EPOCH + Duration::from_secs(180_000),
+                old,
+                Duration::from_millis(500),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let observed = QualifiedClockSample::from_qualified_source(
+            UNIX_EPOCH + Duration::from_millis(180_030_400),
+            captured,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let next = anchor.anchored_round(&config, 6001, &observed).unwrap();
+        assert_eq!(
+            next.at(0).unwrap(),
+            anchor.at(0).unwrap() + Duration::from_secs(30)
+        );
+        assert_eq!(
+            next.at(-8_125_000_000).unwrap(),
+            next.at(0).unwrap() - Duration::from_millis(8125)
+        );
+        assert!(anchor.anchored_round(&config, 6004, &observed).is_err());
+        assert!(
+            anchor
+                .anchored_round(&crate::tests::epoch_config(3), 8640, &observed)
+                .is_err()
+        );
+        let rollback = QualifiedClockSample::from_qualified_source(
+            UNIX_EPOCH + Duration::from_secs(180_029),
+            captured,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(anchor.anchored_round(&config, 6001, &rollback).is_err());
+        assert!(anchor.anchored_round(&config, 6001, &observed).is_err());
+    }
 
     #[test]
     #[cfg(feature = "functional-lab")]

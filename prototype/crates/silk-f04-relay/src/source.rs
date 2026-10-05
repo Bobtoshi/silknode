@@ -6,7 +6,7 @@ use crate::{
         Kind, PreparedAuthorization, Role, SignedControl, check_ready_pair, prepare_authorization,
     },
     flow::{ReadSlot, WriteSlot},
-    input::InputBatch,
+    input::{InputBatch, SealedInput, StrictCompletion, StrictInputBatch},
     journal::Decision,
     owner::{DurableJournal, Identity, ManifestRound, PinRetention, prefix},
     schedule::QualifiedClockSample,
@@ -52,12 +52,48 @@ pub struct SourceRound {
     reader: ReadSlot,
     health_failed: bool,
     transport_id: u64,
+    // Retained for the entire strict round; never constructed from a legacy count.
+    _strict_completion: Option<StrictCompletion>,
 }
 impl SourceRound {
     /// Bind actual sealed input to a locally cut-checked/durable manifest.
     /// # Errors
     /// Refuses changed cfg/round/batch, recorded clock failure or missed assembly.
     pub fn new(round: Rc<ManifestRound>, batch: InputBatch, transport: &Transport) -> Result<Self> {
+        Self::new_bound(round, batch, None, transport)
+    }
+    /// Bind a strict collector's private pre-erasure provenance to this round.
+    /// No legacy batch, public count or caller assertion can construct it.
+    /// # Errors
+    /// Refuses foreign provenance and all ordinary source admission faults.
+    pub fn new_strict(
+        round: Rc<ManifestRound>,
+        batch: StrictInputBatch,
+        transport: &Transport,
+    ) -> Result<Self> {
+        let (batch, completion) = batch.into_bound(
+            round.config.id(),
+            round.manifest().id(),
+            round.schedule.round(),
+        )?;
+        Self::new_bound(round, batch, Some(completion), transport)
+    }
+    pub(crate) fn from_collector(
+        round: Rc<ManifestRound>,
+        batch: SealedInput,
+        transport: &Transport,
+    ) -> Result<Self> {
+        match batch {
+            SealedInput::Legacy(batch) => Self::new(round, batch, transport),
+            SealedInput::Strict(batch) => Self::new_strict(round, batch, transport),
+        }
+    }
+    fn new_bound(
+        round: Rc<ManifestRound>,
+        batch: InputBatch,
+        completion: Option<StrictCompletion>,
+        transport: &Transport,
+    ) -> Result<Self> {
         let schedule = &round.schedule;
         let config = &round.config;
         schedule.in_window(9_500_000_000, 10_000_000_000)?;
@@ -84,6 +120,7 @@ impl SourceRound {
             reader: ReadSlot::default(),
             health_failed: false,
             transport_id: transport.id(),
+            _strict_completion: completion,
         })
     }
     /// Record qualified clock health only while A's authorization barrier is open.

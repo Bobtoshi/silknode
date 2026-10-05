@@ -8,7 +8,7 @@ use crate::{
     failure::{CommittedWrite, FailedControls},
     flow::{ReadSlot, WriteSlot},
     frame::HpkePrivate,
-    input::{FailedSessions, InputCollector, ManifestDelivery, Sessions},
+    input::{FailedSessions, InputCollector, InputPolicy, ManifestDelivery, Sessions},
     journal::Decision,
     lifecycle::{PreparedConnections, SetupWindow},
     negotiation::{AProposal, SelectedCut},
@@ -77,6 +77,7 @@ pub struct SourceOwner<P: PinRetention> {
     epochs: Epochs<Epoch>,
     journal: DurableJournal<P>,
     closed: Option<(u64, bool, bool)>,
+    input_policy: InputPolicy,
     // All remaining epoch resources drop before the actors' native guards.
     rounds: TwoRounds<Round>,
 }
@@ -100,9 +101,51 @@ impl<P: PinRetention> SourceOwner<P> {
         config: Rc<SignedConfig>,
         identity: Identity,
         key: Rc<HpkePrivate>,
+        sessions: Sessions,
+        b: Transport,
+        journal: DurableJournal<P>,
+    ) -> Result<Self> {
+        Self::with_policy(
+            config,
+            identity,
+            key,
+            sessions,
+            b,
+            journal,
+            InputPolicy::Legacy,
+        )
+    }
+    /// Select strict collection for this owner's entire lifetime, before any
+    /// round, manifest delivery or input admission. No mid-round upgrade exists.
+    /// This is honest-A provenance, not a defence against a malicious A relay.
+    /// # Errors
+    /// Refuses the same role/configuration/resource failures as `new`.
+    pub fn new_strict(
+        config: Rc<SignedConfig>,
+        identity: Identity,
+        key: Rc<HpkePrivate>,
+        sessions: Sessions,
+        b: Transport,
+        journal: DurableJournal<P>,
+    ) -> Result<Self> {
+        Self::with_policy(
+            config,
+            identity,
+            key,
+            sessions,
+            b,
+            journal,
+            InputPolicy::Strict32,
+        )
+    }
+    fn with_policy(
+        config: Rc<SignedConfig>,
+        identity: Identity,
+        key: Rc<HpkePrivate>,
         mut sessions: Sessions,
         mut b: Transport,
         journal: DurableJournal<P>,
+        input_policy: InputPolicy,
     ) -> Result<Self> {
         identity.check(&config, crate::control::Role::A)?;
         journal.check_role(crate::control::Role::A)?;
@@ -122,6 +165,7 @@ impl<P: PinRetention> SourceOwner<P> {
             }),
             journal,
             closed: None,
+            input_policy,
         })
     }
     /// Admit the original current/successor schedule before any active work.
@@ -354,6 +398,7 @@ impl<P: PinRetention> SourceOwner<P> {
                 &mut b,
                 &mut self.journal,
                 utc,
+                self.input_policy,
             )?;
             slot.state.phase = Some(phase);
             wake = wake.min(at).min(slot.schedule.at(22_000_000_000)?);
@@ -374,6 +419,7 @@ impl<P: PinRetention> SourceOwner<P> {
         b: &mut Transport,
         journal: &mut DurableJournal<P>,
         utc: u64,
+        input_policy: InputPolicy,
     ) -> Result<(Phase, Instant)> {
         let soon = Instant::now() + Duration::from_micros(500);
         match phase {
@@ -516,7 +562,7 @@ impl<P: PinRetention> SourceOwner<P> {
                     journal,
                 ),
                 Ok(true) => {
-                    let mut input = delivery.into_input(Rc::clone(key));
+                    let mut input = delivery.into_input(Rc::clone(key), input_policy);
                     if input.arm().is_err() {
                         return Self::early_failure(
                             input.into_failed(),
@@ -537,7 +583,7 @@ impl<P: PinRetention> SourceOwner<P> {
                     return Ok((Phase::Input(input), schedule.at(0)?));
                 }
                 if Instant::now() >= schedule.at(9_500_000_000)? {
-                    match input.seal_batch() {
+                    match input.seal_owned() {
                         Err(_) => Self::early_failure(
                             input.into_failed(),
                             WriteSlot::default(),
@@ -550,7 +596,7 @@ impl<P: PinRetention> SourceOwner<P> {
                         ),
                         Ok(batch) => {
                             let (set, batch, bound) = input.into_source(batch);
-                            match SourceRound::new(bound, batch, b) {
+                            match SourceRound::from_collector(bound, batch, b) {
                                 Ok(source) => {
                                     *sessions = Some(set);
                                     Ok((Phase::Source(Box::new(source)), soon))

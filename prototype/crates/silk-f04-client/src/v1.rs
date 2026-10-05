@@ -22,9 +22,11 @@ pub use enrollment::{EnrollmentProgressV1, EnrollmentV1};
 mod lifecycle;
 pub use lifecycle::ProcessV1;
 pub mod preparation;
+pub mod session;
 
 /// Immutable local authority retained through one attempt. No peer cut or
 /// caller-supplied validity boolean can construct a locally accepted manifest.
+#[derive(Clone)]
 pub enum LocalViewV1 {
     /// Complete READY node; an Rc prevents in-process mutation during the round.
     Ready(Rc<Node>),

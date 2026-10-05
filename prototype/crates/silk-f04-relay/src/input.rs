@@ -11,7 +11,27 @@ use crate::{
 };
 use std::{collections::BTreeSet, rc::Rc, time::Instant};
 mod failed;
+mod strict;
+#[cfg(test)]
+mod tests;
 pub(crate) use failed::FailedSessions;
+use strict::CompletedSlots;
+pub(crate) use strict::StrictCompletion;
+pub use strict::StrictInputBatch;
+
+/// Local collection policy, chosen before any cell is collected. Neither policy
+/// proves independent users or protects B against a malicious source relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputPolicy {
+    /// Original minimum-eight collection, with fresh cover for missing slots.
+    Legacy,
+    /// Exactly 32 actual, distinct, valid roster-slot completions; no filler.
+    Strict32,
+}
+pub(crate) enum SealedInput {
+    Legacy(InputBatch),
+    Strict(StrictInputBatch),
+}
 
 /// In-progress setup admission. Driver must cap simultaneous sockets and attempts.
 pub struct Enrolling {
@@ -259,8 +279,8 @@ impl ManifestDelivery {
         }
         Ok(self.sessions)
     }
-    pub(crate) fn into_input(self, key: Rc<HpkePrivate>) -> InputCollector {
-        let mut input = InputCollector::unarmed(self.sessions, self.round, key);
+    pub(crate) fn into_input(self, key: Rc<HpkePrivate>, policy: InputPolicy) -> InputCollector {
+        let mut input = InputCollector::unarmed(self.sessions, self.round, key, policy);
         input.failed = self.failed || !self.claimed || !self.complete;
         input
     }
@@ -324,12 +344,14 @@ pub struct InputCollector {
     output: Vec<Frame>,
     failed: bool,
     armed: bool,
+    policy: InputPolicy,
+    completed_slots: CompletedSlots,
 }
 impl InputCollector {
     pub(crate) fn into_source(
         self,
-        batch: InputBatch,
-    ) -> (Sessions, InputBatch, Rc<ManifestRound>) {
+        batch: SealedInput,
+    ) -> (Sessions, SealedInput, Rc<ManifestRound>) {
         (self.sessions, batch, self.round)
     }
     pub(crate) fn into_failed(self) -> FailedSessions {
@@ -345,11 +367,29 @@ impl InputCollector {
     /// # Errors
     /// Refuses failed/foreign epoch, wrong round, late arming or partial old reads.
     pub fn new(sessions: Sessions, round: Rc<ManifestRound>, key: Rc<HpkePrivate>) -> Result<Self> {
-        let mut input = Self::unarmed(sessions, round, key);
+        let mut input = Self::unarmed(sessions, round, key, InputPolicy::Legacy);
         input.arm()?;
         Ok(input)
     }
-    fn unarmed(sessions: Sessions, round: Rc<ManifestRound>, key: Rc<HpkePrivate>) -> Self {
+    /// Select strict collection before arming actual transport reads. Missing,
+    /// partial, invalid or duplicate cells cannot be replaced by cover.
+    /// # Errors
+    /// Refuses the same configuration, delivery and timing faults as `new`.
+    pub fn new_strict(
+        sessions: Sessions,
+        round: Rc<ManifestRound>,
+        key: Rc<HpkePrivate>,
+    ) -> Result<Self> {
+        let mut input = Self::unarmed(sessions, round, key, InputPolicy::Strict32);
+        input.arm()?;
+        Ok(input)
+    }
+    fn unarmed(
+        sessions: Sessions,
+        round: Rc<ManifestRound>,
+        key: Rc<HpkePrivate>,
+        policy: InputPolicy,
+    ) -> Self {
         Self {
             sessions,
             round,
@@ -362,6 +402,8 @@ impl InputCollector {
             output: Vec::with_capacity(32),
             failed: false,
             armed: false,
+            policy,
+            completed_slots: CompletedSlots::default(),
         }
     }
     pub(crate) fn arm(&mut self) -> Result<()> {
@@ -486,6 +528,11 @@ impl InputCollector {
                     return Err(Error::Invalid("A duplicate inner encapsulation"));
                 }
                 self.round.schedule.completed_before(9_500_000_000)?;
+                // Mint completion provenance only after the full actual TLS,
+                // framing, context, HPKE, uniqueness and deadline checks.
+                if self.policy == InputPolicy::Strict32 {
+                    self.completed_slots.record(session.slot)?;
+                }
                 self.output.push(inner);
                 self.completed[i] = true;
                 self.known_pending[i] = false;
@@ -500,10 +547,28 @@ impl InputCollector {
     /// # Errors
     /// Refuses partial/failed/unfinished/known queued reads or fewer than8 completions.
     pub fn seal(mut self) -> Result<(Sessions, InputBatch)> {
-        let batch = self.seal_batch()?;
+        if self.policy != InputPolicy::Legacy {
+            return Err(Error::Unavailable("A strict input cannot downgrade"));
+        }
+        let SealedInput::Legacy(batch) = self.seal_owned()? else {
+            unreachable!()
+        };
         Ok((self.sessions, batch))
     }
-    pub(crate) fn seal_batch(&mut self) -> Result<InputBatch> {
+    /// Freeze all 32 actual completions and consume their private provenance.
+    /// This cannot upgrade a legacy collector, including one with 32 frames.
+    /// # Errors
+    /// Refuses legacy selection, incomplete provenance or the ordinary barriers.
+    pub fn seal_strict(mut self) -> Result<(Sessions, StrictInputBatch)> {
+        if self.policy != InputPolicy::Strict32 {
+            return Err(Error::Unavailable("A legacy input cannot upgrade"));
+        }
+        let SealedInput::Strict(batch) = self.seal_owned()? else {
+            unreachable!()
+        };
+        Ok((self.sessions, batch))
+    }
+    pub(crate) fn seal_owned(&mut self) -> Result<SealedInput> {
         self.round
             .schedule
             .in_window(9_500_000_000, 10_000_000_000)?;
@@ -511,6 +576,19 @@ impl InputCollector {
             return Err(Error::Unavailable("A input barrier failed"));
         }
         self.failed = true; // No second seal after any fallible work starts.
+        // This transition occurs before source labels are erased or filler is
+        // generated. Counts on an already assembled InputBatch are insufficient.
+        let completion = if self.policy == InputPolicy::Strict32 {
+            Some(self.completed_slots.finish(
+                self.sessions.entries.len(),
+                self.output.len(),
+                self.sessions.config,
+                self.round.manifest().id(),
+                self.round.schedule.round(),
+            )?)
+        } else {
+            None
+        };
         for (i, session) in self.sessions.entries.iter_mut().enumerate() {
             if self.completed[i] || session.transport.receive_progress() == ReceiveProgress::Failed
             {
@@ -525,7 +603,7 @@ impl InputCollector {
         }
         let admitted =
             u8::try_from(self.output.len()).map_err(|_| Error::Unavailable("A count"))?;
-        while self.output.len() < 32 {
+        while self.policy == InputPolicy::Legacy && self.output.len() < 32 {
             let cover = client_cell(&self.round.context(), &Payload::cover())?;
             self.output
                 .push(open_a(&self.round.context(), &self.key, &cover)?);
@@ -538,10 +616,16 @@ impl InputCollector {
         permute_stage2(&self.round.context(), &mut frames)?;
         let id = a_batch_id(&self.round.context(), &frames)?;
         self.round.schedule.completed_before(10_000_000_000)?;
-        Ok(InputBatch {
+        let batch = InputBatch {
             frames,
             admitted,
             id,
+        };
+        Ok(match completion {
+            Some(completion) => {
+                SealedInput::Strict(StrictInputBatch::from_collection(batch, completion))
+            }
+            None => SealedInput::Legacy(batch),
         })
     }
 }

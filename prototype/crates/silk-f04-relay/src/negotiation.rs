@@ -250,6 +250,12 @@ pub struct Manifested {
     manifest: SignedManifest,
 }
 impl Manifested {
+    // Synthetic signed context for local TLS/collection tests only. This bypasses
+    // native cut/durability admission and exists in no production build.
+    #[cfg(test)]
+    pub(crate) fn input_fixture(manifest: SignedManifest) -> Self {
+        Self { manifest }
+    }
     /// B validates A's nested/outer signatures, persists the same M, then signs.
     /// # Errors
     /// Refuses wrong cut/key/phase, conflict, journal or signature failure.
