@@ -2,7 +2,7 @@
 //! default endpoint or promise of eventual canonical inclusion.
 use crate::{
     Digest, Error, Result,
-    carriage::{Body, Candidate},
+    carriage::{Body, Candidate, MiningTemplate},
     node::{Ingress, Node, NodeStatus},
 };
 use silk_sapling_f04::{
@@ -63,6 +63,36 @@ impl LocalOfferV1 {
         Self::from_local_payloads(expected_domain, body.representations().to_vec())
     }
 
+    /// Consume into one ordinary-current-time template without searching nonces.
+    /// Run in the separately contained node owner, after leaving the relay lease.
+    /// Successful preparation closes the node's durable job before returning an
+    /// owned template. The external miner needs its own explicit resource limits;
+    /// neither the offer nor template proves relay provenance or payment validity.
+    /// Cover-only offers create no job. There is no automatic retry or ingestion.
+    ///
+    /// ```compile_fail
+    /// use silk_f04_node::{node::Node, offer::v1::LocalOfferV1};
+    /// fn twice(offer: LocalOfferV1, node: &mut Node) {
+    ///     let _ = offer.prepare_current(node, [0; 32], [0; 32]);
+    ///     let _ = offer.prepare_current(node, [0; 32], [0; 32]);
+    /// }
+    /// ```
+    /// # Errors
+    /// Foreign/unready nodes or ordinary clock, capacity, parent, storage and
+    /// budget failures consume the offer. Existing failed-job STOP rules apply.
+    pub fn prepare_current(
+        self,
+        node: &mut Node,
+        reward_owner: Digest,
+        reward_nonce: Digest,
+    ) -> Result<PreparedV1> {
+        let Some(body) = self.into_body(node.genesis().domain(), node.status()?)? else {
+            return Ok(PreparedV1::NoPayment);
+        };
+        let template = node.prepare_mining_current(body, reward_owner, reward_nonce, None)?;
+        Ok(PreparedV1::Template(template))
+    }
+
     /// Consume this offer for at most ONE ordinary-current-time mining attempt.
     /// Execute in the separately contained node runtime, never the relay process
     /// or its original two-second/128-MiB lease. No proof generation is performed.
@@ -114,6 +144,14 @@ impl LocalOfferV1 {
         }
         Body::decode(&bytes, &self.domain)
     }
+}
+
+/// Preparation is not work, graph admission, proof verification or settlement.
+pub enum PreparedV1 {
+    /// Cover-only: no template and no node job was created.
+    NoPayment,
+    /// Immutable ordinary work input. Receivers still rederive all validity.
+    Template(MiningTemplate),
 }
 
 /// Cover-only does not manufacture work or a checkpoint.
@@ -169,3 +207,6 @@ pub struct AdmissionReceiptV1 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_tests;

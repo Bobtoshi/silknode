@@ -129,3 +129,50 @@ corrections changed between builds. These receipts and the historical fixture
 are separate evidence, not automatically available from a source-only clone.
 This is bounded local lab evidence, not independent reproduction or whole-core,
 larger-history, payment/wallet, two-host network or release acceptance.
+## Producer handoff to a separate miner
+
+`ProducerInboxV1::take_next` (relay crate) consumes the volatile released offer.
+After leaving the relay lease, `LocalOfferV1::prepare_current` consumes that
+offer in the separate node owner. For a real offer it returns
+`PreparedV1::Template(MiningTemplate)` using the node's selected parents,
+fresh ordinary timestamp, reward binding and unchanged foreground budget.
+No nonce is evaluated in this call; the durable preparation job is closed
+before the immutable template leaves the owner. `PreparedV1::NoPayment`
+creates neither template nor job. Errors consume the offer, never requeue it.
+The original synchronous mining API and all release defaults are unchanged.
+
+The existing `encode_local` / `decode_local` pair can move exact body bytes
+between explicitly trusted local processes. It does not authenticate that a
+relay executed, create a public payment endpoint, or recover a dropped offer.
+Any subsequent external nonce evaluation requires separate enforced CPU,
+wall, memory and storage limits. A resulting ordinary `Candidate` still goes
+through `Node::ingest`; a template gives no proof, spentness, admission,
+canonical-effect or wallet-settlement authority. An owned template may outlive
+its preparing node; stale parents and claims remain the receiver's decision.
+
+The 5 October 2026 Linux qualification used a NEW authenticated copy of the existing
+15-vertex public-payment fixture, with independently retained head
+`459e35c58616f47eda88cc44443ad380b70be7515d3bf5fe6dbb9336256111a6`.
+It prepared 1-, 3- and 32-envelope templates, checking exact body order,
+reward fields, unchanged head/state/carriers, absence of active jobs, cover
+and foreign no-job refusals, and successful same-process cold reopen.
+Repeated saved envelopes test maximum framing, **not** independent valid
+payments or spendability. No new work, proofs or wallet keys were generated.
+The consumed-offer compile-fail check and four existing focused framing checks
+also passed. This is not a fresh relay journey, settlement, independent
+operator test, crash test, native history beyond4096, or anonymity acceptance.
+
+Native runtime: one CPU, 39 CPU seconds /120 wall seconds, 3 GiB RAM,
+no swap, four tasks, no public listeners, only a fresh directory on the
+existing capped1-GiB task filesystem writable. It used 10.459 CPU seconds,
+10.672 wall seconds and325 MiB peak memory. Build/doc/framing/native work
+used83.455 CPU seconds total, including the retained20-ms sandbox launch
+refusal. That original pre-exec namespace error changed no store; only the
+mount configuration was corrected, without repeating the passed checks.
+Receipt: `/var/tmp/silknode-replay-pages-evidence-v1/offer-prepare-v1/result.json`,
+SHA-256 `ddcad44d7b7700bcb93509180afa1c6d8b309cf7f08fa6df830bcafd1a3f7f11`.
+The ignored gate is
+`offer::v1::native_tests::saved_public_payment_offer_prepares_without_work_or_admission`;
+its explicit fixture environment is documented in the test source. Use only
+a new authenticated public-input copy with its own retained pin and resource
+containment; never reopen or repair a failed owner to rerun a qualification.
