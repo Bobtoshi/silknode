@@ -2,6 +2,7 @@
 use rand_core::{OsRng, RngCore};
 use silk_f04_node::{
     Digest, Error, Result,
+    capacity::HistoryLimitsV1,
     carriage::{Body, MAX_VERTEX_BYTES},
     genesis::Genesis,
     history::PublicHistoryV1,
@@ -24,9 +25,12 @@ Commands: init | reopen | ingest --vertex PATH | reconcile --max-steps 1..512
           history-resume --history-root PATH --expected-history-manifest HEX32
           history-ingest --history-root PATH --expected-history-manifest HEX32
             --range PATH --start N --count 1..32 --max-steps 1..512
+          pipe-serve | pipe-sync --max-steps 1..512
 All commands require:
   --private-valueless --accept-genesis-trust --domain HEX32 --genesis PATH
   --store PATH --host-margin PATH
+Optional local resource choice for every command:
+  --history-limit N (multiple of 8, 8..8192; omitted means unchanged 4096)
 Except init, additionally require:
   --operator-retained-local --expected-local-head HEX32
   --spend-params PATH --output-params PATH
@@ -47,7 +51,17 @@ explicit recovery authority; this interface never adopts an unknown head.
 Export is one full topologically indexed carrier, NOT canonical wallet order.
 No raw-envelope mining/submission, network endpoint, key or wallet interface.
 Flags acknowledge scope/trust; they do not establish OS qualification, independent
-custody, privacy or acceptance. Use only the separately qualified isolated runtime.";
+custody, privacy or acceptance. The history limit is operator-selected, never
+inferred from a peer, manifest or retained HEAD, and must be supplied again to
+each process. It raises no generation, storage, worker or native time allowance.
+Native history above 4096 remains unproven. Use only the separately qualified
+isolated runtime. Pipe commands use framed binary stdin/stdout and report ONLY
+to stderr; operator supplies independently authenticated duplex transport and a
+hard aggregate process timer. No listener or source checkpoint authority.
+Each pipe-sync starts at source zero and locally checks every duplicate. A loss
+retains completed admissions; no automatic retry, failed-owner recovery or pin
+adoption. Pipe success means source bytes processed, NOT state convergence.
+Pipe commands do not flush the clock; retain the reported own HEAD externally.";
 
 struct Options {
     command: String,
@@ -57,7 +71,8 @@ impl Options {
     fn parse(args: &[String]) -> Result<Self> {
         let command = args.first().ok_or(Error::Invalid("missing CLI command"))?;
         let extra: &[&str] = match command.as_str() {
-            "init" | "reopen" => &[],
+            "init" | "reopen" | "pipe-serve" => &[],
+            "pipe-sync" => &["--max-steps"],
             "ingest" => &["--vertex"],
             "reconcile" => &["--max-steps"],
             "export" => &["--index", "--out"],
@@ -81,8 +96,14 @@ impl Options {
                 key.as_str(),
                 "--private-valueless" | "--accept-genesis-trust"
             ) || (command != "init" && key == "--operator-retained-local");
-            let value_option = ["--domain", "--genesis", "--store", "--host-margin"]
-                .contains(&key.as_str())
+            let value_option = [
+                "--domain",
+                "--genesis",
+                "--store",
+                "--host-margin",
+                "--history-limit",
+            ]
+            .contains(&key.as_str())
                 || (command != "init"
                     && ["--expected-local-head", "--spend-params", "--output-params"]
                         .contains(&key.as_str()))
@@ -119,6 +140,7 @@ impl Options {
             options.get(required)?;
         }
         options.digest("--domain")?;
+        let last_position = options.history_limits()?.vertices() - 1;
         if command != "init" {
             for required in [
                 "--operator-retained-local",
@@ -137,16 +159,19 @@ impl Options {
             options.digest("--reward-owner")?;
         }
         if command == "export" {
-            options.number("--index", 0, 4095)?;
+            options.number("--index", 0, last_position)?;
         }
         if matches!(command.as_str(), "history-resume" | "history-ingest") {
             options.digest("--expected-history-manifest")?;
         }
         if command == "history-ingest" {
-            options.number("--start", 0, 4095)?;
+            options.number("--start", 0, last_position)?;
             options.number("--count", 1, RANGE_LIMIT_V1)?;
         }
-        if matches!(command.as_str(), "reconcile" | "history-ingest") {
+        if matches!(
+            command.as_str(),
+            "reconcile" | "history-ingest" | "pipe-sync"
+        ) {
             options.number("--max-steps", 1, 512)?;
         }
         Ok(options)
@@ -180,6 +205,13 @@ impl Options {
             return Err(Error::Invalid("CLI integer range/encoding"));
         }
         Ok(n)
+    }
+    fn history_limits(&self) -> Result<HistoryLimitsV1> {
+        if self.fields.contains_key("--history-limit") {
+            HistoryLimitsV1::for_vertices(self.number("--history-limit", 8, 8192)?)
+        } else {
+            Ok(HistoryLimitsV1::REFERENCE)
+        }
     }
 }
 
@@ -238,34 +270,42 @@ fn check_output_path(root: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 fn report(node: &Node) -> Result<()> {
+    report_to(node, &mut std::io::stdout().lock())
+}
+fn report_to(node: &Node, output: &mut impl Write) -> Result<()> {
     let status = match node.status()? {
         NodeStatus::Ready => "Ready",
         NodeStatus::NeedsReconcile => "NeedsReconcile",
         NodeStatus::ArchiveReplay => "ArchiveReplay",
     };
-    println!(
-        "pid={};status={status};domain={};local_head={};vertices={};recovered_previous={};accounted_bytes={}",
+    writeln!(
+        output,
+        "pid={};status={status};domain={};local_head={};vertices={};recovered_previous={};accounted_bytes={};history_limit={}",
         std::process::id(),
         hex::encode(node.genesis().domain()),
         hex::encode(node.local_head()?),
         node.vertex_count(),
         node.recovered_previous(),
-        node.accounted_bytes()
-    );
+        node.accounted_bytes(),
+        node.history_limits().vertices()
+    )?;
     if let Ok(state) = node.state() {
         let (pool, burned) = state.private_counters();
-        println!(
+        writeln!(
+            output,
             "checkpoint_index={};checkpoint={};state_digest={};leaves={};pool={pool};burned={burned};eligible_cut={}",
             state.checkpoint_index(),
             hex::encode(state.checkpoint_id()),
             hex::encode(state.digest()),
             state.leaves(),
             state.eligible_cut().index
-        );
+        )?;
     }
     Ok(())
 }
 fn run(options: Options) -> Result<()> {
+    let limits = options.history_limits()?;
+    let last_position = limits.vertices() - 1;
     let genesis = Genesis::admit_local_bundle(
         &bounded_file(Path::new(options.get("--genesis")?), 8 * 1024 * 1024)?,
         &options.digest("--domain")?,
@@ -277,7 +317,7 @@ fn run(options: Options) -> Result<()> {
         check_output_path(root, Path::new(options.get("--out")?))?;
     }
     if options.command == "init" {
-        let mut node = Node::create(root, margin, genesis)?;
+        let mut node = Node::create_with_limits(root, margin, genesis, limits)?;
         node.flush_clock()?;
         return report(&node);
     }
@@ -295,10 +335,11 @@ fn run(options: Options) -> Result<()> {
         options.command.as_str(),
         "history-resume" | "history-ingest"
     ) {
-        Some(PublicHistoryV1::open(
+        Some(PublicHistoryV1::open_with_limits(
             Path::new(options.get("--history-root")?),
             options.digest("--expected-history-manifest")?,
             Arc::new(genesis.clone()),
+            limits,
         )?)
     } else {
         None
@@ -318,7 +359,7 @@ fn run(options: Options) -> Result<()> {
         .map(|bytes| {
             history.as_ref().expect("history input").decode_range(
                 bytes,
-                options.number("--start", 0, 4095)?,
+                options.number("--start", 0, last_position)?,
                 options.number("--count", 1, RANGE_LIMIT_V1)?,
             )
         })
@@ -327,13 +368,40 @@ fn run(options: Options) -> Result<()> {
         Path::new(options.get("--spend-params")?),
         Path::new(options.get("--output-params")?),
     )?;
-    let mut node = Node::open_retained_pinned(
+    let mut node = Node::open_retained_pinned_with_limits(
         root,
         margin,
         genesis,
         &parameters,
         options.digest("--expected-local-head")?,
+        limits,
     )?;
+    if matches!(options.command.as_str(), "pipe-serve" | "pipe-sync") {
+        let mut input = std::io::stdin().lock();
+        let mut output = std::io::stdout().lock();
+        let outcome = if options.command == "pipe-serve" {
+            silk_f04_node::sync::serve_pipe_v1(&node, &mut input, &mut output)
+        } else {
+            silk_f04_node::sync::receive_pipe_v1(
+                &mut node,
+                &parameters,
+                &mut input,
+                &mut output,
+                options.number("--max-steps", 1, 512)?,
+            )
+            .map(|receipt| {
+                eprintln!(
+                    "source_positions={};admitted={};already_known={};convergence_claim=false",
+                    receipt.source_positions, receipt.admitted, receipt.already_known
+                )
+            })
+        };
+        // Never interleave reports with the binary protocol or flush on a loss.
+        // Report only this still-healthy own lineage; a fault grants no pin.
+        let reported = report_to(&node, &mut std::io::stderr().lock());
+        outcome?;
+        return reported;
+    }
     if options.command == "history-resume" {
         let history = history.as_ref().expect("history input");
         println!(
@@ -354,7 +422,7 @@ fn run(options: Options) -> Result<()> {
             }
             "history-ingest" => {
                 let history = history.as_ref().expect("history input");
-                if history.admitted_prefix(&node)? != options.number("--start", 0, 4095)? {
+                if history.admitted_prefix(&node)? != options.number("--start", 0, last_position)? {
                     return Err(Error::Invalid(
                         "history request is not receiver-derived prefix",
                     ));
@@ -386,7 +454,7 @@ fn run(options: Options) -> Result<()> {
                 }
             }
             "export" => {
-                let records = node.export_range(options.number("--index", 0, 4095)?, 1)?;
+                let records = node.export_range(options.number("--index", 0, last_position)?, 1)?;
                 let bytes = records
                     .first()
                     .ok_or(Error::Unavailable("no vertex at export index"))?;
@@ -546,6 +614,54 @@ mod tests {
         let mut args = history_options("history-ingest");
         args.extend(["--peer-cursor".into(), "4".into()]);
         assert!(Options::parse(&args).is_err());
+    }
+    #[test]
+    fn explicit_profile_controls_every_position_bound_without_peer_inference() {
+        assert_eq!(
+            Options::parse(&init()).unwrap().history_limits().unwrap(),
+            HistoryLimitsV1::REFERENCE
+        );
+        for value in [
+            "0",
+            "7",
+            "4097",
+            "8193",
+            "08192",
+            "+8192",
+            "18446744073709551616",
+        ] {
+            let mut args = init();
+            args.extend(["--history-limit".into(), value.into()]);
+            assert!(Options::parse(&args).is_err(), "{value}");
+        }
+        let mut args = history_options("history-ingest");
+        let position = args.iter().position(|a| a == "--start").unwrap();
+        args[position + 1] = "4096".into();
+        assert!(Options::parse(&args).is_err());
+        args.extend(["--history-limit".into(), "8192".into()]);
+        assert_eq!(
+            Options::parse(&args)
+                .unwrap()
+                .history_limits()
+                .unwrap()
+                .vertices(),
+            8192
+        );
+        args[position + 1] = "8192".into();
+        assert!(Options::parse(&args).is_err());
+        for command in ["pipe-serve", "pipe-sync"] {
+            let mut args = history_options("history-resume");
+            args[0] = command.into();
+            let at = args.iter().position(|a| a == "--history-root").unwrap();
+            args.truncate(at);
+            args.extend(["--history-limit".into(), "8192".into()]);
+            if command == "pipe-sync" {
+                args.extend(["--max-steps".into(), "512".into()]);
+            }
+            assert!(Options::parse(&args).is_ok());
+            args.extend(["--peer-cursor".into(), "16".into()]);
+            assert!(Options::parse(&args).is_err());
+        }
     }
     #[test]
     fn history_partial_response_refuses_before_receiver_or_parameter_open() {

@@ -1,6 +1,8 @@
 //! Versioned, bounded public range framing. Decoding grants NO node validity.
 //! Third-party transports must submit every returned carrier to `Node::ingest`.
 use crate::{Error, Result, carriage::MAX_VERTEX_BYTES};
+mod pipe;
+pub use pipe::{PipeReceiveV1, receive_pipe_v1, serve_pipe_v1};
 
 /// Existing full-range transport batch bound, not a new consensus parameter.
 pub const RANGE_LIMIT_V1: usize = 32;
