@@ -9,10 +9,19 @@ publish = false
 
 [features]
 default = []
+# Strict profile/proof preparation; runtime also requires functional-lab.
+aip2-preparation = ["dep:ark-bn254", "dep:ark-ec", "dep:ark-ff", "dep:ark-groth16", "dep:serde", "dep:serde_json", "dep:sha3"]
 # Enables explicitly unqualified scheduling only for private functional fixtures.
 functional-lab = []
 
 [dependencies]
+ark-bn254 = { version = "=0.5.0", default-features = false, features = ["curve", "std"], optional = true }
+ark-ec = { version = "=0.5.0", default-features = false, features = ["std"], optional = true }
+ark-ff = { version = "=0.5.0", default-features = false, features = ["std"], optional = true }
+ark-groth16 = { version = "=0.5.0", default-features = false, features = ["std"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha3 = { version = "=0.10.8", optional = true }
 silk-f04-node = { path = "../silk-f04-node" }
 silk-sapling-f04 = { path = "../silk-sapling-f04" }
 ed25519-dalek = "=2.2.0"

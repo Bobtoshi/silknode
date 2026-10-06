@@ -40,7 +40,7 @@ enum Phase {
 /// to next-round manifest negotiation after the current scheduled write ends.
 pub struct SourceRound {
     round: Rc<ManifestRound>,
-    batch: InputBatch,
+    batch: SourceBatch,
     ready: Option<SignedControl>,
     b_ready: Option<SignedControl>,
     acks: [Option<SignedControl>; 3],
@@ -55,7 +55,109 @@ pub struct SourceRound {
     // Retained for the entire strict round; never constructed from a legacy count.
     _strict_completion: Option<StrictCompletion>,
 }
+enum SourceBatch {
+    Legacy(InputBatch),
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    R2Lab {
+        frames: [crate::aip2_transport::PreparedR2Frame; 32],
+        id: crate::Digest,
+        guard: Rc<crate::runtime::RoundGuard>,
+    },
+}
+impl SourceBatch {
+    fn id(&self) -> crate::Digest {
+        match self {
+            Self::Legacy(b) => b.id(),
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            Self::R2Lab { id, .. } => *id,
+        }
+    }
+    fn admitted(&self) -> u8 {
+        match self {
+            Self::Legacy(b) => b.admitted(),
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            Self::R2Lab { .. } => 32, // lab frames, NOT independent population/admission
+        }
+    }
+    fn bytes(&self, i: usize) -> &[u8; 8192] {
+        match self {
+            Self::Legacy(b) => b.frames()[i].bytes(),
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            Self::R2Lab { frames, .. } => frames[i].bytes(),
+        }
+    }
+    fn is_r2(&self) -> bool {
+        match self {
+            Self::Legacy(_) => false,
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            Self::R2Lab { .. } => true,
+        }
+    }
+    fn check_guard(&self) -> Result<()> {
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        if let Self::R2Lab { guard, .. } = self {
+            guard.check()?;
+        }
+        Ok(())
+    }
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    fn guard(&self) -> Option<Rc<crate::runtime::RoundGuard>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::R2Lab { guard, .. } => Some(Rc::clone(guard)),
+        }
+    }
+}
 impl SourceRound {
+    /// Explicit operator lab: complete precomputed encrypted inputs, not a
+    /// strict client collector or a claim of fixed-deadline client proof dispatch.
+    /// Requires both default-off features and an original unqualified round lease.
+    /// # Errors
+    /// Refuses wrong phase/context/version, duplicates, qualified clocks or lease.
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    pub fn new_r2_lab(
+        round: Rc<ManifestRound>,
+        profile: &crate::aip2_profile::PreparedProfile,
+        vk_hash: crate::Digest,
+        mut frames: [crate::aip2_transport::PreparedR2Frame; 32],
+        guard: Rc<crate::runtime::RoundGuard>,
+        transport: &Transport,
+    ) -> Result<Self> {
+        if round.schedule.uses_qualified_source() || !guard.matches_schedule(&round.schedule) {
+            return Err(Error::Unavailable(
+                "R2 lab unqualified original lease required",
+            ));
+        }
+        guard.check()?;
+        round.schedule.in_window(9_500_000_000, 10_000_000_000)?;
+        round.schedule.clock_healthy()?;
+        transport.check_endpoint(round.config.endpoints()[Role::B as usize], true)?;
+        let c = crate::aip2_transport::PreparedR2Context::new(
+            &round.config,
+            round.manifest(),
+            profile,
+            vk_hash,
+        )?;
+        crate::aip2_transport::permute_at_a(&c, &mut frames)?;
+        let id = crate::aip2_transport::prepared_a_batch_id(&c, &frames)?;
+        round.schedule.completed_before(10_000_000_000)?;
+        Ok(Self {
+            round,
+            batch: SourceBatch::R2Lab { frames, id, guard },
+            ready: None,
+            b_ready: None,
+            acks: std::array::from_fn(|_| None),
+            authorization: None,
+            prepared: None,
+            phase: Phase::Cells(0),
+            failed_phase: None,
+            writer: WriteSlot::default(),
+            reader: ReadSlot::default(),
+            health_failed: false,
+            transport_id: transport.id(),
+            _strict_completion: None,
+        })
+    }
     /// Bind actual sealed input to a locally cut-checked/durable manifest.
     /// # Errors
     /// Refuses changed cfg/round/batch, recorded clock failure or missed assembly.
@@ -108,7 +210,7 @@ impl SourceRound {
         schedule.completed_before(10_000_000_000)?;
         Ok(Self {
             round,
-            batch,
+            batch: SourceBatch::Legacy(batch),
             ready: None,
             b_ready: None,
             acks: std::array::from_fn(|_| None),
@@ -193,22 +295,22 @@ impl SourceRound {
         identity: &Identity,
         journal: &mut DurableJournal<P>,
     ) -> Result<crate::failure::FailedControls> {
-        let (next, previous_is_control) = match self.failed_phase {
-            Some(Phase::Cells(_)) => (0, false),
-            Some(Phase::Ready) => (0, true),
-            Some(Phase::Evidence(_) | Phase::Freeze) => (1, false),
-            Some(Phase::Authorized) => (1, true),
-            _ => return Err(Error::Unavailable("A no reversible failed phase")),
-        };
+        let (next, previous_is_control) =
+            failure_allocation(&self.failed_phase, self.batch.is_r2())?;
         let cancel = journal.cancel_live(&self.round.config, &self.round.schedule, identity)?;
-        Ok(crate::failure::FailedControls::source(
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        let guard = self.batch.guard();
+        let controls = crate::failure::FailedControls::source(
             Rc::clone(&self.round.schedule),
             cancel,
             next,
             self.writer,
             previous_is_control,
             self.transport_id,
-        ))
+        );
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        let controls = controls.retain_r2_lease(guard);
+        Ok(controls)
     }
     pub(crate) fn into_committed_failure<P: PinRetention>(
         self,
@@ -220,11 +322,12 @@ impl SourceRound {
         {
             return Err(Error::Unavailable("A no irreversible failed decision"));
         }
-        Ok(crate::failure::CommittedWrite::new(
-            self.writer,
-            0,
-            vec![self.transport_id],
-        ))
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        let guard = self.batch.guard();
+        let service = crate::failure::CommittedWrite::new(self.writer, 0, vec![self.transport_id]);
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        let service = service.retain_r2_lease(guard);
+        Ok(service)
     }
     #[allow(clippy::too_many_lines)] // Keep the ordered single-coordinator phases together.
     fn advance<P: PinRetention>(
@@ -233,19 +336,25 @@ impl SourceRound {
         identity: &Identity,
         journal: &mut DurableJournal<P>,
     ) -> Result<SourceProgress> {
+        self.batch.check_guard()?;
         if !matches!(self.phase, Phase::Authorized | Phase::Written) && self.health_failed {
             return Err(Error::Unavailable("A frozen local health failure"));
         }
         match self.phase {
             Phase::Cells(i) => {
+                let width = if self.batch.is_r2() {
+                    7_812_500
+                } else {
+                    31_250_000
+                };
                 let start = 10_000_000_000
-                    + i64::try_from(i).map_err(|_| Error::Invalid("A slot"))? * 31_250_000;
+                    + i64::try_from(i).map_err(|_| Error::Invalid("A slot"))? * width;
                 if self.writer.poll(
                     transport,
                     &self.round.schedule,
-                    (start, start + 31_250_000),
+                    (start, start + width),
                     RecordSize::Cell,
-                    self.batch.frames()[i].bytes(),
+                    self.batch.bytes(i),
                 )? {
                     self.writer = WriteSlot::default();
                     self.phase = if i == 31 {
@@ -275,7 +384,11 @@ impl SourceRound {
                 if self.writer.poll(
                     transport,
                     &self.round.schedule,
-                    (11_000_000_000, 14_000_000_000),
+                    if self.batch.is_r2() {
+                        (10_250_000_000, 10_500_000_000)
+                    } else {
+                        (11_000_000_000, 14_000_000_000)
+                    },
                     RecordSize::Control,
                     self.ready
                         .as_ref()
@@ -423,5 +536,58 @@ impl SourceRound {
                 .as_ref()
                 .ok_or(Error::Unavailable("P2 ACK absent"))?,
         ])
+    }
+}
+
+fn failure_allocation(phase: &Option<Phase>, r2: bool) -> Result<(usize, bool)> {
+    // R2 READY's original +10.25 write can be carried, but it never consumed
+    // the SEPARATE +11 CANCEL allocation. A selected record is never replaced.
+    match phase {
+        Some(Phase::Cells(_)) => Ok((0, false)),
+        Some(Phase::Ready) => Ok((0, !r2)),
+        Some(Phase::Evidence(_) | Phase::Freeze) => Ok((usize::from(!r2), false)),
+        Some(Phase::Authorized) => Ok((1, true)),
+        _ => Err(Error::Unavailable("A no reversible failed phase")),
+    }
+}
+
+#[cfg(test)]
+mod r2_failure_tests {
+    use super::*;
+    #[test]
+    fn r2_ready_and_evidence_do_not_consume_cancel_allocation() {
+        for phase in [
+            Phase::Ready,
+            Phase::Evidence(0),
+            Phase::Evidence(3),
+            Phase::Freeze,
+        ] {
+            assert_eq!(failure_allocation(&Some(phase), true).unwrap(), (0, false));
+        }
+        assert_eq!(
+            failure_allocation(&Some(Phase::Cells(31)), true).unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            failure_allocation(&Some(Phase::Authorized), true).unwrap(),
+            (1, true)
+        );
+        assert!(failure_allocation(&Some(Phase::Written), true).is_err());
+        assert!(failure_allocation(&None, true).is_err());
+    }
+    #[test]
+    fn r2_addition_preserves_legacy_cancel_ownership() {
+        assert_eq!(
+            failure_allocation(&Some(Phase::Ready), false).unwrap(),
+            (0, true)
+        );
+        assert_eq!(
+            failure_allocation(&Some(Phase::Evidence(2)), false).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            failure_allocation(&Some(Phase::Freeze), false).unwrap(),
+            (1, false)
+        );
     }
 }

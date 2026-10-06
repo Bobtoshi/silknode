@@ -52,6 +52,8 @@ mod platform {
         wall: Option<Timer>,
         _lease: Lease,
         round: u64,
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        schedule_identity: Rc<()>,
         cpu_deadline: Duration,
         wall_deadline: Instant,
         #[cfg(feature = "functional-lab")]
@@ -88,6 +90,8 @@ mod platform {
                 wall: None,
                 _lease: Lease::acquire()?,
                 round: schedule.round(),
+                #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+                schedule_identity: Rc::clone(&schedule.lease_identity),
                 cpu_deadline,
                 wall_deadline,
                 #[cfg(feature = "functional-lab")]
@@ -133,6 +137,12 @@ mod platform {
         #[must_use]
         pub const fn round(&self) -> u64 {
             self.round
+        }
+        // Retain the original nonserializable identity even if its schedule is
+        // dropped: allocator address reuse cannot substitute a fresh mapping.
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        pub(crate) fn matches_schedule(&self, schedule: &Schedule) -> bool {
+            Rc::ptr_eq(&self.schedule_identity, &schedule.lease_identity)
         }
         /// Original kernel monotonic deadline for an isolated external recorder.
         /// This read-only value cannot change the timer or admit a clock source.
@@ -223,6 +233,10 @@ mod platform {
         #[must_use]
         pub const fn round(&self) -> u64 {
             self.round
+        }
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        pub(crate) const fn matches_schedule(&self, _schedule: &Schedule) -> bool {
+            false
         }
         /// # Errors
         /// This platform has no qualified native relay-round backend.

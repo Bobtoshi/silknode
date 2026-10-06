@@ -68,6 +68,8 @@ impl Decision {
 /// No secret-bearing control, session, permutation, cell, or key is serializable.
 pub struct Journal {
     directory: File,
+    // Optional explicitly separate host filesystem; never serialized authority.
+    host_margin: Option<File>,
     lock: File,
     bytes: [u8; BYTES],
     pin: Digest,
@@ -92,8 +94,36 @@ impl Journal {
         role: Role,
         utc_round: u64,
     ) -> Result<Self> {
+        Self::create_inner(path, None, domain, cohort, role, utc_round)
+    }
+    /// Create on an externally capped store while retaining the unchanged4GiB
+    /// host-space guard on an explicitly separate filesystem. The store must
+    /// additionally have64KiB free for the fixed journal/staging metadata.
+    /// This selects no runtime cap, default or ledger authority.
+    /// # Errors
+    /// Refuses non-directory/symlink/same-filesystem margins, capacity and all
+    /// ordinary owned-directory, residue, role and persistence failures.
+    pub fn create_with_host_margin(
+        path: &Path,
+        host_margin: &Path,
+        domain: Digest,
+        cohort: u32,
+        role: Role,
+        utc_round: u64,
+    ) -> Result<Self> {
+        Self::create_inner(path, Some(host_margin), domain, cohort, role, utc_round)
+    }
+    fn create_inner(
+        path: &Path,
+        margin: Option<&Path>,
+        domain: Digest,
+        cohort: u32,
+        role: Role,
+        utc_round: u64,
+    ) -> Result<Self> {
         check_role(role)?;
         let directory = open_dir(path)?;
+        let host_margin = open_margin(margin, &directory)?;
         inventory(&directory, false)?;
         let lock = fresh(&directory, "LOCK")?;
         lock_file(&lock)?;
@@ -105,6 +135,7 @@ impl Journal {
         bytes[80..84].copy_from_slice(&cohort.to_le_bytes());
         let mut journal = Self {
             directory,
+            host_margin,
             lock,
             bytes,
             pin: [0; 32],
@@ -129,8 +160,43 @@ impl Journal {
         expected_pin: Digest,
         utc_round: u64,
     ) -> Result<Self> {
+        Self::open_inner(path, None, domain, cohort, role, expected_pin, utc_round)
+    }
+    /// Pinned cold reopen of the explicit separately-margined capped-store mode.
+    /// No old round resumes and no stored byte can select its host filesystem.
+    /// # Errors
+    /// Refuses margin, capacity and every ordinary continuity/recovery failure.
+    pub fn open_with_host_margin(
+        path: &Path,
+        host_margin: &Path,
+        domain: Digest,
+        cohort: u32,
+        role: Role,
+        expected_pin: Digest,
+        utc_round: u64,
+    ) -> Result<Self> {
+        Self::open_inner(
+            path,
+            Some(host_margin),
+            domain,
+            cohort,
+            role,
+            expected_pin,
+            utc_round,
+        )
+    }
+    fn open_inner(
+        path: &Path,
+        margin: Option<&Path>,
+        domain: Digest,
+        cohort: u32,
+        role: Role,
+        expected_pin: Digest,
+        utc_round: u64,
+    ) -> Result<Self> {
         check_role(role)?;
         let directory = open_dir(path)?;
+        let host_margin = open_margin(margin, &directory)?;
         let lock = existing(&directory, "LOCK", 0)?;
         lock_file(&lock)?;
         inventory(&directory, true)?;
@@ -151,6 +217,7 @@ impl Journal {
         }
         let mut journal = Self {
             directory,
+            host_margin,
             lock,
             bytes,
             pin: expected_pin,
@@ -458,11 +525,12 @@ impl Journal {
     }
     fn publish(&mut self, next: &[u8; BYTES], replace: bool) -> Result<()> {
         let space = rustix::fs::fstatvfs(&self.directory).map_err(std::io::Error::from)?;
-        if space
-            .f_bavail
-            .checked_mul(space.f_frsize)
-            .is_none_or(|bytes| bytes < 4 * 1024 * 1024 * 1024)
-        {
+        if !has_space(space.f_bavail, space.f_frsize, 64 * 1024) {
+            return Err(Error::Unavailable("journal store capacity"));
+        }
+        let margin = self.host_margin.as_ref().unwrap_or(&self.directory);
+        let space = rustix::fs::fstatvfs(margin).map_err(std::io::Error::from)?;
+        if !has_space(space.f_bavail, space.f_frsize, 4 * 1024 * 1024 * 1024) {
             return Err(Error::Unavailable("journal host margin"));
         }
         let mut stage = fresh(&self.directory, "STAGE")?;
@@ -623,6 +691,43 @@ fn open_dir(path: &Path) -> Result<File> {
         return Err(Error::Unavailable("journal owned0700 directory"));
     }
     Ok(file)
+}
+fn has_space(blocks: u64, size: u64, required: u64) -> bool {
+    blocks
+        .checked_mul(size)
+        .is_some_and(|bytes| bytes >= required)
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::has_space;
+    #[test]
+    fn fixed_store_and_unchanged_host_thresholds_refuse_underflow_and_overflow() {
+        for required in [64 * 1024, 4 * 1024 * 1024 * 1024] {
+            assert!(!has_space(required - 1, 1, required));
+            assert!(has_space(required, 1, required));
+            assert!(!has_space(0, 4096, required));
+            assert!(!has_space(u64::MAX, 2, required));
+        }
+    }
+}
+fn open_margin(path: Option<&Path>, directory: &File) -> Result<Option<File>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let margin: File = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    if margin.metadata()?.dev() == directory.metadata()?.dev() {
+        return Err(Error::Unavailable(
+            "journal margin must be a separate filesystem",
+        ));
+    }
+    Ok(Some(margin))
 }
 fn identity(file: &File, directory: &File, length: u64) -> Result<()> {
     let meta = file.metadata()?;

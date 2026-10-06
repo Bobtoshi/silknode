@@ -1,5 +1,17 @@
 //! Private F0.4 relay components. No default endpoint, activation or privacy claim.
 //! Signature-checked bytes are NOT timing, readiness, custody or release authority.
+#[cfg(unix)]
+pub mod aip2_claim;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+pub mod aip2_profile;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+pub mod aip2_proof;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+pub mod aip2_transport;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+fn aip2_signature(key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    silk_f04_node::auth::verify_role_signature(key, message, signature).is_ok()
+}
 pub mod config;
 pub mod control;
 #[cfg(unix)]

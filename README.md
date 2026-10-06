@@ -92,6 +92,11 @@ payment system.
 
 ## Contributing and limitations
 
+The optional [R2 exact-cohort preparation](docs/AIP2_R2_PREPARATION_V1.md)
+exposes strict profile/one-shot/proof/encrypted-cohort components for inspection
+and focused tests. It is default-off, has no accepted operational profile and
+does not activate anonymous networking or change payment/consensus bytes.
+
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 Tests and compact vectors are retained for inspection and focused work; some
 proof/runtime tests require external parameters and separately bounded

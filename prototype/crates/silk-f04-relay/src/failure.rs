@@ -16,6 +16,52 @@ pub(crate) struct CommittedWrite {
     carry: Option<(usize, WriteSlot)>,
     connections: Vec<u64>,
     unavailable: u8,
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    r2_guard: Option<Rc<crate::runtime::RoundGuard>>,
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "aip2-preparation",
+    feature = "functional-lab"
+))]
+mod r2_lease_tests {
+    use super::*;
+    #[test]
+    fn r2_committed_carry_retains_original_kernel_lease_and_mapping() {
+        use crate::schedule::QualifiedClockSample;
+        use std::time::{Duration, SystemTime};
+        let config = crate::tests::relay_test_config();
+        let sample = || {
+            QualifiedClockSample::from_qualified_source(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(179_970),
+                Instant::now(),
+                Duration::from_millis(500),
+            )
+            .unwrap()
+        };
+        // Numeric/native lease fixture only, NOT an external UTC qualification.
+        let schedule = Rc::new(Schedule::new(&config, 6000, sample()).unwrap());
+        let other = Rc::new(Schedule::new(&config, 6000, sample()).unwrap());
+        let guard = Rc::new(crate::runtime::RoundGuard::arm(&schedule).unwrap());
+        assert!(guard.matches_schedule(&schedule));
+        assert!(!guard.matches_schedule(&other));
+        assert!(crate::runtime::RoundGuard::arm(&schedule).is_err());
+        let identity = Rc::downgrade(&schedule.lease_identity);
+        let weak = Rc::downgrade(&guard);
+        let mut service = CommittedWrite::new(WriteSlot::default(), 0, vec![])
+            .retain_r2_lease(Some(Rc::clone(&guard)));
+        drop(guard);
+        drop(schedule);
+        drop(other);
+        assert!(weak.upgrade().is_some());
+        assert!(identity.upgrade().is_some());
+        assert!(service.poll(&mut []).unwrap());
+        drop(service);
+        assert!(weak.upgrade().is_none());
+        assert!(identity.upgrade().is_none());
+    }
 }
 impl CommittedWrite {
     pub(crate) fn new(writer: WriteSlot, lane: usize, connections: Vec<u64>) -> Self {
@@ -23,9 +69,20 @@ impl CommittedWrite {
             carry: (writer.selected() && !writer.complete()).then_some((lane, writer)),
             connections,
             unavailable: 0,
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            r2_guard: None,
         }
     }
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    pub(crate) fn retain_r2_lease(mut self, guard: Option<Rc<crate::runtime::RoundGuard>>) -> Self {
+        self.r2_guard = guard;
+        self
+    }
     pub(crate) fn poll(&mut self, links: &mut [&mut Transport]) -> Result<bool> {
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        if let Some(guard) = &self.r2_guard {
+            guard.check()?;
+        }
         if links.len() != self.connections.len()
             || links
                 .iter()
@@ -66,6 +123,8 @@ pub struct FailedControls {
     connections: Vec<u64>,
     unavailable: u8,
     completed: u32,
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    r2_guard: Option<Rc<crate::runtime::RoundGuard>>,
 }
 impl FailedControls {
     #[allow(clippy::too_many_arguments)] // Complete transfer of one selected slot, not independent flags.
@@ -91,7 +150,14 @@ impl FailedControls {
             connections,
             unavailable: 0,
             completed: 0,
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            r2_guard: None,
         }
+    }
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    pub(crate) fn retain_r2_lease(mut self, guard: Option<Rc<crate::runtime::RoundGuard>>) -> Self {
+        self.r2_guard = guard;
+        self
     }
     pub(crate) fn source(
         schedule: Rc<Schedule>,
@@ -268,6 +334,10 @@ impl FailedControls {
     /// # Errors
     /// Refuses changed connection identity, unhealthy clock or malformed local state.
     pub fn poll(&mut self, links: &mut [&mut Transport]) -> Result<bool> {
+        #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+        if let Some(guard) = &self.r2_guard {
+            guard.check()?;
+        }
         if links.len() != self.connections.len()
             || links
                 .iter()

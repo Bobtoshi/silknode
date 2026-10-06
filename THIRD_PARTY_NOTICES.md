@@ -53,3 +53,19 @@ project and verifies the complete pinned bytes before use. Parameter bodies
 and any rights to redistribute those bodies are not granted by this repository.
 Their acquisition and ceremony trust assumptions are separate from the source
 licences above.
+
+## Optional R2 preparation parameters
+
+The default-off R2 preparation module uses separately obtained arkworks 0.5.0
+registry packages; their declared terms and archive checksums are included in
+the dependency inventory above. No proving-key or trusted-setup artifact is
+distributed with this module.
+
+The numeric Poseidon table in `aip2_poseidon_constants.rs` was mechanically
+decoded from `poseidon-lite` 0.3.0 `constants/2.js`, not from its executable
+JavaScript implementation. Upstream declares versions 0.2.0 and later MIT;
+see the [upstream version-specific licensing statement](https://github.com/chancinald/poseidon-lite#license).
+The source provenance and exact input hash are recorded in
+[the preparation notes](docs/AIP2_R2_PREPARATION_V1.md). This is provenance and
+licensing metadata, not cryptographic setup acceptance or an upstream audit of
+SilkNode. Preserve applicable upstream terms when redistributing material.

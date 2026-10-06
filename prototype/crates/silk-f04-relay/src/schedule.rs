@@ -114,6 +114,8 @@ pub struct Schedule {
     last_observed: Cell<(Instant, Duration)>,
     clock_failed: Cell<bool>,
     pub(crate) budget_claimed: Cell<bool>,
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    pub(crate) lease_identity: std::rc::Rc<()>,
     qualified: bool,
 }
 impl Schedule {
@@ -150,6 +152,8 @@ impl Schedule {
             last_observed: Cell::new((sample.monotonic, sample.utc)),
             clock_failed: Cell::new(false),
             budget_claimed: Cell::new(false),
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            lease_identity: std::rc::Rc::new(()),
             qualified: true,
             sample,
             round,
@@ -230,6 +234,8 @@ impl Schedule {
             last_observed: Cell::new((observation.monotonic, observation.utc)),
             clock_failed: Cell::new(false),
             budget_claimed: Cell::new(false),
+            #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+            lease_identity: std::rc::Rc::new(()),
             qualified: true,
         })
     }
