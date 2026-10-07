@@ -15,6 +15,58 @@ fn immutable_inputs(root: &Path) -> BTreeMap<String, Digest> {
 }
 
 #[test]
+#[ignore = "isolated synthetic over-count header and canonical public parameters; no replay/mining/proofs"]
+fn generation_horizon_public_open_refuses_before_any_replay_marker_or_write() {
+    assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
+    let root = PathBuf::from(std::env::var_os("SILK_F04_GENERATION_BOUNDARY_ROOT").unwrap());
+    let margin = PathBuf::from(std::env::var_os("SILK_F04_HOST_MARGIN").unwrap());
+    let parameter_dir = PathBuf::from(std::env::var_os("SILK_F04_PARAMETER_DIR").unwrap());
+    assert!(!root.exists());
+    let genesis = crate::genesis::public_testnet_v1::genesis().unwrap();
+    let parameters = SaplingParameters::load(
+        &parameter_dir.join("sapling-spend.params"),
+        &parameter_dir.join("sapling-output.params"),
+    )
+    .unwrap();
+    let mut store = Store::create(&root, &margin).unwrap();
+    // One deliberately synthetic intact header, not 20,001 valid generations.
+    // Counts can refuse the public open, never establish lineage or validity.
+    let header = Record {
+        kind: 0,
+        status: 0,
+        sequence: crate::capacity::HistoryLimitsV1::REFERENCE.generations(),
+        previous: [0; 32],
+        domain: genesis.domain(),
+        clock: 0,
+        data: raw_hash(b"synthetic over-count header"),
+        state: [0; 32],
+        order: [0; 32],
+        checkpoint: [0; 32],
+        vertices: 0,
+    };
+    let pin = store
+        .commit(&[b"synthetic over-count header"], &header.encode())
+        .unwrap();
+    drop(store);
+    let original = immutable_inputs(&root);
+    assert!(!root.join("ACTIVE_REPLAY").exists());
+    assert!(!root.join("ACTIVE_JOB").exists());
+    let error = Node::open_retained_pinned(&root, &margin, genesis, &parameters, pin)
+        .err()
+        .expect("zero-based sequence equal to the count limit must refuse");
+    assert!(matches!(
+        error,
+        Error::Unavailable("retained local resource profile")
+    ));
+    assert!(!root.join("ACTIVE_REPLAY").exists());
+    assert!(!root.join("ACTIVE_JOB").exists());
+    assert_eq!(immutable_inputs(&root), original);
+    println!(
+        "synthetic_header_sequence=20000; claimed_record_count=20001; public_open_refused=true; no_replay_marker=true; all_store_bytes_unchanged=true; replay_executed=false; work=0; proofs=0"
+    );
+}
+
+#[test]
 #[ignore = "requires isolated COPY of a genuine locally retained eight-vertex corpus and canonical parameters"]
 fn disk_ancestry_native_cold_replay_preserves_source_and_corrupt_auxiliary_stops() {
     assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));

@@ -204,7 +204,7 @@ impl Node {
                 return Err(Error::Unavailable("retained generation context"));
             }
             if record.vertices > store.limits().vertices() as u64
-                || record.sequence > store.limits().generations()
+                || record.sequence >= store.limits().generations()
             {
                 // Header counts can only refuse resource selection, not establish
                 // validity. Do not consume a replay attempt for a too-small profile.

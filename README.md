@@ -90,6 +90,12 @@ this optional download path is not part of the checked offline smoke. Pins
 authenticate bytes, not the ceremony's trust assumptions or an end-to-end
 payment system.
 
+The [bounded generation replay directory](docs/F04_GENERATION_DIRECTORY_V1.md)
+supports an independently selected finite local history count without changing
+the 20,000-generation default. Cold reopen still verifies the complete original
+history; no saved directory is trusted and no history is pruned. Focused checks
+and a small saved-carrier replay do not establish native large-chain capacity.
+
 ## Contributing and limitations
 
 The optional [R2 exact-cohort preparation](docs/AIP2_R2_PREPARATION_V1.md)

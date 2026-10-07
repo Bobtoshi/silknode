@@ -1,6 +1,7 @@
 //! Full-data generation traversal with one 64-address page resident at a time.
 //! This is a local representation, not pruning, finality, a validity cache or
-//! permission to exceed the existing graph, ledger, replay or runtime horizons.
+//! permission to exceed selected local graph, ledger, replay or runtime horizons.
+mod directory;
 use super::{GENERATION_LIMIT_V1, Record};
 use crate::{
     Digest, Error, Result,
@@ -11,9 +12,7 @@ use std::collections::VecDeque;
 
 const PAGE_RECORDS: usize = 64;
 const PAGE_HEADER: usize = 56;
-const DIRECTORY_PAGES: usize = 313;
-const _: () = assert!((DIRECTORY_PAGES * PAGE_RECORDS) as u64 >= GENERATION_LIMIT_V1);
-const _: () = assert!((((DIRECTORY_PAGES - 1) * PAGE_RECORDS) as u64) < GENERATION_LIMIT_V1);
+const _: () = assert!(GENERATION_LIMIT_V1 > 0);
 
 struct Page {
     domain: Digest,
@@ -62,7 +61,7 @@ pub(super) struct ReplayPagesV1 {
     source: Digest,
     total: u64,
     sequence: u64,
-    pages: [Digest; DIRECTORY_PAGES],
+    pages: directory::Directory,
     previous: Digest,
     ids: VecDeque<Digest>,
 }
@@ -77,11 +76,12 @@ impl ReplayPagesV1 {
         let total = terminal.sequence + 1;
         let mut sequence = terminal.sequence;
         let mut cursor = head;
-        // Fresh, nonserialized directory: it cannot stand in for replay. Leaves
+        // Fresh directory root: it cannot stand in for replay. Leaves
         // are aligned to sequence zero, so completed prefix pages deduplicate
         // across appended heads. At most 64 prefix variants per aligned group
-        // on one append-only lineage: <=20,000 pages, not quadratic growth.
-        let mut pages = [[0; 32]; DIRECTORY_PAGES];
+        // on one append-only lineage: <=one leaf per generation. Directory
+        // construction has three bounded groups, never a total-sized vector.
+        let mut pages = directory::Builder::new(domain, total)?;
         let mut ids = Vec::with_capacity(PAGE_RECORDS);
         loop {
             let record = Record::decode(&store.object(cursor)?)?;
@@ -94,9 +94,8 @@ impl ReplayPagesV1 {
             ids.push(cursor);
             if sequence % PAGE_RECORDS as u64 == 0 {
                 ids.reverse();
-                let ordinal = usize::try_from(sequence / PAGE_RECORDS as u64)
-                    .map_err(|_| Error::Unavailable("retained replay page ordinal"))?;
-                pages[ordinal] = store.retain_replay_page(
+                let ordinal = sequence / PAGE_RECORDS as u64;
+                let page = store.retain_replay_page(
                     &Page {
                         domain,
                         sequence,
@@ -104,6 +103,7 @@ impl ReplayPagesV1 {
                     }
                     .encode(),
                 )?;
+                pages.push(store, ordinal, page)?;
                 ids = Vec::with_capacity(PAGE_RECORDS);
             }
             if sequence == 0 {
@@ -117,7 +117,7 @@ impl ReplayPagesV1 {
             source: head,
             total,
             sequence: 0,
-            pages,
+            pages: pages.finish()?,
             previous: [0; 32],
             ids: VecDeque::new(),
         })
@@ -133,12 +133,8 @@ impl ReplayPagesV1 {
             return Ok(None);
         }
         if self.ids.is_empty() {
-            let ordinal = usize::try_from(self.sequence / PAGE_RECORDS as u64)
-                .map_err(|_| Error::Unavailable("retained replay page ordinal"))?;
-            let page_id = self.pages[ordinal];
-            if page_id == [0; 32] {
-                return Err(Error::Unavailable("missing retained replay page"));
-            }
+            let ordinal = self.sequence / PAGE_RECORDS as u64;
+            let page_id = self.pages.leaf(store, ordinal)?;
             // Auxiliary index damage is a STOP, never authority to replace an
             // intact canonical HEAD with PREVIOUS. Original record reads below
             // retain the ordinary verified-previous recovery classification.
@@ -211,6 +207,165 @@ mod tests {
     }
 
     #[test]
+    fn generation_directory_traverses_actual_lineage_beyond_20000_and_default_refuses() {
+        use crate::capacity::HistoryLimitsV1;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let limits = HistoryLimitsV1::REFERENCE.with_generations(40_000).unwrap();
+        let mut store = Store::create(&root, temp.path())
+            .unwrap()
+            .with_limits(limits);
+        const COUNT: u64 = 20_033;
+        // Actual contiguous original-format headers, not counter injection.
+        // No PoW, private proof or node semantic acceptance is implied.
+        let mut head = [0; 32];
+        for sequence in 0..COUNT {
+            head = store
+                .commit(&[b"data"], &record(sequence, head).encode())
+                .unwrap();
+        }
+        drop(store);
+        let mut store = Store::open_pinned(&root, temp.path(), head).unwrap();
+        let before = fs::read_dir(&root).unwrap().count();
+        let error = ReplayPagesV1::build(&mut store, head, DOMAIN)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            Error::Paused("generation replay reference horizon")
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+        assert_eq!(store.head(), Some(head));
+        assert!(store.active_replay().unwrap().is_none());
+        store = store.with_limits(limits);
+        fenced(&mut store);
+        let mut pages = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
+        let directory = pages.pages.root;
+        let mut previous = [0; 32];
+        for sequence in 0..COUNT {
+            let expected = record(sequence, previous).encode();
+            assert_eq!(pages.next(&store).unwrap().unwrap().encode(), expected);
+            previous = raw_hash(&expected);
+            assert!(pages.ids.len() < PAGE_RECORDS);
+        }
+        assert!(pages.next(&store).unwrap().is_none());
+        assert_eq!(previous, head);
+        let before = fs::read_dir(&root).unwrap().count();
+        let fresh = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
+        assert_eq!(fresh.sequence, 0);
+        assert_eq!(fresh.pages.root, directory);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+        assert_eq!(store.head(), Some(head));
+        let marker = store.active_replay().unwrap();
+        drop(store);
+        assert!(matches!(
+            Store::open_pinned(&root, temp.path(), [9; 32]),
+            Err(Error::Unavailable(
+                "independently retained local head mismatch"
+            ))
+        ));
+        let store = Store::open_pinned(&root, temp.path(), head).unwrap();
+        assert_eq!(store.active_replay().unwrap(), marker);
+        assert_eq!(store.head(), Some(head));
+        println!(
+            "synthetic_contiguous_headers={COUNT}; full_byte_traversal=true; default_horizon_refused=true; fresh_rebuild=true; work=0; proofs=0"
+        );
+    }
+
+    #[test]
+    fn generation_directory_swapped_leaf_never_advances_record_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let mut store = Store::create(&root, temp.path()).unwrap();
+        let (head, _) = chain(&mut store, 65);
+        fenced(&mut store);
+        let mut pages = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
+        let first = pages.pages.leaf(&store, 0).unwrap();
+        let last = pages.pages.leaf(&store, 1).unwrap();
+        let mut builder = directory::Builder::new(DOMAIN, 65).unwrap();
+        builder.push(&mut store, 1, first).unwrap();
+        builder.push(&mut store, 0, last).unwrap();
+        pages.pages = builder.finish().unwrap();
+        assert!(matches!(
+            pages.next(&store),
+            Err(Error::Unavailable("retained replay page binding/lineage"))
+        ));
+        assert_eq!(pages.sequence, 0);
+        assert_eq!(store.head(), Some(head));
+        assert!(store.active_replay().unwrap().is_some());
+        drop(store);
+        // An interrupted attempt survives reopen; another attempt is refused.
+        let mut store = Store::open_pinned(&root, temp.path(), head).unwrap();
+        assert!(store.begin_replay(b"not a renewed allowance").is_err());
+        assert_eq!(store.head(), Some(head));
+    }
+
+    #[test]
+    #[ignore = "one isolated COPY of the saved genuine eight-carrier node; canonical parameters; no mining/proofs"]
+    fn generation_directory_native_saved_eight_cold_parity() {
+        use super::super::{Node, NodeStatus};
+        use crate::{capacity::HistoryLimitsV1, genesis::public_testnet_v1};
+        use silk_sapling_f04::parameters::SaplingParameters;
+        use std::{collections::BTreeMap, path::PathBuf};
+        assert_eq!(std::env::var("SILK_F04_ISOLATED_LAB").as_deref(), Ok("1"));
+        let root = PathBuf::from(std::env::var_os("SILK_F04_ANCESTRY_NATIVE_STORE").unwrap());
+        let margin = PathBuf::from(std::env::var_os("SILK_F04_HOST_MARGIN").unwrap());
+        let parameter_dir = PathBuf::from(std::env::var_os("SILK_F04_PARAMETER_DIR").unwrap());
+        let digest = |name: &str| -> Digest {
+            hex::decode(std::env::var(name).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let pin = digest("SILK_F04_ANCESTRY_NATIVE_PIN");
+        let checkpoint = digest("SILK_F04_ANCESTRY_NATIVE_CHECKPOINT");
+        let state = digest("SILK_F04_ANCESTRY_NATIVE_STATE");
+        let original = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    raw_hash(&fs::read(path).unwrap()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let parameters = SaplingParameters::load(
+            &parameter_dir.join("sapling-spend.params"),
+            &parameter_dir.join("sapling-output.params"),
+        )
+        .unwrap();
+        let limits = HistoryLimitsV1::REFERENCE.with_generations(40_000).unwrap();
+        let node = Node::open_retained_pinned_with_limits(
+            &root,
+            &margin,
+            public_testnet_v1::genesis().unwrap(),
+            &parameters,
+            pin,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(node.status().unwrap(), NodeStatus::Ready);
+        assert_eq!(node.vertex_count(), 8);
+        assert_eq!(node.state().unwrap().executed().len(), 8);
+        assert_eq!(node.local_head().unwrap(), pin);
+        assert_eq!(node.state().unwrap().checkpoint_id(), checkpoint);
+        assert_eq!(node.state().unwrap().digest(), state);
+        assert!(!node.recovered_previous());
+        let order = node.export_range(0, 8).unwrap();
+        drop(node);
+        for (name, hash) in original {
+            assert_eq!(raw_hash(&fs::read(root.join(name)).unwrap()), hash);
+        }
+        assert!(!root.join("ACTIVE_REPLAY").exists());
+        assert!(!root.join("ACTIVE_JOB").exists());
+        println!(
+            "saved_genuine_vertices=8; full_cold_replay=true; exact_state_checkpoint_pin=true; exported_carriers={}; selected_generations=40000; new_work=0; new_proofs=0",
+            order.len()
+        );
+    }
+
+    #[test]
     fn paged_generation_traversal_is_exact_bounded_and_fresh() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
@@ -222,7 +377,7 @@ mod tests {
             .collect::<Vec<_>>();
         fenced(&mut store);
         let mut pages = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
-        let directory = pages.pages;
+        let directory = pages.pages.root;
         let mut output = Vec::new();
         while let Some(record) = pages.next(&store).unwrap() {
             assert!(pages.ids.len() < PAGE_RECORDS);
@@ -235,7 +390,7 @@ mod tests {
         // deduplicate, but the old completed cursor was not loaded or trusted.
         let fresh = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
         assert_eq!(fresh.sequence, 0);
-        assert_eq!(fresh.pages, directory);
+        assert_eq!(fresh.pages.root, directory);
     }
 
     #[test]
@@ -246,7 +401,10 @@ mod tests {
         let (head, _) = chain(&mut store, 65);
         fenced(&mut store);
         let mut pages = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
-        let path = root.join(format!("{}.obj", hex::encode(pages.pages[0])));
+        let path = root.join(format!(
+            "{}.obj",
+            hex::encode(pages.pages.leaf(&store, 0).unwrap())
+        ));
         let mut changed = fs::read(&path).unwrap();
         changed[8] ^= 1;
         fs::write(&path, changed).unwrap();
@@ -291,7 +449,10 @@ mod tests {
             sequence: 0,
             ids: vec![head],
         };
-        pages.pages[0] = store.retain_replay_page(&forged.encode()).unwrap();
+        let id = store.retain_replay_page(&forged.encode()).unwrap();
+        let mut builder = directory::Builder::new(DOMAIN, 1).unwrap();
+        builder.push(&mut store, 0, id).unwrap();
+        pages.pages = builder.finish().unwrap();
         assert!(matches!(
             pages.next(&store),
             Err(Error::Unavailable("retained replay page binding/lineage"))
@@ -347,14 +508,23 @@ mod tests {
             let pages = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
             let after = fs::read_dir(&root).unwrap().count();
             if sequence == 127 {
-                stable.copy_from_slice(&pages.pages[..2]);
-                assert_eq!(after - before, 2); // first two full leaves
+                stable = [
+                    pages.pages.leaf(&store, 0).unwrap(),
+                    pages.pages.leaf(&store, 1).unwrap(),
+                ];
+                assert_eq!(after - before, 3); // two leaves plus one directory
             } else {
-                assert_eq!(pages.pages[..2], stable);
-                assert_eq!(after - before, 1); // only the new leaf
+                assert_eq!(
+                    [
+                        pages.pages.leaf(&store, 0).unwrap(),
+                        pages.pages.leaf(&store, 1).unwrap()
+                    ],
+                    stable
+                );
+                assert_eq!(after - before, 2); // new leaf plus one directory
             }
             let fresh = ReplayPagesV1::build(&mut store, head, DOMAIN).unwrap();
-            assert_eq!(fresh.pages, pages.pages);
+            assert_eq!(fresh.pages.root, pages.pages.root);
             assert_eq!(fs::read_dir(&root).unwrap().count(), after);
             store
                 .finish_replay(store.active_replay().unwrap().unwrap().0)

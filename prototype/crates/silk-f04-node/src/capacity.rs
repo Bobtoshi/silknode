@@ -4,6 +4,10 @@ use crate::{Error, Result, sync::HISTORY_LIMIT_V1};
 /// Existing retained-generation replay horizon, not an increased resource limit.
 pub const GENERATION_LIMIT_V1: u64 = 20_000;
 
+/// Closed opt-in local envelope. Selecting it does not qualify a workload or
+/// increase disk, graph, effect, CPU, wall or native-runtime allowances.
+pub const MAX_GENERATIONS_V1: u64 = 1_048_576;
+
 /// Receiver-local, nonserialized resource choice. It conveys no work, proof,
 /// disk reservation, runtime qualification or permission to launch a node.
 /// Existing entry points retain the reference policy. Higher-profile native
@@ -11,11 +15,13 @@ pub const GENERATION_LIMIT_V1: u64 = 20_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryLimitsV1 {
     vertices: usize,
+    generations: u64,
 }
 impl HistoryLimitsV1 {
     /// Original release/reference defaults, unchanged.
     pub const REFERENCE: Self = Self {
         vertices: HISTORY_LIMIT_V1,
+        generations: GENERATION_LIMIT_V1,
     };
     /// Construct an explicit bounded local research profile, not a peer flag.
     /// The retained-generation, object, effect, cache and CPU/wall limits stay
@@ -24,7 +30,25 @@ impl HistoryLimitsV1 {
         if vertices == 0 || vertices > 8192 || !vertices.is_multiple_of(8) {
             return Err(Error::Unavailable("local history resource profile"));
         }
-        let limits = Self { vertices };
+        let limits = Self {
+            vertices,
+            generations: GENERATION_LIMIT_V1,
+        };
+        limits.linear_generations()?;
+        Ok(limits)
+    }
+    /// Independently choose a finite LOCAL publication/replay envelope. Never
+    /// decode this choice from a peer or retained header. Existing constructors
+    /// retain 20,000; the complete linear graph must fit the selected envelope.
+    /// Full original-record replay and every other resource/failure fence remain.
+    pub fn with_generations(self, generations: u64) -> Result<Self> {
+        if generations == 0 || generations > MAX_GENERATIONS_V1 {
+            return Err(Error::Unavailable("local generation resource profile"));
+        }
+        let limits = Self {
+            generations,
+            ..self
+        };
         limits.linear_generations()?;
         Ok(limits)
     }
@@ -32,9 +56,9 @@ impl HistoryLimitsV1 {
     pub const fn vertices(self) -> usize {
         self.vertices
     }
-    /// Original independent generation horizon; never inferred from a peer.
+    /// Independently selected finite horizon; never inferred from a peer.
     pub const fn generations(self) -> u64 {
-        GENERATION_LIMIT_V1
+        self.generations
     }
     /// Complete linear-history publications, including checkpoint zero.
     pub fn linear_generations(self) -> Result<u64> {
@@ -136,7 +160,7 @@ impl HistoryCapacityV1 {
 
     /// Check a known publication/reconciliation bound without changing state.
     /// # Errors
-    /// Pauses at the unchanged retained-generation horizon.
+    /// Pauses at the independently selected retained-generation horizon.
     pub fn check_generations(&self, required: u64) -> Result<()> {
         if required > self.generations_remaining {
             Err(Error::Paused("generation reference horizon"))
@@ -149,6 +173,38 @@ impl HistoryCapacityV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generation_profile_is_finite_local_and_preserves_reference_preflight() {
+        let reference = HistoryLimitsV1::REFERENCE;
+        assert_eq!(reference.generations(), GENERATION_LIMIT_V1);
+        let selected = reference.with_generations(40_000).unwrap();
+        assert_eq!(selected.vertices(), reference.vertices());
+        assert_eq!(selected.generations(), 40_000);
+        assert_ne!(selected, reference);
+        for invalid in [0, 4608, MAX_GENERATIONS_V1 + 1, u64::MAX] {
+            assert!(reference.with_generations(invalid).is_err());
+        }
+        assert_eq!(
+            reference
+                .with_generations(MAX_GENERATIONS_V1)
+                .unwrap()
+                .generations(),
+            MAX_GENERATIONS_V1
+        );
+        let full = HistoryCapacityV1::for_counts(20_000, 0, 0).unwrap();
+        assert!(full.check_generations(1).is_err());
+        assert!(full.check_admission().is_err());
+        let extended = HistoryCapacityV1::for_counts_with_limits(selected, 20_000, 0, 0).unwrap();
+        assert_eq!(extended.generations_remaining, 20_000);
+        extended.check_admission().unwrap();
+        assert!(HistoryCapacityV1::for_counts_with_limits(selected, 40_001, 0, 0).is_err());
+        assert!(
+            HistoryLimitsV1::for_vertices(8192)
+                .unwrap()
+                .with_generations(9216)
+                .is_err()
+        );
+    }
     #[test]
     fn explicit_profile_is_local_closed_and_reserves_full_reconciliation() {
         let limits = HistoryLimitsV1::for_vertices(8192).unwrap();

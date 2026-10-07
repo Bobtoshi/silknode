@@ -7,7 +7,7 @@ The explicit research API permits a nonzero multiple of eight up to 8,192.
 
 ## One immutable local choice
 
-`capacity::HistoryLimitsV1` has a private field, a reference constant and a
+`capacity::HistoryLimitsV1` has private fields, a reference constant and a
 checked constructor. It is not decoded from network traffic or serialized in a
 head, vertex, state, delta, manifest or checkpoint. Operators must choose it
 independently; an advertised source count is never permission to enlarge it.
@@ -20,8 +20,10 @@ index insertion, directory append and ancestry storage refuse mismatched local
 bindings. Public resident compatibility paths retain their original horizon.
 
 The graph, executed positions, reward rows, original order-object lengths and
-public inventory bounds all use that one selected vertex envelope. The 20,000
-generation ceiling, 313 x 64 replay-address geometry, object/storage accounting,
+public inventory bounds all use that one selected vertex envelope. The reference
+generation limit remains 20,000. An independent finite `with_generations` choice
+and rebuilt bounded-fanout replay directory are described in
+[Generation directory](F04_GENERATION_DIRECTORY_V1.md). Object/storage accounting,
 16 MiB crypto and 128 MiB prefix caches, 50,000 effects, 100,000 nullifiers,
 100,000 recovery-effect allowance, admission/checkpoint CPU and wall budgets,
 worker quantum limits and thread/process limits are unchanged.
