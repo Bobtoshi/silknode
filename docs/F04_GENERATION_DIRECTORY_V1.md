@@ -34,8 +34,10 @@ child ordinal, level, exact child count, reserved zero bytes and up to 64 hashes
 Each payload is at most 2,104 bytes. Consensus, vertex, genesis, order, state,
 delta and checkpoint bytes are unchanged.
 
-Every cold reopen rebuilds from the independently pinned HEAD and authenticates
-the complete backward header lineage. Descending construction holds at most
+Retained cold reopen rebuilds from the selected local HEAD and authenticates
+the complete backward header lineage. Ordinary `Node::open_retained` does not
+require an external pin; independently retained rollback pins are supplied and
+enforced only by the pinned reopen APIs. Descending construction holds at most
 three pending 64-address groups, independent of total journal length. A fresh
 in-memory root then directs forward traversal through the original leaves and
 headers; the ordinary full semantic replay is still required. No saved root or
