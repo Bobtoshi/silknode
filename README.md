@@ -11,6 +11,24 @@ relay transport, DAG admission, sealed-cut state reduction and durable local
 state. Supporting crates keep ordering, work, profiles and kernel interfaces
 separate. Start with [Architecture](ARCHITECTURE.md) to find each boundary.
 
+## Current research progress
+
+The optional, default-off IM3 slice adds a three-relay A→C→B path: complete
+32-member gates, original-link cancellation, durable round sequencing and
+mandatory runner-owned relay ports. Its client integration and explicit lab
+harness are source components, not an activated anonymous network.
+See [IM3 implementation and limits](docs/IM3_EXPERIMENTAL_V1.md) and
+[research status](STATUS.md).
+
+Separate private, valueless demonstrations exercised an ordinary wallet through
+three relays and producers into fresh-node settlement and separate cold wallet
+recovery; a later run exercised two fresh timed clients and three matching
+producer offers. These were not one combined experiment or 32 fresh timed users.
+One frozen hidden-assignment attack prediction was wrong, rejecting that one
+timing/order hypothesis in that trial—not proving anonymity. Failure-path
+evaluation remains incomplete. The private controllers and inputs are not
+bundled, so this checkout alone does not reproduce those demonstrations.
+
 ## Optional zero-value public testnet
 
 See [Public testnet V1](PUBLIC_TESTNET_V1.md) for the pinned genesis, bootstrap
@@ -27,6 +45,9 @@ described separately; they do not establish open discovery, independent
 operators, network privacy or whole-blockchain completion.
 
 ## Try a small local example
+
+[Getting started](GETTING_STARTED.md) separates the small public smoke example
+from optional experimental components and their external prerequisites.
 
 Use a **Git checkout**, not a source ZIP: the RandomX build verifies the exact
 vendored Git index tree. Prerequisites are Rust 1.93.0 (pinned in

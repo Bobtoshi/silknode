@@ -8,6 +8,10 @@ use silk_f04_node::auth::sign_role;
 use silk_sapling_f04::codec::domain_hash;
 
 mod crypto_cells;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+mod aip2_collusion;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+mod aip2_im3;
 #[cfg(unix)]
 pub mod tls;
 

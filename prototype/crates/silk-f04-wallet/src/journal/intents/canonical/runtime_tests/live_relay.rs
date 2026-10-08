@@ -191,3 +191,96 @@ fn cold_same_relay_payment_and_both_wallets() {
         std::process::id()
     );
 }
+
+
+// Separate explicitly contained processes call these selectors. The sender
+// namespace contains no recipient backup; the recipient namespace contains no
+// sender backup or intent journal. Both replay the same fresh accepted node seal.
+fn im3_cold_node() -> (std::path::PathBuf, Node, Vec<u8>) {
+    let (_store, margin, parameters) = qualified_paths();
+    let lab = retained_lab();
+    let pins = std::fs::read(lab.join("accepted-pins")).unwrap();
+    assert_eq!(pins.len(), 256);
+    let domain = field(&pins, 0);
+    let genesis = Genesis::admit_local_bundle(
+        &std::fs::read(lab.join("public-genesis")).unwrap(),
+        &domain,
+        true,
+    )
+    .unwrap();
+    let node = Node::open_retained_pinned(
+        &lab.join("node"),
+        &margin,
+        genesis,
+        &parameters,
+        field(&pins, 96),
+    )
+    .unwrap();
+    assert_eq!(node.status().unwrap(), NodeStatus::Ready);
+    assert_eq!(node.vertex_count(), 8);
+    assert_eq!(node.state().unwrap().checkpoint_index(), 1);
+    assert_eq!(node.state().unwrap().digest(), field::<32>(&pins, 128));
+    assert_eq!(
+        node.state().unwrap().checkpoint_id(),
+        field::<32>(&pins, 160)
+    );
+    (lab, node, pins)
+}
+
+#[test]
+#[ignore = "distinct sender-only cold IM3 recovery; no recipient backup, new proof or work"]
+fn cold_im3_sender_from_actual_seal() {
+    let (lab, node, pins) = im3_cold_node();
+    assert!(!lab.join("recipient-encrypted-key").exists());
+    let domain = field(&pins, 0);
+    let key = backup::load(&lab.join("encrypted-key"), domain, PASSWORD).unwrap();
+    let margin = std::path::PathBuf::from(std::env::var_os("SILK_F04_HOST_MARGIN").unwrap());
+    let mut journal = Journal::open(
+        &lab.join("wallet"),
+        &margin,
+        &key,
+        PASSWORD,
+        field(&pins, 32),
+    )
+    .unwrap();
+    let mut intents = journal.intents(field(&pins, 64)).unwrap();
+    let bytes = intents.release_saved_envelope(field(&pins, 64)).unwrap();
+    assert_eq!(
+        bytes.as_slice(),
+        payment(&lab.join("settled-producer-payment-2790")).as_slice()
+    );
+    let signed = Envelope::decode(&bytes, &domain).unwrap();
+    assert_eq!(signed.effect_id(), field::<32>(&pins, 192));
+    assert_eq!(signed.envelope_id(), field::<32>(&pins, 224));
+    verify_accepted(&mut intents, &node, &signed);
+    println!(
+        "cold_sender_pid={};actual_im3_same_payment_and_seal=true;recipient_key_absent=true;new_proofs=0;new_work=0",
+        std::process::id()
+    );
+}
+
+#[test]
+#[ignore = "distinct recipient-only cold IM3 recovery; no sender backup/journal, proof or work"]
+fn cold_im3_recipient_from_actual_seal() {
+    let (lab, node, pins) = im3_cold_node();
+    assert!(!lab.join("encrypted-key").exists());
+    assert!(!lab.join("wallet").exists());
+    let domain = field(&pins, 0);
+    let key = backup::load(&lab.join("recipient-encrypted-key"), domain, PASSWORD).unwrap();
+    let delivered = payment(&lab.join("settled-producer-payment-2790"));
+    let signed = Envelope::decode(&delivered, &domain).unwrap();
+    assert_eq!(signed.effect_id(), field::<32>(&pins, 192));
+    assert_eq!(signed.envelope_id(), field::<32>(&pins, 224));
+    assert!(node.state().unwrap().contains_effect(&signed.effect_id()));
+    let inventory = key.inventory_from_node(&node).unwrap();
+    assert_eq!(inventory.notes.len(), 1);
+    let note = &inventory.notes[0];
+    assert_eq!(note.note.value().inner(), 8);
+    assert_eq!(note.status, NoteStatus::PendingCut);
+    assert_eq!(note.memo, [0; 512]);
+    assert_eq!(inventory.local_head, node.local_head().unwrap());
+    println!(
+        "cold_recipient_pid={};actual_im3_same_payment_and_seal=true;sender_key_and_intent_journal_absent=true;recipient_pending_maturity=true;new_proofs=0;new_work=0",
+        std::process::id()
+    );
+}

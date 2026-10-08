@@ -3,11 +3,17 @@
 #[cfg(unix)]
 pub mod aip2_claim;
 #[cfg(all(unix, feature = "aip2-preparation"))]
+pub mod aip2_im3;
+#[cfg(all(unix, feature = "aip2-preparation"))]
 pub mod aip2_profile;
 #[cfg(all(unix, feature = "aip2-preparation"))]
 pub mod aip2_proof;
 #[cfg(all(unix, feature = "aip2-preparation"))]
 pub mod aip2_transport;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+pub mod im3_gate;
+#[cfg(all(unix, feature = "aip2-preparation"))]
+pub mod im3_schedule;
 #[cfg(all(unix, feature = "aip2-preparation"))]
 fn aip2_signature(key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     silk_f04_node::auth::verify_role_signature(key, message, signature).is_ok()

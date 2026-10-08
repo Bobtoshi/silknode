@@ -10,7 +10,7 @@ Private wallet / scanner
         |
   silk-f04-client::v1       explicit submission ownership
         |
-  silk-f04-relay            two-relay transport and producer handoff
+  silk-f04-relay            ordinary transport; optional R2 / three-relay IM3
         |
   silk-f04-node             full admission -> DAG -> sealed cuts -> store
         |
@@ -63,6 +63,36 @@ is off by default. It is not production time/custody qualification. Local store
 creation likewise does not establish a complete resource sandbox; deployments
 need a separately reviewed execution environment. No deployment launcher is
 included here.
+
+## Optional three-relay IM3 boundary
+
+IM3 is a separate experimental A→C→B composition, not the ordinary relay
+path's new default. On Unix, the relay's `aip2-preparation` feature exposes
+`aip2_im3`, `im3_schedule` and `im3_gate`; live functional construction also
+requires `functional-lab`. Client `v1::im3_lab` and its R2 prerequisites require
+the separate, default-off `r2-functional-lab` feature.
+
+The original client receives the signed manifest on its existing A TLS link,
+freezes its durable choice, prepares B then C membership proofs and writes in
+its selected slot. A admits the full input train; C verifies the complete
+middle batch before irreversible disclosure; B verifies the complete exit
+batch. Signed readiness, producer acknowledgements, A authorization and B
+release precede ordinary producer offers. Fixed authenticated cancellation
+travels on original links, with no replacement connection or partial release.
+
+`Im3RoundRunner::run_round` supplies scoped `Im3RoundPorts`; external callers
+cannot directly construct the raw original relay owners. Durable sequence
+claims precede dispatch, and terminal state fences subsequent rounds. Completion
+means the original B release and cleanup completed, not node settlement.
+Independent pin retention, trustworthy clocks, worker containment and actual
+peer closure remain external obligations; Rust ownership alone proves none of
+them. The IM3 experimental schedule has its own bounded round window and uses
+the original two-CPU-second native budget, not a renewed proof-time lease.
+
+See [IM3 implementation and limits](docs/IM3_EXPERIMENTAL_V1.md) for the source
+map, omitted private controllers and separate evidence scopes. This change
+does not activate a wallet network, alter consensus/payment bytes or change
+the public testnet/mining defaults.
 
 ## Source and verification boundaries
 

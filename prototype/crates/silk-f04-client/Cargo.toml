@@ -7,6 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[[example]]
+name = "aip2-client-dispatch-lab"
+required-features = ["r2-functional-lab"]
+
+[features]
+default = []
+# Explicitly unqualified one-client worker/transport experiment; never activation.
+r2-functional-lab = ["silk-f04-relay/aip2-preparation", "silk-f04-relay/functional-lab"]
+
 [dependencies]
 silk-f04-wallet = { path = "../silk-f04-wallet", features = ["local-node"] }
 silk-f04-relay = { path = "../silk-f04-relay" }
@@ -15,6 +24,9 @@ silk-sapling-f04 = { path = "../silk-sapling-f04" }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "chacha", "x25519"] }
+serde_json.workspace = true
+rustix = { version = "=1.1.4", features = ["fs", "time"] }
 sha2.workspace = true
 silk-local-platform = { path = "../silk-local-platform" }
 ed25519-dalek = "=2.2.0"

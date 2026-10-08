@@ -7,6 +7,21 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[[example]]
+name = "f04-relay-lab"
+path = "examples/live_lab/main.rs"
+required-features = ["functional-lab"]
+
+[[example]]
+name = "aip2-r2-integration"
+path = "examples/aip2_r2_integration.rs"
+required-features = ["aip2-preparation"]
+
+[[example]]
+name = "aip2-r2-timed-lab"
+path = "examples/aip2_r2_timed_lab.rs"
+required-features = ["aip2-preparation", "functional-lab"]
+
 [features]
 default = []
 # Strict profile/proof preparation; runtime also requires functional-lab.

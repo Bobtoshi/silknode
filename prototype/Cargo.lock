@@ -1655,9 +1655,12 @@ name = "silk-f04-client"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hpke",
  "rand_core 0.6.4",
+ "rustix",
  "rustls",
  "sapling-crypto",
+ "serde_json",
  "sha2 0.10.9",
  "silk-f04-node",
  "silk-f04-relay",

@@ -29,6 +29,33 @@ pub struct PreparedR2Context<'a> {
     pub(crate) round: RoundContext<'a>,
     profile: &'a PreparedProfile,
 }
+
+// One immutable, locally validated input binding. Unlike a public C/M/P tuple,
+// this owner cannot be constructed without checking the exact profile/root/VK.
+// Reborrowing it avoids recomputing all 31 Poseidon nodes on every socket poll.
+// It confers no proof, admission, clock, staging or release authority.
+#[cfg(feature = "functional-lab")]
+pub(crate) struct PreparedR2InputContext<'a> {
+    round: std::rc::Rc<crate::owner::ManifestRound>,
+    profile: &'a PreparedProfile,
+}
+#[cfg(feature = "functional-lab")]
+impl<'a> PreparedR2InputContext<'a> {
+    pub(crate) fn new(
+        round: std::rc::Rc<crate::owner::ManifestRound>,
+        profile: &'a PreparedProfile,
+        vk_hash: Digest,
+    ) -> Result<Self> {
+        let _ = PreparedR2Context::new(&round.config, round.manifest(), profile, vk_hash)?;
+        Ok(Self { round, profile })
+    }
+    pub(crate) fn context(&self) -> Result<PreparedR2Context<'_>> {
+        Ok(PreparedR2Context {
+            round: RoundContext::new(&self.round.config, self.round.manifest())?,
+            profile: self.profile,
+        })
+    }
+}
 impl<'a> PreparedR2Context<'a> {
     /// Recheck P against actual signature-checked configuration and role keys.
     /// `vk_hash` is a local byte pin, not a ceremony acceptance certificate.
@@ -82,7 +109,7 @@ impl<'a> PreparedR2Context<'a> {
         )
         .map_err(|_| Error::Invalid("R2 statement context"))
     }
-    fn check_cell(&self, cell: &[u8; 4096]) -> Result<Digest> {
+    pub(crate) fn check_cell(&self, cell: &[u8; 4096]) -> Result<Digest> {
         let s = self.statement()?;
         if cell[..8] != s.cell()[..8]
             || cell[8] > 1
@@ -126,7 +153,7 @@ impl PreparedR2Frame {
     pub fn bytes(&self) -> &[u8; FRAME_BYTES] {
         &self.0
     }
-    fn encapsulation(&self) -> Digest {
+    pub(crate) fn encapsulation(&self) -> Digest {
         self.0[64..96].try_into().expect("32")
     }
 }
@@ -228,6 +255,34 @@ pub fn open_a(
     let mut bytes = [0; FRAME_BYTES];
     bytes[..4208].copy_from_slice(&plain[..4208]);
     PreparedR2Frame::decode(&bytes, c, 2)
+}
+/// Test-only adversarial observation: a colluding B can identify and open the
+/// exact inner encapsulation that A observed for one source. This deliberately
+/// does not expose plaintext or a production API; it exists to keep the
+/// source-to-payment counterexample executable against genuine lab artefacts.
+#[cfg(test)]
+pub(crate) fn colluding_b_observation(
+    c: &PreparedR2Context<'_>,
+    key: &HpkePrivate,
+    frame: &PreparedR2Frame,
+) -> Result<(u8, Digest)> {
+    PreparedR2Frame::decode(frame.bytes(), c, 2)?;
+    let plain = open(
+        c,
+        &frame.bytes()[..64],
+        &c.round.config.hpke_keys()[1],
+        key,
+        &frame.bytes()[64..4208],
+    )?;
+    let cell: &[u8; 4096] = plain
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Invalid("R2 B plaintext length"))?;
+    let _ = c.check_cell(cell)?;
+    Ok((
+        cell[8],
+        domain_hash("SilkNode-AIP2R2-observed-envelope", &[&cell[416..3206]]),
+    ))
 }
 /// Only a full, duplicate-free actual stage2 array can be shuffled at A.
 pub fn permute_at_a(c: &PreparedR2Context<'_>, frames: &mut [PreparedR2Frame; 32]) -> Result<()> {

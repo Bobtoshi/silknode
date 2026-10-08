@@ -67,6 +67,19 @@ mod platform {
         /// # Errors
         /// Refuses late/unhealthy timing, a reused schedule, excess rounds or native failure.
         pub fn arm(schedule: &Schedule) -> Result<Self> {
+            Self::arm_until(schedule, schedule.at(30_000_000_000)?)
+        }
+        /// Separate IM3 profile; never called by the legacy driver. The CPU
+        /// allowance remains the same absolute two seconds for the whole cycle.
+        #[cfg(feature = "aip2-preparation")]
+        pub(crate) fn arm_im3(schedule: &Schedule) -> Result<Self> {
+            let end = schedule
+                .at(0)?
+                .checked_add(Duration::from_secs(50))
+                .ok_or(Error::Unavailable("IM3 native wall representation"))?;
+            Self::arm_until(schedule, end)
+        }
+        fn arm_until(schedule: &Schedule, wall_deadline: Instant) -> Result<Self> {
             schedule.clock_healthy()?;
             schedule.completed_before(-10_000_000_000)?;
             if schedule.budget_claimed.replace(true) {
@@ -78,7 +91,6 @@ mod platform {
             // Reading native monotonic BEFORE Instant gives a conservative
             // mapping, not a fresh allowance at each later phase or poll.
             let native = clock(rustix::time::ClockId::Monotonic)?;
-            let wall_deadline = schedule.at(30_000_000_000)?;
             let remaining = wall_deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(Error::Unavailable("relay round already expired"))?;
@@ -221,6 +233,10 @@ mod platform {
             Err(crate::Error::Unavailable(
                 "native relay round guard unsupported",
             ))
+        }
+        #[cfg(feature = "aip2-preparation")]
+        pub(crate) fn arm_im3(schedule: &Schedule) -> Result<Self> {
+            Self::arm(schedule)
         }
         /// # Errors
         /// No qualified guard can be obtained on this platform.

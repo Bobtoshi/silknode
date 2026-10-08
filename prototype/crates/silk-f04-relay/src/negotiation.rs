@@ -122,6 +122,25 @@ impl<'a> SelectedCut<'a> {
         }
         Ok(manifest)
     }
+    /// Admit the same exact locally selected cut under the separate IM3 round
+    /// mapping. No clock, proof, custody or execution authority is inferred.
+    #[cfg(feature = "aip2-preparation")]
+    pub fn admit_im3_signed(
+        &self,
+        bytes: &[u8],
+        config: &SignedConfig,
+        schedule: &crate::im3_schedule::Im3Schedule,
+    ) -> Result<SignedManifest> {
+        if self.config != config.id() {
+            return Err(Error::Invalid("selected cut configuration"));
+        }
+        crate::manifest::check_body(&self.body, config, schedule.round())?;
+        let manifest = SignedManifest::verify(bytes, config, schedule.round())?;
+        if manifest.bytes()[..128] != self.body {
+            return Err(Error::Invalid("received manifest/local cut mismatch"));
+        }
+        Ok(manifest)
+    }
 }
 impl SelectedCut<'static> {
     /// Retain an immutable READY node owner through asynchronous negotiation.

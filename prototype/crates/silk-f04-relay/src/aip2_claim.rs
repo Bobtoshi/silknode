@@ -28,6 +28,22 @@ pub type ClaimResult<T> = std::result::Result<T, ClaimError>;
 pub enum ClaimRole {
     Client = 1,
     Exit = 2,
+    /// Independently selected IM3 complete-batch disclosure owner.
+    Middle = 3,
+    /// Separate IM3 A terminal authorization fence; existing role bytes stay fixed.
+    Im3Authorization = 4,
+    /// Separate IM3 B irreversible release fence; never a recovered key permit.
+    Im3Release = 5,
+    /// First producer's one-shot IM3 receive/handoff scope.
+    Im3Producer0 = 6,
+    /// Second producer's one-shot IM3 receive/handoff scope.
+    Im3Producer1 = 7,
+    /// Third producer's one-shot IM3 receive/handoff scope.
+    Im3Producer2 = 8,
+    /// One-shot A pre-round Q/M fanout, separate from later authorization.
+    Im3Ingress = 9,
+    /// Default-off IM3 round-sequence fence; not a wire or settlement role.
+    Im3Sequence = 10,
 }
 
 /// Structurally bound preparation inputs. These are NOT an accepted/co-signed P.
@@ -93,6 +109,51 @@ pub struct ConsumedScope<'a, P: ClaimPinRetention> {
     message: [u8; 32],
 }
 impl<P: ClaimPinRetention> ConsumedScope<'_, P> {
+    /// Persist irreversible middle disclosure before an output capability exists.
+    /// Reopen never resumes this round or reconstructs its permutation.
+    pub(crate) fn decide_disclosure(&mut self, output: [u8; 32]) -> ClaimResult<()> {
+        if self.binding().role != ClaimRole::Middle
+            || self._owner.failed
+            || self._owner.bytes[10] != 0
+            || output == [0; 32]
+        {
+            return Err(ClaimError::Unavailable("middle disclosure state"));
+        }
+        self._owner.failed = true;
+        inventory(&self._owner.directory, true)?;
+        let mut actual = [0; BYTES];
+        existing(&self._owner.directory, "CURRENT", BYTES as u64)?.read_exact(&mut actual)?;
+        if actual != self._owner.bytes || digest(&actual) != self._owner.pin {
+            return Err(ClaimError::Unavailable("middle disclosure continuity"));
+        }
+        let mut next = actual;
+        next[10] = 1;
+        next[256..288].copy_from_slice(&output);
+        self._owner.publish(next, true)
+    }
+    /// Persist one terminal sequence outcome before a live owner can start a
+    /// later round. An interrupted status remains nonterminal and is skipped
+    /// only after a trusted cold restart; no worker or link resumes.
+    pub(crate) fn finish_im3_sequence(&mut self, terminal: [u8; 32]) -> ClaimResult<()> {
+        if self.binding().role != ClaimRole::Im3Sequence
+            || self._owner.failed
+            || self._owner.bytes[10] != 0
+            || terminal == [0; 32]
+        {
+            return Err(ClaimError::Unavailable("IM3 sequence terminal state"));
+        }
+        self._owner.failed = true;
+        inventory(&self._owner.directory, true)?;
+        let mut actual = [0; BYTES];
+        existing(&self._owner.directory, "CURRENT", BYTES as u64)?.read_exact(&mut actual)?;
+        if actual != self._owner.bytes || digest(&actual) != self._owner.pin {
+            return Err(ClaimError::Unavailable("IM3 sequence continuity"));
+        }
+        let mut next = actual;
+        next[10] = 1;
+        next[256..288].copy_from_slice(&terminal);
+        self._owner.publish(next, true)
+    }
     pub(crate) fn binding(&self) -> PreparedClaimBinding {
         self._owner.binding
     }
@@ -111,6 +172,11 @@ impl<P: ClaimPinRetention> ConsumedScope<'_, P> {
 }
 
 impl<P: ClaimPinRetention> PreparedScopeStore<P> {
+    /// Original structural binding for local owner linkage, not profile approval
+    /// or permission to restart/dispatch an already consumed round.
+    pub const fn binding(&self) -> PreparedClaimBinding {
+        self.binding
+    }
     /// Create only in a new empty owned0700 directory. This selects no profile
     /// or runtime. Publication and external pin retention finish before return.
     pub fn create(path: &Path, binding: PreparedClaimBinding, pins: P) -> ClaimResult<Self> {
@@ -160,6 +226,14 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
         let mut bytes = [0; BYTES];
         current.read_exact(&mut bytes)?;
         check_bytes(&bytes, binding)?;
+        if binding.role == ClaimRole::Im3Sequence
+            && bytes[9] == 1
+            && trusted_restart_round < round(&bytes)
+        {
+            return Err(ClaimError::Unavailable(
+                "IM3 trusted restart before last round",
+            ));
+        }
         let pin = digest(&bytes);
         if pin != expected_pin || expected_pin == [0; 32] {
             return Err(ClaimError::Unavailable("latest independently retained pin"));
@@ -215,6 +289,10 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
             || selected_round >= first + 2880
             || manifest == [0; 32]
             || (self.bytes[9] == 1 && selected_round <= round(&self.bytes))
+            || (self.binding.role == ClaimRole::Im3Sequence
+                && self.bytes[9] == 1
+                && self.bytes[10] == 0
+                && self.floor <= round(&self.bytes) + 1)
         {
             return Err(ClaimError::Unavailable("consumed or foreign scope"));
         }
@@ -228,6 +306,8 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
         }
         let mut next = self.bytes;
         next[9] = 1;
+        next[10] = 0;
+        next[256..288].fill(0);
         next[152..160].copy_from_slice(&selected_round.to_le_bytes());
         next[160..192].copy_from_slice(&manifest);
         next[192..224].copy_from_slice(&message);
@@ -245,7 +325,7 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
         self.failed = true;
         #[cfg(test)]
         if replace {
-            crash_checkpoint("before_stage");
+            publication_checkpoint("before_stage", next[10] == 1);
         }
         let free = rustix::fs::fstatvfs(&self.directory).map_err(std::io::Error::from)?;
         if !free
@@ -259,12 +339,12 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
         stage.write_all(&next)?;
         #[cfg(test)]
         if replace {
-            crash_checkpoint("snapshot_written");
+            publication_checkpoint("snapshot_written", next[10] == 1);
         }
         stage.sync_all()?;
         #[cfg(test)]
         if replace {
-            crash_checkpoint("snapshot_fsynced");
+            publication_checkpoint("snapshot_fsynced", next[10] == 1);
         }
         if replace {
             rustix::fs::renameat(&self.directory, "STAGE", &self.directory, "CURRENT")
@@ -281,19 +361,19 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
         }
         #[cfg(test)]
         if replace {
-            crash_checkpoint("snapshot_renamed");
+            publication_checkpoint("snapshot_renamed", next[10] == 1);
         }
         self.directory.sync_all()?;
         #[cfg(test)]
         if replace {
-            crash_checkpoint("directory_fsynced");
+            publication_checkpoint("directory_fsynced", next[10] == 1);
         }
         self.bytes = next;
         self.pin = digest(&next);
         self.pins.retain_claim_pin(self.pin)?;
         #[cfg(test)]
         if replace {
-            crash_checkpoint("pin_retained");
+            publication_checkpoint("pin_retained", next[10] == 1);
         }
         self.failed = false;
         Ok(())
@@ -301,6 +381,17 @@ impl<P: ClaimPinRetention> PreparedScopeStore<P> {
 }
 
 // Native child-only fault boundary. Absent from every non-test build.
+#[cfg(test)]
+fn publication_checkpoint(label: &str, disclosure: bool) {
+    crash_checkpoint(label);
+    if disclosure && std::env::var("SILK_IM3_CRASH_POINT").ok().as_deref() == Some(label) {
+        println!("SCOPE_CHECKPOINT {label}");
+        let _ = std::io::stdout().flush();
+        loop {
+            std::thread::park();
+        }
+    }
+}
 #[cfg(test)]
 pub(crate) fn crash_checkpoint(label: &str) {
     if std::env::var("SILKNODE_SCOPE_CRASH_POINT").ok().as_deref() == Some(label) {
@@ -338,14 +429,20 @@ fn check_bytes(bytes: &[u8; BYTES], binding: PreparedClaimBinding) -> ClaimResul
     if &bytes[..8] != b"SNAICL02"
         || bytes[8] != binding.role as u8
         || bytes[9] > 1
-        || bytes[10..16] != [0; 6]
+        || bytes[10] > 1
+        || bytes[11..16] != [0; 5]
         || bytes[16..48] != binding.domain
         || bytes[48..80] != binding.config
         || bytes[80..112] != binding.profile
         || bytes[112..144] != binding.vk_hash
         || bytes[144..148] != binding.epoch.to_le_bytes()
         || bytes[148..152] != [0; 4]
-        || bytes[256..].iter().any(|b| *b != 0)
+        || bytes[288..].iter().any(|b| *b != 0)
+        || (bytes[10] == 0 && bytes[256..288] != [0; 32])
+        || (bytes[10] == 1
+            && (!matches!(binding.role, ClaimRole::Middle | ClaimRole::Im3Sequence)
+                || bytes[9] != 1
+                || bytes[256..288] == [0; 32]))
         || (bytes[9] == 0 && bytes[152..256].iter().any(|b| *b != 0))
         || (bytes[9] == 1
             && (round(bytes) < first

@@ -153,6 +153,24 @@ struct Incoming {
     size: RecordSize,
 }
 
+/// Observation around an actual nonblocking socket step. The interval bounds
+/// the local syscall/validation; it is not a packet timestamp or UTC qualification.
+#[cfg(feature = "aip2-preparation")]
+pub struct WireObservation {
+    /// Original established connection identity.
+    pub connection: u64,
+    /// Monotonic time immediately before the step.
+    pub started: Instant,
+    /// Monotonic time immediately after the step.
+    pub completed: Instant,
+    /// Actual wire bytes transferred, including progress before a later failure.
+    pub bytes: usize,
+    /// Whole selected record completed locally.
+    pub record_complete: bool,
+    /// Step failed, including EOF, deadline or authentication failure.
+    pub failed: bool,
+}
+
 /// One established pinned connection, one pending transmit and one pending read.
 ///
 /// No source queues, reconnection, retries, TLS resumption or post-handshake
@@ -172,6 +190,20 @@ pub struct Transport {
     setup_quota: Option<crate::resources::SetupPermit>,
 }
 impl Transport {
+    // Deterministic partial-TCP fixture hook, absent from production builds.
+    #[cfg(test)]
+    pub(crate) fn write_prefix_for_test(&mut self, limit: usize) -> Result<usize> {
+        self.ready()?;
+        let pending = self
+            .transmit
+            .as_mut()
+            .ok_or(Error::Unavailable("fixture no selected record"))?;
+        remaining(pending.deadline)?;
+        let end = pending.offset.saturating_add(limit).min(pending.used);
+        let n = self.socket.write(&pending.bytes[pending.offset..end])?;
+        pending.offset += n;
+        Ok(n)
+    }
     /// Complete setup with CA/IP/time AND exact endpoint SPKI authentication.
     /// Wallet clients never send client certificates. Application role signatures
     /// and token admission remain required; this is not client identity evidence.
@@ -284,7 +316,11 @@ impl Transport {
     pub(crate) const fn id(&self) -> u64 {
         self.id
     }
-    pub(crate) fn check_endpoint(&self, endpoint: Endpoint, client: bool) -> Result<()> {
+    /// Check an established connection's original pinned endpoint and direction.
+    /// This authenticates neither application enrollment nor clock qualification.
+    /// # Errors
+    /// Refuses a different endpoint/direction or a quarantined connection.
+    pub fn check_endpoint(&self, endpoint: Endpoint, client: bool) -> Result<()> {
         if self.endpoint != endpoint || self.client != client {
             return Err(Error::Unavailable("TLS role endpoint binding"));
         }
@@ -352,6 +388,50 @@ impl Transport {
         }
         self.failed = false;
         Ok(complete)
+    }
+    /// Observe socket progress, including partial writes and failures. Queueing
+    /// never produces this observation and is not represented as transmission.
+    #[cfg(feature = "aip2-preparation")]
+    pub fn write_step_observed(&mut self) -> (Result<bool>, WireObservation) {
+        let started = Instant::now();
+        let before = self.transmit.as_ref().map(|p| (p.offset, p.used));
+        let result = self.write_step();
+        let bytes = before.map_or(0, |(old, used)| {
+            self.transmit
+                .as_ref()
+                .map_or(used - old, |p| p.offset.saturating_sub(old))
+        });
+        let observation = WireObservation {
+            connection: self.id,
+            started,
+            completed: Instant::now(),
+            bytes,
+            record_complete: matches!(result, Ok(true)),
+            failed: result.is_err(),
+        };
+        (result, observation)
+    }
+    /// Observe actual reads and their completion/authentication outcome. A read
+    /// may transfer bytes and still fail; both facts remain in this observation.
+    #[cfg(feature = "aip2-preparation")]
+    pub fn read_step_observed(&mut self) -> (Result<Option<Zeroizing<Vec<u8>>>>, WireObservation) {
+        let started = Instant::now();
+        let before = self.receive.as_ref().map(|r| (r.wire.offset, r.wire.used));
+        let result = self.read_step();
+        let bytes = before.map_or(0, |(old, used)| {
+            self.receive
+                .as_ref()
+                .map_or(used - old, |r| r.wire.offset.saturating_sub(old))
+        });
+        let observation = WireObservation {
+            connection: self.id,
+            started,
+            completed: Instant::now(),
+            bytes,
+            record_complete: matches!(result, Ok(Some(_))),
+            failed: result.is_err(),
+        };
+        (result, observation)
     }
     /// Select one expected record for this scheduled slot, before reading its bytes.
     /// # Errors

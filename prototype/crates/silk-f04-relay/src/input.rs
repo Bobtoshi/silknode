@@ -11,6 +11,8 @@ use crate::{
 };
 use std::{collections::BTreeSet, rc::Rc, time::Instant};
 mod failed;
+#[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+pub mod r2_lab;
 mod strict;
 #[cfg(test)]
 mod tests;

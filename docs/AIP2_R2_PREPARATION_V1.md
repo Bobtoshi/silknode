@@ -1,5 +1,11 @@
 # Optional exact-cohort R2 preparation
 
+This document records the earlier R2 preparation milestone. Later source adds
+original-input collection, a one-client dispatch experiment and the separate
+[three-relay IM3 slice](IM3_EXPERIMENTAL_V1.md). The test counts below belong to
+the earlier exact candidate, not the current public export. R2 collusion remains
+a known counterexample; IM3 is not an activation or security acceptance of R2.
+
 This candidate adds inspectable Rust preparation components, not an operational
 anonymous network. No production profile, accepted setup, qualified clock or
 delivery bound is bundled. Defaults, payment/consensus bytes and the public

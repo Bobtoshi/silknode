@@ -21,7 +21,11 @@ mod enrollment;
 pub use enrollment::{EnrollmentProgressV1, EnrollmentV1};
 mod lifecycle;
 pub use lifecycle::ProcessV1;
+#[cfg(feature = "r2-functional-lab")]
+pub mod im3_lab;
 pub mod preparation;
+#[cfg(feature = "r2-functional-lab")]
+pub mod r2_lab;
 pub mod session;
 
 /// Immutable local authority retained through one attempt. No peer cut or

@@ -109,6 +109,44 @@ impl SourceBatch {
     }
 }
 impl SourceRound {
+    /// Consume actual full32 R2 collection provenance, not a precomputed frame
+    /// array/count. Retains the SAME original whole-round lease. Lab only: this
+    /// grants no independent-population, proof-validity or operational admission.
+    /// # Errors
+    /// Refuses a missed seal window, poisoned original lease or wrong B endpoint.
+    #[cfg(all(feature = "aip2-preparation", feature = "functional-lab"))]
+    pub fn from_collected_r2_lab(
+        collected: crate::input::r2_lab::CollectedR2Lab,
+        transport: &Transport,
+    ) -> Result<Self> {
+        let (round, frames, id, guard, completion) = collected.into_bound();
+        if round.schedule.uses_qualified_source() || !guard.matches_schedule(&round.schedule) {
+            return Err(Error::Unavailable(
+                "R2 collected original unqualified lease",
+            ));
+        }
+        guard.check()?;
+        round.schedule.in_window(9_500_000_000, 10_000_000_000)?;
+        round.schedule.clock_healthy()?;
+        transport.check_endpoint(round.config.endpoints()[Role::B as usize], true)?;
+        round.schedule.completed_before(10_000_000_000)?;
+        Ok(Self {
+            round,
+            batch: SourceBatch::R2Lab { frames, id, guard },
+            ready: None,
+            b_ready: None,
+            acks: std::array::from_fn(|_| None),
+            authorization: None,
+            prepared: None,
+            phase: Phase::Cells(0),
+            failed_phase: None,
+            writer: WriteSlot::default(),
+            reader: ReadSlot::default(),
+            health_failed: false,
+            transport_id: transport.id(),
+            _strict_completion: Some(completion),
+        })
+    }
     /// Explicit operator lab: complete precomputed encrypted inputs, not a
     /// strict client collector or a claim of fixed-deadline client proof dispatch.
     /// Requires both default-off features and an original unqualified round lease.
