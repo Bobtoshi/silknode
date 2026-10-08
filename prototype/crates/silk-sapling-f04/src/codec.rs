@@ -103,16 +103,26 @@ impl<'a> EnvelopeView<'a> {
         let bytes: &'a [u8; ENVELOPE_BYTES] = bytes
             .try_into()
             .map_err(|_| Error::Encoding("envelope length"))?;
-        if &bytes[..8] != b"SNPRV003" || bytes[8..12] != [3, 0, 0, 0] {
+        // Evaluate every fixed framing field before selecting an error. Client
+        // preparation also checks zero cover through this parser; short-circuit
+        // checks would otherwise skip all later fields for that kind.
+        let version = fixed_equal(&bytes[..8], b"SNPRV003")
+            & fixed_equal(&bytes[8..12], &[3, 0, 0, 0]);
+        let domain = fixed_equal(&bytes[12..44], expected_domain);
+        let counts = (bytes[84] == 2)
+            & (bytes[277] == 2)
+            & fixed_equal(&bytes[1790..1798], &1_i64.to_le_bytes());
+        let distinct = !fixed_equal(&bytes[117..149], &bytes[213..245]);
+        if !version {
             return Err(Error::Encoding("envelope version/reserved"));
         }
-        if &bytes[12..44] != expected_domain {
+        if !domain {
             return Err(Error::Encoding("envelope context"));
         }
-        if bytes[84] != 2 || bytes[277] != 2 || bytes[1790..1798] != 1_i64.to_le_bytes() {
+        if !counts {
             return Err(Error::Encoding("envelope counts/fee"));
         }
-        if bytes[117..149] == bytes[213..245] {
+        if !distinct {
             return Err(Error::Encoding("equal nullifiers"));
         }
         Ok(Self { bytes })
@@ -142,6 +152,14 @@ impl<'a> EnvelopeView<'a> {
     pub fn anchor(&self) -> Digest {
         field(self.bytes, 1798)
     }
+}
+
+fn fixed_equal(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
 }
 
 /// Framed but not cryptographically verified envelope.

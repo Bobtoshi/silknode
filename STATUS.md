@@ -17,6 +17,22 @@ IM3 interfaces and ignored fixture harnesses are inspectable source, not a
 turnkey anonymous network. Private readiness and fault controllers are excluded.
 No fresh build, test, native run or proof was performed for this export.
 
+## Bounded source corrections
+
+Normal-wallet handoff now advances durably from exposed to `HandoffConsumed`
+and retains new wallet heads before returning one offer. Historical exclusions
+cover both input nullifiers and note commitments across authenticated restart.
+The client driver now destroys preparation authority on recoverable errors and
+retains the original connection in cleanup-only mode to its public boundary or
+detectable peer close. Fixed-size payload scans/copies preserve validation.
+
+The writer reports focused VPS checks; independent acceptance of `934dbed6`
+and `1d8b8931` is bounded source review, not independent runtime replication.
+The curated public package has not been built or executed for this update.
+These corrections do not establish joint timing/deadline privacy, system-wide
+anonymity, malicious-rollback or retransmission guarantees, crash masking or
+release readiness. See [exact scope and API changes](docs/IM3_HANDOFF_CLEANUP_V1.md).
+
 ## Separate completed private demonstrations
 
 These are distinct private, valueless, one-operator experiments. They must not

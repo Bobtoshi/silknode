@@ -27,9 +27,11 @@ use std::{
 };
 use zeroize::Zeroizing;
 mod connect;
+mod cleanup;
 mod profile;
 mod setup;
 pub use connect::{ConnectStep, Connecting};
+pub use cleanup::CleanupOnly;
 pub use profile::{ClientProfile, Listener, ServerProfile};
 pub use setup::{Setup, SetupStep};
 

@@ -80,6 +80,23 @@ batch. Signed readiness, producer acknowledgements, A authorization and B
 release precede ordinary producer offers. Fixed authenticated cancellation
 travels on original links, with no replacement connection or partial release.
 
+The normal-wallet `offer_saved` API now requires an independent durable pin
+retainer. It records `HandoffConsumed` before exporting one `SavedOfferV1`;
+`offer_ready` is a no-export preflight and the old raw export is test-only.
+Authenticated history retains both exposed-input nullifiers and note commitments
+as exclusions, including when recovery changes a note's position/nullifier.
+This is journal issuance control, not protection against a caller copying bytes
+or coordinated rollback of the journal and its independently retained pins.
+
+After a recoverable preparation/worker/verification failure in the enclosing
+client driver, submission authority is destroyed. `Transport::into_cleanup`
+consumes TLS state and record buffers while retaining the same nonblocking
+socket and permits; `CleanupOnly` offers closure polling/finishing, no application
+write or reconnect. The driver retains it to the original T+44 boundary or
+detectable peer close. Early admission/manifest refusals remain separate;
+panic, abandonment and process/host death are not masked. See
+[handoff and cleanup limits](docs/IM3_HANDOFF_CLEANUP_V1.md).
+
 `Im3RoundRunner::run_round` supplies scoped `Im3RoundPorts`; external callers
 cannot directly construct the raw original relay owners. Durable sequence
 claims precede dispatch, and terminal state fences subsequent rounds. Completion

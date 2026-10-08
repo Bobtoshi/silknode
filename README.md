@@ -20,6 +20,13 @@ harness are source components, not an activated anonymous network.
 See [IM3 implementation and limits](docs/IM3_EXPERIMENTAL_V1.md) and
 [research status](STATUS.md).
 
+The latest [wallet handoff and cleanup corrections](docs/IM3_HANDOFF_CLEANUP_V1.md)
+consume one normal-wallet handoff durably before export and retain the original
+connection in cleanup-only mode after recoverable preparation failure. Fixed-size
+payload checks/copies preserve validation; they are not a constant-time or
+system-wide privacy guarantee. Independent acceptance covers bounded source
+review, not independently reproduced execution.
+
 Separate private, valueless demonstrations exercised an ordinary wallet through
 three relays and producers into fresh-node settlement and separate cold wallet
 recovery; a later run exercised two fresh timed clients and three matching

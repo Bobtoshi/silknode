@@ -1,13 +1,13 @@
 //! Explicit private IM3 original-link client experiment, default off. Not epoch
 //! admission, clock qualification, worker containment or an anonymity claim.
-use super::{LocalViewV1, select_payload};
+use super::LocalViewV1;
 use silk_f04_relay::{
     Error, Result,
     aip2_claim::{ClaimPinRetention, ClaimRole, PreparedScopeStore},
     aip2_profile::PreparedProfile,
     aip2_proof::PreparedProofVerifier,
     config::SignedConfig,
-    frame::RoundContext,
+    frame::{Payload, RoundContext},
     im3_gate::{
         ClientProofJob, ClientProofOutput, MiddleContext, MiddleFrame, PreparedClientOwner,
         PreparedQ,
@@ -15,7 +15,7 @@ use silk_f04_relay::{
     im3_schedule::Im3Schedule,
     manifest::SignedManifest,
     negotiation::SelectedCut,
-    tls::{ReceiveProgress, RecordSize, Transport, WireObservation},
+    tls::{CleanupOnly, ReceiveProgress, RecordSize, Transport, WireObservation},
 };
 use silk_f04_wallet::journal::intents::SavedOfferV1;
 use silk_sapling_f04::codec::ENVELOPE_BYTES;
@@ -39,6 +39,7 @@ pub struct OriginalClientLab<'a, P: ClaimPinRetention> {
     reading: bool,
     failed: bool,
     observation: Option<WireObservation>,
+    cleanup_at: Instant,
 }
 impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
     /// Consume an ordinary already-exposed wallet offer before T-8. Local
@@ -100,6 +101,7 @@ impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
             let _ = link.quarantine();
             return Err(e);
         }
+        let cleanup_at = schedule.at(44_000_000_000)?;
         Ok(Self {
             config,
             schedule,
@@ -115,6 +117,7 @@ impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
             reading: false,
             failed: false,
             observation: None,
+            cleanup_at,
         })
     }
     fn stop(&mut self) {
@@ -187,14 +190,29 @@ impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
     }
     /// Run the entire borrowed context in one scope, so M stays alive without
     /// self-references/unsafe. The closure cannot return or resume this stream.
-    /// Any early return/drop closes the original link; no replacement is allowed.
+    /// A recoverable preparation/worker error destroys submission authority and
+    /// drives the original socket's cleanup before returning that error. The
+    /// driver remains on this thread; panic/process death is outside this rule.
     pub fn run<T>(
         mut self,
         drive: impl for<'r> FnOnce(&mut ClientStreamLab<'r, P>) -> Result<T>,
     ) -> Result<T> {
+        let result = self.run_inner(drive);
+        if result.is_err() {
+            self.offer = None;
+            self.store = None;
+            if let Some(link) = self.link.take() {
+                link.into_cleanup(self.cleanup_at).finish();
+            }
+        }
+        result
+    }
+    fn run_inner<T>(
+        &mut self,
+        drive: impl for<'r> FnOnce(&mut ClientStreamLab<'r, P>) -> Result<T>,
+    ) -> Result<T> {
         self.schedule.observe_functional_clock()?;
         if self.failed || self.manifest.is_none() {
-            self.stop();
             return Err(Error::Unavailable("IM3 no original manifest"));
         }
         let manifest = self
@@ -208,11 +226,10 @@ impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
             self.profile.claim_binding(ClaimRole::Client).vk_hash,
             self.q,
         )?;
-        let payload = select_payload(
+        let payload = Payload::client_choice(
             self.offer.take(),
-            self.config.domain(),
             &RoundContext::new(&self.config, manifest)?,
-        );
+        )?;
         let cut = selected_cut(&self.view, &self.config, manifest)?;
         let owner = PreparedClientOwner::admit(
             &context,
@@ -227,10 +244,13 @@ impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
         let mut stream = ClientStreamLab {
             owner: Some(owner),
             schedule: &self.schedule,
-            link: self
-                .link
-                .take()
-                .ok_or(Error::Unavailable("IM3 client original link"))?,
+            link: Some(
+                self.link
+                    .take()
+                    .ok_or(Error::Unavailable("IM3 client original link"))?,
+            ),
+            cleanup: None,
+            cleanup_at: self.cleanup_at,
             slot: self.slot,
             frame: None,
             queued: false,
@@ -239,9 +259,18 @@ impl<'a, P: ClaimPinRetention> OriginalClientLab<'a, P> {
             failed: false,
             observation: None,
         };
-        let result = drive(&mut stream);
-        if result.is_ok() && !stream.cleaned_up {
-            return Err(Error::Unavailable("IM3 original client cleanup incomplete"));
+        let result = match drive(&mut stream) {
+            Ok(_) if !stream.cleaned_up || stream.failed => {
+                Err(Error::Unavailable("IM3 original client cleanup incomplete"))
+            }
+            result => result,
+        };
+        if result.is_err() {
+            stream.stop();
+            if let Some(cleanup) = &mut stream.cleanup {
+                cleanup.finish();
+            }
+            stream.cleaned_up = true;
         }
         result
     }
@@ -277,7 +306,9 @@ fn selected_cut(
 pub struct ClientStreamLab<'r, P: ClaimPinRetention> {
     owner: Option<PreparedClientOwner<'r, 'r, 'r, P>>,
     schedule: &'r Im3Schedule,
-    link: Transport,
+    link: Option<Transport>,
+    cleanup: Option<CleanupOnly>,
+    cleanup_at: Instant,
     slot: u8,
     frame: Option<MiddleFrame>,
     queued: bool,
@@ -291,7 +322,9 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
         self.failed = true;
         self.owner = None;
         self.frame = None;
-        let _ = self.link.quarantine();
+        if let Some(link) = self.link.take() {
+            self.cleanup = Some(link.into_cleanup(self.cleanup_at));
+        }
     }
     fn operation<T>(
         &mut self,
@@ -299,7 +332,13 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
     ) -> Result<T> {
         let result = (|| {
             self.schedule.observe_functional_clock()?;
-            if self.failed || self.link.has_extra_bytes()? {
+            if self.failed
+                || self
+                    .link
+                    .as_ref()
+                    .ok_or(Error::Unavailable("IM3 cleanup-only client"))?
+                    .has_extra_bytes()?
+            {
                 return Err(Error::Unavailable("IM3 client closed/extra input"));
             }
             let value = f(self
@@ -371,7 +410,11 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
             return Err(Error::Unavailable("IM3 client write closed"));
         }
         self.schedule.observe_functional_clock()?;
-        if self.link.has_extra_bytes()? {
+        let link = self
+            .link
+            .as_mut()
+            .ok_or(Error::Unavailable("IM3 cleanup-only client"))?;
+        if link.has_extra_bytes()? {
             return Err(Error::Invalid("IM3 extra client input"));
         }
         if self.complete {
@@ -391,9 +434,9 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
                 .take()
                 .ok_or(Error::Unavailable("IM3 no prepared onion"))?;
             self.queued = true;
-            self.link.queue(RecordSize::Cell, frame.bytes(), end)?;
+            link.queue(RecordSize::Cell, frame.bytes(), end)?;
         }
-        let (result, observation) = self.link.write_step_observed();
+        let (result, observation) = link.write_step_observed();
         self.observation = Some(observation);
         if result? {
             self.schedule.check_client_clock()?;
@@ -424,16 +467,20 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
             return Err(Error::Invalid("IM3 test omission state"));
         }
         self.schedule.observe_functional_clock()?;
+        let link = self
+            .link
+            .as_mut()
+            .ok_or(Error::Unavailable("IM3 cleanup-only client"))?;
         if Instant::now() >= self.schedule.at(44_000_000_000)? {
-            self.link.quarantine()?;
+            link.quarantine()?;
             self.cleaned_up = true;
             return Ok(Some("HELD_TO_T44"));
         }
-        match self.link.has_extra_bytes() {
+        match link.has_extra_bytes() {
             Ok(false) => Ok(None),
             Ok(true) => Err(Error::Invalid("IM3 test omission inbound bytes")),
             Err(Error::Unavailable("TLS peer closed")) => {
-                let _ = self.link.quarantine();
+                let _ = link.quarantine();
                 self.cleaned_up = true;
                 Ok(Some("PEER_CLOSED"))
             }
@@ -443,7 +490,7 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
                     | std::io::ErrorKind::UnexpectedEof
                     | std::io::ErrorKind::NotConnected) =>
             {
-                let _ = self.link.quarantine();
+                let _ = link.quarantine();
                 self.cleaned_up = true;
                 Ok(Some("PEER_IO_CLOSED"))
             }
@@ -462,12 +509,16 @@ impl<'r, P: ClaimPinRetention> ClientStreamLab<'r, P> {
                 return Ok(true);
             }
             self.schedule.observe_functional_clock()?;
+            let link = self
+                .link
+                .as_mut()
+                .ok_or(Error::Unavailable("IM3 cleanup-only client"))?;
             if Instant::now() >= self.schedule.at(44_000_000_000)? {
-                self.link.quarantine()?;
+                link.quarantine()?;
                 self.cleaned_up = true;
                 return Ok(true);
             }
-            if self.link.has_extra_bytes()? {
+            if link.has_extra_bytes()? {
                 return Err(Error::Invalid("IM3 extra input during hold"));
             }
             Ok(false)

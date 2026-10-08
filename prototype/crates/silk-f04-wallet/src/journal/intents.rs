@@ -30,6 +30,22 @@ impl SavedOfferV1 {
     }
 }
 
+/// Independent durable retention of the new payment pin before any IM3 offer
+/// leaves the wallet. A failed or uncertain retention consumes the handoff but
+/// returns no offer; it must never be interpreted as permission to retry.
+pub trait IntentPinRetention {
+    /// Retain both wallet heads outside the journal before returning success.
+    /// # Errors
+    /// An uncertain or failed write must return an error and withhold the offer.
+    fn retain_intent_pin(&mut self, receipt: &IntentReceipt) -> Result<()>;
+}
+
+impl<F: FnMut(&IntentReceipt) -> Result<()>> IntentPinRetention for F {
+    fn retain_intent_pin(&mut self, receipt: &IntentReceipt) -> Result<()> {
+        self(receipt)
+    }
+}
+
 /// Opt-in adapter over one locally verified ready node, inside the trusted wallet.
 ///
 #[cfg(feature = "local-node")]
@@ -44,6 +60,9 @@ pub enum IntentStatus {
     Reserved,
     /// Exact signed bytes committed before possible export. Never reset on failure.
     MayHaveEscaped,
+    /// One transport handoff of this linkable payment has been consumed.
+    /// No cancellation, later-round/profile export or re-proof is permitted.
+    HandoffConsumed,
     /// Explicitly cancelled before any signed-envelope export was possible.
     CancelledBeforeRelease,
 }
@@ -54,6 +73,7 @@ impl IntentStatus {
             Self::Reserved => 1,
             Self::MayHaveEscaped => 2,
             Self::CancelledBeforeRelease => 3,
+            Self::HandoffConsumed => 4,
         }
     }
 }
@@ -128,6 +148,7 @@ pub struct IntentJournal<'journal, 'key> {
     sequence: u64,
     state: State,
     exposed: std::collections::BTreeMap<Digest, InputRef>,
+    exposed_cmu: std::collections::BTreeSet<Digest>,
 }
 impl<'key> Journal<'key> {
     /// Create a new address AND empty payment journal before returning either pin.
@@ -147,6 +168,7 @@ impl<'key> Journal<'key> {
             head: [0; 32],
             sequence: 0,
             exposed: std::collections::BTreeMap::new(),
+            exposed_cmu: std::collections::BTreeSet::new(),
             state: State {
                 status: IntentStatus::Empty,
                 plan: None,
@@ -178,6 +200,7 @@ impl<'key> Journal<'key> {
             sequence: audited.sequence,
             state: audited.state,
             exposed: audited.exposed,
+            exposed_cmu: audited.exposed_cmu,
         })
     }
 }
@@ -242,7 +265,10 @@ impl IntentJournal<'_, '_> {
     ) -> Result<IntentReceipt> {
         self.current()?;
         let permitted = if distinct {
-            self.state.status == IntentStatus::MayHaveEscaped
+            matches!(
+                self.state.status,
+                IntentStatus::MayHaveEscaped | IntentStatus::HandoffConsumed
+            )
         } else {
             matches!(
                 self.state.status,
@@ -257,7 +283,9 @@ impl IntentJournal<'_, '_> {
         let refs = selected(self.journal.key, context, inputs)?;
         if refs
             .iter()
-            .any(|input| self.exposed.contains_key(&input.nf))
+            .any(|input| {
+                self.exposed.contains_key(&input.nf) || self.exposed_cmu.contains(&input.cmu)
+            })
         {
             return Err(Error::Unavailable(
                 "historically exposed input remains reserved",
@@ -348,7 +376,9 @@ impl IntentJournal<'_, '_> {
             || plan
                 .inputs
                 .iter()
-                .any(|input| self.exposed.contains_key(&input.nf))
+                .any(|input| {
+                    self.exposed.contains_key(&input.nf) || self.exposed_cmu.contains(&input.cmu)
+                })
         {
             return Err(Error::Unavailable(
                 "reserved payment inputs/context changed",
@@ -406,11 +436,12 @@ impl IntentJournal<'_, '_> {
         )?;
         self.receipt()
     }
-    /// Explicitly export ONLY the saved exact bytes, after the caller retained
-    /// both receipt pins. This grants no inclusion, retry or transport authority.
+    /// Test-only raw bytes for existing genuine node/settlement fixtures. The
+    /// normal client cannot bypass the consuming `SavedOfferV1` path with this.
     /// # Errors
     /// Refuses stale receipts, uncertain storage or an unprepared intent.
-    pub fn release_saved_envelope(
+    #[cfg(test)]
+    pub(crate) fn release_saved_envelope(
         &mut self,
         retained_intent_pin: Digest,
     ) -> Result<[u8; ENVELOPE_BYTES]> {
@@ -425,16 +456,40 @@ impl IntentJournal<'_, '_> {
             .ok_or(Error::Authentication)?
             .bytes())
     }
-    /// Explicit one-use modular client export, after independent pin retention.
-    /// A second invocation is a separate caller decision, never a timeout policy.
+    /// Read-only preflight for a pinned, not-yet-handed-off IM3 payment. This
+    /// exports no bytes and does not consume the one permitted handoff.
     /// # Errors
-    /// Applies the same current-pin, durable-exposure and exact-byte checks as
-    /// `release_saved_envelope`; failure leaves reservation/exposure unchanged.
-    pub fn offer_saved(&mut self, retained_intent_pin: Digest) -> Result<SavedOfferV1> {
+    /// Refuses stale pins, uncertain storage, missing signed bytes or a prior
+    /// handoff.
+    pub fn offer_ready(&mut self, retained_intent_pin: Digest) -> Result<()> {
         self.current()?;
         if retained_intent_pin != self.head || self.state.status != IntentStatus::MayHaveEscaped {
             return Err(Error::Unavailable("no pinned exposed payment"));
         }
+        self.state.signed.as_ref().ok_or(Error::Authentication)?;
+        Ok(())
+    }
+    /// Consume the single IM3 handoff before returning transport authority.
+    /// The independent pin retainer must durably save the NEW address/intent
+    /// heads. Failure still consumes the handoff and returns no offer; the
+    /// current receipt can be retained for local settlement recovery only.
+    /// # Errors
+    /// Refuses a second handoff, stale pin or uncertain publication/retention.
+    pub fn offer_saved<P: IntentPinRetention>(
+        &mut self,
+        retained_intent_pin: Digest,
+        retention: &mut P,
+    ) -> Result<SavedOfferV1> {
+        self.offer_ready(retained_intent_pin)?;
+        self.write_state(
+            State {
+                status: IntentStatus::HandoffConsumed,
+                plan: self.state.plan.clone(),
+                signed: self.state.signed.clone(),
+            },
+            false,
+        )?;
+        retention.retain_intent_pin(&self.receipt()?)?;
         let mut bytes = Zeroizing::new([0; ENVELOPE_BYTES]);
         bytes.copy_from_slice(
             self.state
@@ -527,6 +582,7 @@ impl IntentJournal<'_, '_> {
         if state.status == IntentStatus::MayHaveEscaped {
             for input in &state.plan.as_ref().ok_or(Error::Authentication)?.inputs {
                 self.exposed.insert(input.nf, input.clone());
+                self.exposed_cmu.insert(input.cmu);
             }
         }
         self.state = state;
@@ -572,7 +628,11 @@ fn selected(
             value: input.note.value().inner(),
         });
     }
-    if refs.len() == 2 && (refs[0].position == refs[1].position || refs[0].nf == refs[1].nf) {
+    if refs.len() == 2
+        && (refs[0].position == refs[1].position
+            || refs[0].nf == refs[1].nf
+            || refs[0].cmu == refs[1].cmu)
+    {
         return Err(Error::Unavailable("same positioned input selected twice"));
     }
     Ok(refs)
@@ -659,6 +719,7 @@ fn decode(b: &[u8], key: &WalletKey) -> Result<State> {
         1 => IntentStatus::Reserved,
         2 => IntentStatus::MayHaveEscaped,
         3 => IntentStatus::CancelledBeforeRelease,
+        4 => IntentStatus::HandoffConsumed,
         _ => return Err(Error::Authentication),
     };
     if status == IntentStatus::Empty {
@@ -703,7 +764,11 @@ fn decode(b: &[u8], key: &WalletKey) -> Result<State> {
         }
         inputs.push(input);
     }
-    if count == 2 && (inputs[0].position == inputs[1].position || inputs[0].nf == inputs[1].nf) {
+    if count == 2
+        && (inputs[0].position == inputs[1].position
+            || inputs[0].nf == inputs[1].nf
+            || inputs[0].cmu == inputs[1].cmu)
+    {
         return Err(Error::Authentication);
     }
     let plan = Plan {
@@ -745,7 +810,10 @@ fn decode_signed(
     status: IntentStatus,
     plan: &Plan,
 ) -> Result<Option<Envelope>> {
-    if status == IntentStatus::MayHaveEscaped {
+    if matches!(
+        status,
+        IntentStatus::MayHaveEscaped | IntentStatus::HandoffConsumed
+    ) {
         let signed =
             Envelope::decode(&b[590..3380], &key.domain).map_err(|_| Error::Authentication)?;
         if signed.effect_id() != field::<32>(b, 526) || signed.envelope_id() != field::<32>(b, 558)
@@ -1106,31 +1174,136 @@ mod tests {
         )
         .unwrap();
         let mut intents = journal.intents(pin).unwrap();
-        assert!(intents.offer_saved(pin).is_err());
+        let mut retain = |_: &IntentReceipt| Ok(());
+        assert!(intents.offer_saved(pin, &mut retain).is_err());
         let reserved = intents
             .reserve(context, &[copy_input(&selected)], &recipient, 4)
             .unwrap();
-        assert!(intents.offer_saved(reserved.intent_head).is_err());
+        assert!(intents.offer_saved(reserved.intent_head, &mut retain).is_err());
         // Framing-only journal fixture: no proof-generation or acceptance claim.
         let receipt = expose_unverified_journal_fixture(&mut intents);
         let expected = *intents.state.signed.as_ref().unwrap().bytes();
-        assert!(intents.offer_saved(reserved.intent_head).is_err());
+        assert!(intents.offer_saved(reserved.intent_head, &mut retain).is_err());
         let bytes = intents
-            .offer_saved(receipt.intent_head)
+            .offer_saved(receipt.intent_head, &mut retain)
             .unwrap()
             .into_bytes();
         assert_eq!(*bytes, expected);
         drop(bytes);
         assert_eq!(
             intents.receipt().unwrap().status,
-            IntentStatus::MayHaveEscaped
+            IntentStatus::HandoffConsumed
         );
+        assert!(intents.offer_saved(receipt.intent_head, &mut retain).is_err());
         assert!(intents.cancel_before_release().is_err());
         assert!(
             intents
                 .reserve(context, &[selected], &recipient, 4)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn handoff_is_durable_across_restart_and_cannot_reexport_or_reprove() {
+        let dir = private_dir();
+        let path = dir.path().join("wallet");
+        let mut key = FreshKey::generate().unwrap().bind([66; 32]);
+        let (context, selected) = input(&key);
+        let filler = key
+            .key
+            .default_address()
+            .1
+            .create_note(NoteValue::from_raw(1), Rseed::AfterZip212([32; 32]));
+        let mut moved_tree = CommitmentTree::empty();
+        moved_tree.append(Node::from_cmu(&filler.cmu())).unwrap();
+        moved_tree.append(Node::from_cmu(&selected.note.cmu())).unwrap();
+        let mut moved_context = context;
+        moved_context.cut.root = moved_tree.root().to_bytes();
+        moved_context.cut_leaves = 2;
+        let moved = SelectedInput {
+            note: selected.note.clone(),
+            path: IncrementalWitness::from_tree(moved_tree)
+                .unwrap()
+                .path()
+                .unwrap(),
+        };
+        let original_ref = super::selected(&key, context, &[copy_input(&selected)]).unwrap();
+        let moved_ref = super::selected(&key, moved_context, &[copy_input(&moved)]).unwrap();
+        assert_eq!(original_ref[0].cmu, moved_ref[0].cmu);
+        assert_ne!(original_ref[0].nf, moved_ref[0].nf);
+        let recipient = recipient(&key);
+        let (mut journal, pin) =
+            Journal::create_with_intents(&path, dir.path(), &mut key, PASSWORD).unwrap();
+        let mut intents = journal.intents(pin).unwrap();
+        intents
+            .reserve(context, &[copy_input(&selected)], &recipient, 4)
+            .unwrap();
+        let exposed = expose_unverified_journal_fixture(&mut intents);
+        let mut retained = None;
+        let _offer = intents
+            .offer_saved(exposed.intent_head, &mut |receipt: &IntentReceipt| {
+                retained = Some((receipt.address_head, receipt.intent_head));
+                Ok(())
+            })
+            .unwrap();
+        let (address_head, intent_head) = retained.unwrap();
+        assert_ne!(intent_head, exposed.intent_head);
+        assert!(intents.offer_ready(intent_head).is_err());
+        assert!(intents
+            .offer_saved(intent_head, &mut |_: &IntentReceipt| Ok(()))
+            .is_err());
+        assert!(intents.release_saved_envelope(intent_head).is_err());
+        drop(intents);
+        drop(journal);
+        let mut stale = Journal::open(&path, dir.path(), &key, PASSWORD, address_head).unwrap();
+        assert!(stale.intents(exposed.intent_head).is_err());
+        drop(stale);
+        let mut journal = Journal::open(&path, dir.path(), &key, PASSWORD, address_head).unwrap();
+        let mut intents = journal.intents(intent_head).unwrap();
+        assert_eq!(
+            intents.receipt().unwrap().status,
+            IntentStatus::HandoffConsumed
+        );
+        assert!(intents
+            .offer_saved(intent_head, &mut |_: &IntentReceipt| Ok(()))
+            .is_err());
+        assert!(intents.cancel_before_release().is_err());
+        assert!(intents
+            .reserve_distinct(context, &[selected], &recipient, 4)
+            .is_err());
+        assert!(intents
+            .reserve_distinct(moved_context, &[moved], &recipient, 4)
+            .is_err());
+    }
+
+    #[test]
+    fn failed_pin_retention_returns_no_offer_but_consumes_handoff() {
+        let dir = private_dir();
+        let path = dir.path().join("wallet");
+        let mut key = FreshKey::generate().unwrap().bind([66; 32]);
+        let (context, selected) = input(&key);
+        let recipient = recipient(&key);
+        let (mut journal, pin) =
+            Journal::create_with_intents(&path, dir.path(), &mut key, PASSWORD).unwrap();
+        let mut intents = journal.intents(pin).unwrap();
+        intents.reserve(context, &[selected], &recipient, 4).unwrap();
+        let exposed = expose_unverified_journal_fixture(&mut intents);
+        assert!(intents
+            .offer_saved(exposed.intent_head, &mut |_: &IntentReceipt| {
+                Err(Error::Unavailable("test pin retention failure"))
+            })
+            .is_err());
+        let consumed = intents.receipt().unwrap();
+        assert_eq!(consumed.status, IntentStatus::HandoffConsumed);
+        assert!(intents.offer_ready(consumed.intent_head).is_err());
+        drop(intents);
+        drop(journal);
+        let mut journal =
+            Journal::open(&path, dir.path(), &key, PASSWORD, consumed.address_head).unwrap();
+        let mut intents = journal.intents(consumed.intent_head).unwrap();
+        assert!(intents
+            .offer_saved(consumed.intent_head, &mut |_: &IntentReceipt| Ok(()))
+            .is_err());
     }
 
     #[test]

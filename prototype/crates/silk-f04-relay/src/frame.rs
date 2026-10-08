@@ -109,6 +109,23 @@ pub struct Payload {
     bytes: Box<Zeroizing<[u8; ENVELOPE_BYTES]>>,
 }
 impl Payload {
+    /// Build one IM3 choice with the same allocation, full payload copy and
+    /// framing/context/zero scans for either kind. Invalid offered bytes fail
+    /// silently at the owner; they are never replaced with another Cell.
+    /// This is fixed source work, not a machine-code constant-time guarantee.
+    pub fn client_choice(
+        offer: Option<Zeroizing<[u8; ENVELOPE_BYTES]>>,
+        context: &RoundContext<'_>,
+    ) -> Result<Self> {
+        let kind = u8::from(offer.is_some());
+        let cover = Zeroizing::new([0; ENVELOPE_BYTES]);
+        let input = offer.as_ref().unwrap_or(&cover);
+        let mut bytes = Box::new(Zeroizing::new([0; ENVELOPE_BYTES]));
+        bytes.copy_from_slice(input.as_ref());
+        let payload = Self { kind, bytes };
+        payload.validate(context)?;
+        Ok(payload)
+    }
     /// Valid fixed zero cover, not an additional admitted/honest participant.
     #[must_use]
     pub fn cover() -> Self {
@@ -150,10 +167,21 @@ impl Payload {
         Ok(Self { kind: 1, bytes })
     }
     pub(crate) fn validate(&self, context: &RoundContext<'_>) -> Result<()> {
-        if let Some(bytes) = self.real_bytes() {
-            Self::check_real(bytes, context)?;
+        let bytes = self.bytes.as_ref().as_ref();
+        let framed = EnvelopeView::decode(bytes, &context.config.domain()).is_ok();
+        let cut = fixed_equal(&bytes[44..52], &context.manifest.bytes()[52..60])
+            & fixed_equal(&bytes[52..84], &context.manifest.bytes()[60..92])
+            & fixed_equal(&bytes[1798..1830], &context.manifest.bytes()[92..124]);
+        let zero = bytes.iter().fold(0_u8, |all, byte| all | byte) == 0;
+        let valid = ((self.kind == 0) & zero) | ((self.kind == 1) & framed & cut);
+        if !valid {
+            return Err(Error::Invalid("payload kind/framing/manifest cut"));
         }
         Ok(())
+    }
+    pub(crate) fn copy_prepared_cell(&self, cell: &mut [u8; 4096]) {
+        cell[8] = self.kind;
+        cell[416..3206].copy_from_slice(self.bytes.as_ref().as_ref());
     }
     /// Exit-visible real/cover class. Never attach source metadata to this result.
     #[must_use]
@@ -198,6 +226,14 @@ impl Payload {
             Self::real_from_bytes(&bytes[64..2854], context)
         }
     }
+}
+
+fn fixed_equal(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
 }
 
 pub(crate) fn random() -> Result<ChaCha20Rng> {

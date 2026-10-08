@@ -83,10 +83,7 @@ impl<'c, 'a, 's, P: ClaimPinRetention> PreparedClientOwner<'c, 'a, 's, P> {
         )
         .map_err(|_| Error::Invalid("IM3 client B statement"))?;
         let mut cell = Box::new(Zeroizing::new(*s.cell()));
-        if let Some(bytes) = payload.real_bytes() {
-            cell[8] = 1;
-            cell[416..3206].copy_from_slice(bytes);
-        }
+        payload.copy_prepared_cell(&mut cell);
         let msg = c.r2.check_cell(&cell)?;
         let choice = domain_hash(
             "SilkNode-IM3-client-choice",

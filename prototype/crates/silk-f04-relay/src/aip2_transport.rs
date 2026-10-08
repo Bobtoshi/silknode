@@ -111,11 +111,13 @@ impl<'a> PreparedR2Context<'a> {
     }
     pub(crate) fn check_cell(&self, cell: &[u8; 4096]) -> Result<Digest> {
         let s = self.statement()?;
+        let padding = cell[3206..].iter().fold(0_u8, |all, byte| all | byte);
+        let payload = cell[416..3206].iter().fold(0_u8, |all, byte| all | byte);
         if cell[..8] != s.cell()[..8]
             || cell[8] > 1
             || cell[9..128] != s.cell()[9..128]
-            || cell[3206..].iter().any(|x| *x != 0)
-            || (cell[8] == 0 && cell[416..3206].iter().any(|x| *x != 0))
+            || padding != 0
+            || ((cell[8] == 0) & (payload != 0))
         {
             return Err(Error::Invalid("R2 cell context/kind/padding"));
         }

@@ -13,6 +13,7 @@ pub(super) struct Audit {
     pub sequence: u64,
     pub state: State,
     pub exposed: BTreeMap<Digest, InputRef>,
+    pub exposed_cmu: BTreeSet<Digest>,
 }
 struct Record {
     version: u8,
@@ -72,6 +73,10 @@ pub(super) fn transition(older: &State, newer: &State, newer_version: u8) -> Res
         .plan
         .as_ref()
         .is_some_and(|b| older.plan.as_ref().is_none_or(|a| a.id != b.id));
+    let same_signed = match (&older.signed, &newer.signed) {
+        (Some(a), Some(b)) => a.bytes() == b.bytes(),
+        _ => false,
+    };
     let permitted = match (older.status, newer.status) {
         (IntentStatus::Empty | IntentStatus::CancelledBeforeRelease, IntentStatus::Reserved) => {
             new_identity
@@ -81,6 +86,12 @@ pub(super) fn transition(older: &State, newer: &State, newer_version: u8) -> Res
             IntentStatus::MayHaveEscaped | IntentStatus::CancelledBeforeRelease,
         ) => same_plan,
         (IntentStatus::MayHaveEscaped, IntentStatus::Reserved) => {
+            newer_version == 2 && new_identity
+        }
+        (IntentStatus::MayHaveEscaped, IntentStatus::HandoffConsumed) => {
+            newer_version == 2 && same_plan && same_signed
+        }
+        (IntentStatus::HandoffConsumed, IntentStatus::Reserved) => {
             newer_version == 2 && new_identity
         }
         _ => false,
@@ -99,11 +110,13 @@ pub(super) fn audit(journal: &Journal<'_>, expected: Digest) -> Result<Audit> {
         sequence: current.sequence,
         state: current.state.clone(),
         exposed: BTreeMap::new(),
+        exposed_cmu: BTreeSet::new(),
     };
     // Walking backward, any reservation already seen is LATER than this exposure.
     // Thus we can detect historical reuse without retaining every plaintext state
     // or quadratic scans. Sets are bounded by two inputs per fixed sequence slot.
     let mut newer_reservations = BTreeSet::new();
+    let mut newer_commitments = BTreeSet::new();
     loop {
         if started.elapsed() > Duration::from_secs(10) {
             return Err(Error::Unavailable(
@@ -114,16 +127,22 @@ pub(super) fn audit(journal: &Journal<'_>, expected: Digest) -> Result<Audit> {
             match current.state.status {
                 IntentStatus::Reserved => {
                     newer_reservations.extend(plan.inputs.iter().map(|input| input.nf));
+                    newer_commitments.extend(plan.inputs.iter().map(|input| input.cmu));
                 }
                 IntentStatus::MayHaveEscaped => {
                     for input in &plan.inputs {
                         if newer_reservations.contains(&input.nf)
+                            || newer_commitments.contains(&input.cmu)
                             || audited.exposed.insert(input.nf, input.clone()).is_some()
+                            || !audited.exposed_cmu.insert(input.cmu)
                         {
                             return Err(Error::Authentication);
                         }
                     }
                 }
+                // This snapshot repeats the identical signed payment. Count
+                // its nullifiers only at the preceding exposure transition.
+                IntentStatus::HandoffConsumed => {}
                 _ => {}
             }
         }

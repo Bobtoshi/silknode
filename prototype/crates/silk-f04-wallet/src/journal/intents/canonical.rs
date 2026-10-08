@@ -355,7 +355,10 @@ impl IntentJournal<'_, '_> {
             return Err(Error::Unavailable("wallet/node domain mismatch"));
         }
         let permitted = if distinct {
-            self.state.status == IntentStatus::MayHaveEscaped
+            matches!(
+                self.state.status,
+                IntentStatus::MayHaveEscaped | IntentStatus::HandoffConsumed
+            )
         } else {
             matches!(
                 self.state.status,
@@ -381,6 +384,7 @@ impl IntentJournal<'_, '_> {
             |note| {
                 if note.status == NoteStatus::SpendableAtCut
                     && !self.exposed.contains_key(&note.nullifier)
+                    && !self.exposed_cmu.contains(&note.note.cmu().to_bytes())
                 {
                     funding.push((note.note.value().inner(), note.position));
                 }
@@ -444,7 +448,7 @@ impl IntentJournal<'_, '_> {
     }
 
     /// Observe the internally saved effect against a complete current local state.
-    /// Confirmation is reversible; all outcomes preserve `MayHaveEscaped` and
+    /// Confirmation is reversible; all outcomes preserve exposure/handoff and
     /// neither authorize a retry nor release inputs for another payment.
     /// # Errors
     /// Refuses changed local pins or incomplete/foreign canonical state.
@@ -546,7 +550,9 @@ mod tests {
         assert_eq!(receipt.status, IntentStatus::Reserved);
         assert_eq!(node.local_head().unwrap(), original_head);
         assert_eq!(intents.receipt().unwrap().intent_head, receipt.intent_head);
-        assert!(intents.offer_saved(receipt.intent_head).is_err());
+        assert!(intents
+            .offer_saved(receipt.intent_head, &mut |_: &IntentReceipt| Ok(()))
+            .is_err());
         assert!(
             intents
                 .reserve_distinct_from_view(&view, &recipient, 4)

@@ -30,8 +30,11 @@ original A link, validates the actual selected cut and freezes its common claim
 before dispatching B then C once. A/C/B retain original links and absolute
 deadlines. Full batches, distinct nullifiers and native proof verification
 precede disclosure and ordinary producer release. Counts, saved receipts and
-caller booleans are not authority. Failed owners quarantine links; no reconnect,
-replacement proof or partial-train release is introduced.
+caller booleans are not authority. Failed owners cannot reuse submission
+authority. The client driver's recoverable preparation errors now enter
+[cleanup-only original-socket retention](IM3_HANDOFF_CLEANUP_V1.md); other
+admission/manifest refusals retain their separate quarantine behavior. No
+reconnect, replacement proof or partial-train release is introduced.
 
 `Im3RoundRunner::run_round` admits a durable sequence claim before handing out
 nonconstructible scoped `Im3RoundPorts`. Borrowed role owners cannot escape a
@@ -44,9 +47,11 @@ not consequences of Rust types. This is not a production operational profile.
 
 ## Public packaging and reproduction limits
 
-The runtime/client sources are taken from committed objects at frozen source
-`50bb496fb794f37193bcbd4ef1c051473c3c5c64`, with no private Git ancestry imported.
-The public commit is a descendant only of the preceding public source.
+The original runtime/client slice was taken from committed objects at source
+`50bb496fb794f37193bcbd4ef1c051473c3c5c64`. The later bounded
+[handoff/cleanup correction](IM3_HANDOFF_CLEANUP_V1.md) updates only its necessary
+accepted source closure and selected existing harness callers. No private Git
+ancestry is imported; public commits descend only from preceding public source.
 Original execution acceptance belongs to the reviewed private sources/fixtures;
 no new build, test, native run or proof was executed for this export.
 
@@ -58,6 +63,9 @@ explicit `SILK_IM3_NODE_BINARY` input. Other fixture/proof-helper paths are also
 explicit environment inputs; there are no implicit private host paths.
 This curated harness has not been executed as a public package. The source's
 `#[ignore]` annotations and input reads describe prerequisites, not shipped data.
+Its selected handoff, worker-error propagation, payload-validation and cleanup
+selectors now include the accepted corrections; unrelated private fault and
+readiness orchestration remains excluded.
 
 Private readiness/start-gate and fault-supervisor fixes through the frozen
 source are not bundled. In particular, this package does not include the late

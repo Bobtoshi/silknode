@@ -18,7 +18,10 @@ use silk_f04_relay::{
 };
 use silk_f04_wallet::{
     backup,
-    journal::{Journal, intents::IntentStatus},
+    journal::{
+        Journal,
+        intents::{IntentReceipt, IntentStatus},
+    },
 };
 use silk_sapling_f04::codec::domain_hash;
 use std::{
@@ -31,18 +34,17 @@ use std::{
 };
 
 fn save(p: &Path, bytes: &[u8]) {
+    save_checked(p, bytes).unwrap();
+}
+fn save_checked(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(p)
-        .unwrap();
-    f.write_all(bytes).unwrap();
-    f.sync_all().unwrap();
-    fs::File::open(p.parent().unwrap())
-        .unwrap()
-        .sync_all()
-        .unwrap();
+        .open(p)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::File::open(p.parent().unwrap())?.sync_all()
 }
 fn text(b: &[u8]) -> String {
     b.iter().map(|v| format!("{v:02x}")).collect()
@@ -194,8 +196,15 @@ fn offer(wallet: &Path, margin: &Path) -> SavedOfferV1 {
         intents.receipt().unwrap().status,
         IntentStatus::MayHaveEscaped
     );
+    let mut retain = |receipt: &IntentReceipt| {
+        let mut next = Vec::from(domain);
+        next.extend_from_slice(&receipt.address_head);
+        next.extend_from_slice(&receipt.intent_head);
+        save(&wallet.join("wallet-pins-after-handoff"), &next);
+        Ok(())
+    };
     intents
-        .offer_saved(pins[64..96].try_into().unwrap())
+        .offer_saved(pins[64..96].try_into().unwrap(), &mut retain)
         .unwrap()
 }
 fn job(
@@ -208,7 +217,7 @@ fn job(
     b_message: [u8; 32],
     slot: u8,
     member_index: u8,
-) -> ClientProofOutput {
+) -> Result<ClientProofOutput> {
     let native = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     let stamp = Duration::new(
         native.tv_sec.try_into().unwrap(),
@@ -218,32 +227,33 @@ fn job(
         + request
             .deadline
             .checked_duration_since(Instant::now())
-            .unwrap();
+            .ok_or(Error::Unavailable("IM3 original worker deadline"))?;
     let [root, message, scope] = request.statement;
     let folder = out.join(role);
-    save(&folder.join("job-request.json"), &serde_json::to_vec(&serde_json::json!({"root":text(&root),"message":text(&message),"scope":text(&scope),
+    save_checked(&folder.join("job-request.json"), &serde_json::to_vec(&serde_json::json!({"root":text(&root),"message":text(&message),"scope":text(&scope),
         "profile":text(&profile),"manifest":text(&manifest),"round":round,"b_message":text(&b_message),
-        "slot":slot,"member_index":member_index,"absolute_monotonic_ns":deadline.as_nanos().to_string()})).unwrap());
+        "slot":slot,"member_index":member_index,"absolute_monotonic_ns":deadline.as_nanos().to_string()})).map_err(|_| Error::Invalid("IM3 worker request encoding"))?)?;
     let result = folder.join("worker-result.json");
     while !result.exists() {
-        assert!(
-            Instant::now() < request.deadline,
-            "original {role} deadline"
-        );
+        if Instant::now() >= request.deadline {
+            return Err(Error::Unavailable("IM3 original worker deadline"));
+        }
         std::thread::sleep(Duration::from_micros(500));
     }
-    let v: serde_json::Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
-    assert_eq!(v["role"], role);
-    assert_eq!(v["new_proofs"], 1);
-    assert_eq!(v["precomputed"], false);
-    assert_eq!(v["slot"], slot);
-    assert_eq!(v["member_index"], member_index);
-    assert_eq!(v["manifest"], text(&manifest));
-    assert_eq!(v["round"], round);
-    ClientProofOutput {
-        nullifier: hex(v["nullifier"].as_str().unwrap()).unwrap(),
-        proof: hex(v["packed_proof"].as_str().unwrap()).unwrap(),
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(result)?)
+        .map_err(|_| Error::Invalid("IM3 worker output encoding"))?;
+    if v["role"] != role || v["new_proofs"] != 1 || v["precomputed"] != false
+        || v["slot"] != slot || v["member_index"] != member_index
+        || v["manifest"] != text(&manifest) || v["round"] != round
+    {
+        return Err(Error::Invalid("IM3 worker output binding"));
     }
+    Ok(ClientProofOutput {
+        nullifier: hex(v["nullifier"].as_str().ok_or(Error::Invalid("IM3 worker nullifier"))?)
+            .map_err(|_| Error::Invalid("IM3 worker nullifier"))?,
+        proof: hex(v["packed_proof"].as_str().ok_or(Error::Invalid("IM3 worker proof"))?)
+            .map_err(|_| Error::Invalid("IM3 worker proof"))?,
+    })
 }
 
 #[test]
@@ -411,10 +421,10 @@ fn ordinary_wallet_original_tls_and_two_workers() {
     session.run(|stream| {
         wait(origin-Duration::from_secs(5)); stream.freeze()?;
         wait(origin-Duration::from_millis(4500)); let b=stream.take_b_job()?; let b_message=b.statement[1];
-        stream.complete_b(job(&out,"B",b,profile.id(),manifest.id(),round,b_message,slot,member_index))?;
+        stream.complete_b(job(&out,"B",b,profile.id(),manifest.id(),round,b_message,slot,member_index)?)?;
         wait(origin+Duration::from_millis(500));stream.seal_b()?;
         wait(origin+Duration::from_secs(1));let c=stream.take_c_job()?;
-        stream.complete_c(job(&out,"C",c,profile.id(),manifest.id(),round,b_message,slot,member_index))?;
+        stream.complete_c(job(&out,"C",c,profile.id(),manifest.id(),round,b_message,slot,member_index)?)?;
         wait(origin+Duration::from_secs(6));stream.seal_onion()?;
         // Administrative test visibility only; production exposes no onion bytes.
         let onion_hash=domain_hash("IM3-test-original-onion",&[stream.frame.as_ref().unwrap().bytes()]);
@@ -535,6 +545,101 @@ fn fresh_context_genesis_and_envelope_without_claim() {
         &RoundContext::new(&config, &manifest).unwrap(),
     )
     .unwrap();
+    let context = RoundContext::new(&config, &manifest).unwrap();
+    let original: [u8; ENVELOPE_BYTES] = envelope.try_into().unwrap();
+    let real = Payload::client_choice(Some(Zeroizing::new(original)), &context).unwrap();
+    assert_eq!(real.real_bytes(), Some(&original));
+    assert!(!Payload::client_choice(None, &context).unwrap().is_real());
+    // Every codec framing condition and every manifest binding remains required.
+    // No malformed offer may silently become a different cover Cell.
+    for at in [0, 8, 9, 10, 11, 12, 44, 52, 84, 277, 1790, 1797, 1798] {
+        let mut bad = original;
+        bad[at] ^= 1;
+        assert!(Payload::client_choice(Some(Zeroizing::new(bad)), &context).is_err(), "{at}");
+    }
+    let mut same_nullifiers = original;
+    same_nullifiers[213..245].copy_from_slice(&original[117..149]);
+    assert!(Payload::client_choice(Some(Zeroizing::new(same_nullifiers)), &context).is_err());
+    println!("PASS_FIXED_PAYLOAD_CHOICE_EXACT_REAL_COVER_AND_MALFORMED_REFUSAL");
+}
+
+#[test]
+#[ignore = "explicit VPS public TLS fixture; recoverable failure only, no proofs"]
+fn preparation_failure_driver_holds_original_socket_to_fixed_boundary() {
+    let root = PathBuf::from(std::env::var_os("SILK_IM3_CLIENT_TLS_ROOT").unwrap());
+    let e: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("expected.json")).unwrap()).unwrap();
+    let domain = hex(e["domain"].as_str().unwrap()).unwrap();
+    let round = e["round"].as_u64().unwrap();
+    let role_keys = [
+        hex(e["role_keys"][0].as_str().unwrap()).unwrap(),
+        hex(e["role_keys"][1].as_str().unwrap()).unwrap(),
+    ];
+    let config = Rc::new(SignedConfig::verify(
+        &fs::read(root.join("config.bin")).unwrap(), domain,
+        e["cohort"].as_u64().unwrap().try_into().unwrap(),
+        e["epoch"].as_u64().unwrap().try_into().unwrap(), role_keys,
+    ).unwrap());
+    let vk_hash = hex(e["vk_hash"].as_str().unwrap()).unwrap();
+    let profile = PreparedProfile::verify(&fs::read(root.join("profile.bin")).unwrap(),
+        &ProfileExpectations { domain, config: config.id(), epoch: config.epoch(),
+            cohort: config.cohort(), vk_hash, role_keys }).unwrap();
+    let verifier = PreparedProofVerifier::from_canonical_vk(
+        &fs::read(root.join("vk-canonical.json")).unwrap(), vk_hash).unwrap();
+    let overlay = q(&config, &profile,
+        spki_pin(&CertificateDer::from(fs::read(root.join("tls/c.der")).unwrap())).unwrap());
+    let genesis = Rc::new(Genesis::admit_local_bundle(
+        &fs::read(root.join("public-genesis")).unwrap(), &domain, true).unwrap());
+    let (client, mut server) = pair(&config, &root);
+    let physical_t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 10;
+    silk_f04_relay::schedule::initialize_functional_offset(
+        i64::try_from(round * 30).unwrap() - i64::try_from(physical_t).unwrap()).unwrap();
+    let schedule = Im3Schedule::functional_fixture(&config, round).unwrap();
+    let origin = schedule.at(0).unwrap();
+    let cleanup_at = schedule.at(44_000_000_000).unwrap();
+    let private = tempfile::tempdir().unwrap();
+    fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let scope = private.path().join("scope");
+    dir(&scope);
+    let mut store = PreparedScopeStore::create(&scope,
+        profile.claim_binding(ClaimRole::Client), Pins(private.path().join("pin"))).unwrap();
+    let mut session = OriginalClientLab::begin(Rc::clone(&config), schedule, &profile,
+        &overlay, verifier, LocalViewV1::Genesis(genesis), &mut store, 0, client, None).unwrap();
+    wait(origin - Duration::from_secs(8));
+    server.queue(RecordSize::Manifest, &fs::read(root.join("manifest.bin")).unwrap(),
+        origin - Duration::from_secs(7)).unwrap();
+    while !server.write_step().unwrap() { std::thread::sleep(Duration::from_micros(100)); }
+    while !session.poll_manifest().unwrap() { std::thread::sleep(Duration::from_micros(100)); }
+    let result: Result<()> = session.run(|stream| {
+        // A real admitted owner durably consumes its original choice. An
+        // out-of-order C dispatch must destroy that authority immediately.
+        assert!(stream.owner.is_some());
+        wait(origin - Duration::from_secs(5) + Duration::from_millis(10));
+        stream.freeze().unwrap();
+        assert!(stream.take_c_job().is_err());
+        assert!(stream.owner.is_none() && stream.frame.is_none() && stream.link.is_none());
+        assert!(stream.cleanup.is_some());
+        assert!(!stream.cleanup.as_mut().unwrap().poll());
+        assert!(stream.freeze().is_err());
+        assert!(stream.take_b_job().is_err());
+        assert!(stream.take_c_job().is_err());
+        assert!(stream.seal_onion().is_err());
+        assert!(stream.poll_write().is_err());
+        assert!(!server.has_extra_bytes().unwrap()); // still open; no Cell
+        Err(Error::Unavailable("test recoverable worker failure"))
+    });
+    assert!(matches!(result, Err(Error::Unavailable("test recoverable worker failure"))));
+    assert!(Instant::now() >= cleanup_at);
+    assert!(Instant::now() < cleanup_at + Duration::from_secs(2));
+    assert!(matches!(server.has_extra_bytes(), Err(Error::Unavailable("TLS peer closed"))));
+    drop(store);
+    let pin = fs::read(private.path().join("pin")).unwrap().try_into().unwrap();
+    let mut cold = PreparedScopeStore::open(&scope,
+        profile.claim_binding(ClaimRole::Client), pin, round,
+        Pins(private.path().join("pin"))).unwrap();
+    assert!(cold.consume(round, [7; 32], [8; 32]).is_err());
+    println!("PASS_PREPARATION_AUTHORITY_DESTROYED_ORIGINAL_SOCKET_HELD_TO_T44_NO_WRITES");
 }
 
 #[test]
@@ -571,7 +676,9 @@ fn cleanup_accepts_peer_close_only_at_original_cutoff() {
     let mut stream = ClientStreamLab::<Pins> {
         owner: None,
         schedule: &schedule,
-        link: client,
+        link: Some(client),
+        cleanup: None,
+        cleanup_at: schedule.at(44_000_000_000).unwrap(),
         slot: 0,
         frame: None,
         queued: true,

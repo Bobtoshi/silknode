@@ -26,6 +26,19 @@ cohort is distributed here. Do not create real identities or send identifying
 traffic through the lab examples. See [status](STATUS.md) and
 [IM3 limits](docs/IM3_EXPERIMENTAL_V1.md).
 
+The [one-time wallet handoff](docs/IM3_HANDOFF_CLEANUP_V1.md) prevents repeated
+journal issuance after durable consumption under authenticated latest pins.
+It cannot stop trusted caller code from copying exported bytes, guarantee
+retransmission safety, or resist malicious coordinated rollback across devices
+or backups. The independent pin-retention callback must itself be honest and
+durable; failure returns no offer while preserving consumption.
+
+Cleanup-only retention covers recoverable preparation errors while the enclosing
+driver/process survives, not panic, arbitrary abandonment, process/host death
+or uniform timing of earlier admission/manifest failures. Fixed-size source
+scans/copies are not compiled constant-time evidence, equal proof-time evidence,
+joint deadline privacy, crash masking or a system-wide anonymity result.
+
 Never post spending keys, viewing keys, backups, private logs, credentials or
 identifying traffic captures in a public issue. Public test seeds and generated
 test certificates in this source must never be reused as real identities.
